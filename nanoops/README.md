@@ -22,14 +22,17 @@ changing imports only.
 
 ## Conventions
 
-- Module init schemes match `torch.nn` exactly, so weights from a `nanoops`
-  module and the corresponding `torch.nn` module are statistically interchangeable.
-- `autograd.Function` subclasses (e.g. `Matmul`) use the legacy
+- Module init schemes are deliberate, not always matching `torch.nn`. Where
+  PyTorch's default has a historical wart (e.g. `Linear`'s
+  `kaiming_uniform_(a=sqrt(5))`), nanoops picks the principled value (`a=1`)
+  and documents the divergence in the class docstring.
+- `autograd.Function` subclasses (e.g. `Mm`, `Add`, `Lookup`) use the legacy
   `forward(ctx, ...)` signature for clarity — the math and the cached tensors
   sit next to each other.
-- Shape restrictions (e.g. 2D-only `Matmul`) are intentional: they keep the
-  implementation small enough to read in one sitting. Higher-rank versions are
-  left as an exercise.
+- Shape restrictions (2D-only `Mm`, 1D-only `Lookup`) are intentional: they
+  keep the autograd primitive small enough to read in one sitting. Higher-rank
+  handling is done by the caller (see `linear` / `embedding` in
+  `functional.py`, which flatten + unflatten around the 2D/1D core).
 
 ## Parity tests
 
@@ -44,11 +47,17 @@ When adding a new op, add a parity test alongside it.
 
 ## TODO
 
-Sequenced by what nanochat actually depends on. Tier 1 is enough to run a forward
-pass of the model on toy weights; later tiers unlock training, sampling, and the
-fast-path optimizations.
+**Scope: only ops with a meaningful autograd backward.** Optimizers
+(AdamW/Muon), parameter init, discrete sampling (`topk`/`argmax`/`multinomial`),
+constant generators (`arange`, rotary cos/sin tables), DDP, and `torch.compile`
+all use PyTorch directly — nanoops is about teaching backward, not replicating
+every utility.
 
-### Tier 1 — core forward pass
+Sequenced by what nanochat actually depends on. Tier 1 is enough to run a
+forward + backward pass through the core blocks; Tier 2 adds attention; Tier 3
+adds optional fast-path variants.
+
+### Tier 1 — core blocks
 
 - [x] `nn.Linear` / `F.linear`
 - [ ] `nn.Embedding`
@@ -56,29 +65,19 @@ fast-path optimizations.
 - [ ] `F.relu` (MLP uses `relu(x) ** 2`)
 - [ ] `F.softmax`
 - [ ] `F.cross_entropy` (with `ignore_index`)
-- [ ] `torch.arange`, `torch.outer`, `torch.cat`, `torch.stack`
+- [ ] `torch.outer`, `torch.cat`, `torch.stack`
 - [ ] `torch.sigmoid`, `torch.tanh` (gates + logit softcap)
 
-### Tier 2 — attention & generation
+### Tier 2 — attention
 
-- [ ] Rotary embeddings: cos/sin precompute + `apply_rotary_emb`
+- [ ] `apply_rotary_emb` (cos/sin tables stay on PyTorch)
 - [ ] `F.scaled_dot_product_attention` (start with the naive `softmax(QK/√d) V`)
-- [ ] `torch.topk`, `torch.multinomial`, `torch.argmax` (for `engine.py` sampling)
 - [ ] `torch.where`, `torch.roll` (eval / loss masking)
 
-### Tier 3 — training loop
-
-- [ ] `nn.init.normal_`, `uniform_`, `zeros_`, `constant_`
-- [ ] AdamW step (fused-style, no `torch.compile`)
-- [ ] Muon optimizer (matrices only; embeddings stay on AdamW)
-- [ ] Param-group routing (matrix → Muon, embedding/scalar → AdamW)
-
-### Tier 4 — performance / advanced (optional)
+### Tier 3 — performance / advanced (optional)
 
 - [ ] FP8 matmul wrapper around `torch._scaled_mm` + custom `autograd.Function`
 - [ ] FlashAttention-3 shim with SDPA fallback (mirrors `nanochat/flash_attention.py`)
-- [ ] DDP variant of the Muon+AdamW optimizer
-- [ ] `torch.compile` compatibility pass
 
 ### Conventions for each new op
 

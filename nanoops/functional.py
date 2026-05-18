@@ -77,6 +77,13 @@ def linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
     # weight: (out, in); input: (..., in) -> (..., out)
+    # Layout: storing weight as (out, in) keeps the contracted dim (`in`) as
+    # the fast axis in BOTH operands of the GEMM below. `weight.T` is a free
+    # view (stride flip, no copy); BLAS then sees both operands with `in`
+    # contiguous — the cache-friendliest pattern for inner dot products.
+    # With tuned BLAS this is mostly absorbed by internal packing, but the
+    # advantage becomes real in tensor-parallel sharding (row-blocks of W
+    # are physically contiguous) and in any non-BLAS / small-matrix path.
     input_shape = input.shape
     new_input = input.reshape(-1, input_shape[-1])
     out = Mm.apply(new_input, weight.T)
@@ -125,3 +132,19 @@ class Lookup(torch.autograd.Function):
         #      grad_weight[indices[i]] += grad_output[i]
         grad_weight.index_add_(0, indices, grad_output)
         return None, grad_weight
+
+
+def embedding(indices: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # weight: (V, D); input: (...) -> (..., D)
+    # Layout (why (V, D), not (D, V)):
+    #   Under row-major storage, `weight[i]` reads D contiguous floats
+    #   (~1-2 cache lines). `index_add_` along dim 0 likewise writes D
+    #   contiguous floats. A (D, V) layout would do strided column gathers
+    #   with V*4-byte stride (~200KB jumps at V=50k), turning each lookup
+    #   into ~D cache misses instead of ~D/16. This op doesn't go through
+    #   BLAS, so the layout-locality advantage shows up directly —
+    #   typically a 10-100x gap, not a wash.
+    indices_shape = indices.shape
+    new_indices = indices.reshape(-1)
+    out = Lookup.apply(new_indices, weight)
+    return out.reshape(*indices_shape, -1)

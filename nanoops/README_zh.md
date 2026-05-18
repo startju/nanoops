@@ -20,12 +20,14 @@
 
 ## 约定
 
-- Module 的初始化方案与 `torch.nn` 完全一致，nanoops 的 module 与对应的
-  `torch.nn` module 在统计意义上权重可互换。
-- `autograd.Function` 子类（例如 `Matmul`）刻意使用 legacy 的
+- Module 的初始化方案是经过推敲的选择，不必然与 `torch.nn` 一致。当 PyTorch
+  的默认值有历史包袱（例如 `Linear` 的 `kaiming_uniform_(a=sqrt(5))`），
+  nanoops 选择更有理论依据的值（`a=1`），并在类的 docstring 里说明差异。
+- `autograd.Function` 子类（例如 `Mm`、`Add`、`Lookup`）刻意使用 legacy 的
   `forward(ctx, ...)` 签名——把数学和缓存张量写在一起更直观。
-- shape 限制（例如 `Matmul` 只接受 2D）是有意为之，目的是让实现一屏读完。
-  更高维版本留作练习。
+- shape 限制（`Mm` 只接 2D、`Lookup` 只接 1D）是有意为之，目的是让 autograd
+  原语一屏读完。更高维的处理由调用方负责（见 `functional.py` 里的 `linear`
+  和 `embedding`，在 2D/1D 核心算子外做 flatten + unflatten）。
 
 ## Parity 测试
 
@@ -39,10 +41,15 @@ pytest tests/test_nanoops.py
 
 ## TODO
 
-按 nanochat 真实依赖排序。Tier 1 完成即可跑通模型前向（玩具权重）；后续 tier
-逐步解锁训练、采样、以及性能优化。
+**范围：只实现有意义反向传播的算子。** 优化器（AdamW/Muon）、参数初始化、
+离散采样（`topk`/`argmax`/`multinomial`）、常量生成器（`arange`、rotary 的
+cos/sin 表）、DDP、`torch.compile` 等**不可导**的部分一律走 PyTorch——
+nanoops 的目的是教 backward，不是复刻所有工具函数。
 
-### Tier 1 —— 模型前向
+按 nanochat 真实依赖排序。Tier 1 完成即可跑通核心 block 的前向 + 反向；
+Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
+
+### Tier 1 —— 核心 block
 
 - [x] `nn.Linear` / `F.linear`
 - [ ] `nn.Embedding`
@@ -50,29 +57,19 @@ pytest tests/test_nanoops.py
 - [ ] `F.relu`（MLP 用的是 `relu(x) ** 2`）
 - [ ] `F.softmax`
 - [ ] `F.cross_entropy`（带 `ignore_index`）
-- [ ] `torch.arange` / `torch.outer` / `torch.cat` / `torch.stack`
+- [ ] `torch.outer` / `torch.cat` / `torch.stack`
 - [ ] `torch.sigmoid` / `torch.tanh`（gate 与 logit softcap）
 
-### Tier 2 —— 注意力与生成
+### Tier 2 —— 注意力
 
-- [ ] Rotary embedding：cos/sin 预计算 + `apply_rotary_emb`
+- [ ] `apply_rotary_emb`（cos/sin 表继续用 PyTorch）
 - [ ] `F.scaled_dot_product_attention`（先用朴素的 `softmax(QK/√d) V`）
-- [ ] `torch.topk` / `torch.multinomial` / `torch.argmax`（`engine.py` 采样用）
 - [ ] `torch.where` / `torch.roll`（eval 与 loss masking 用）
 
-### Tier 3 —— 训练循环
-
-- [ ] `nn.init.normal_` / `uniform_` / `zeros_` / `constant_`
-- [ ] AdamW step（fused 风格，不依赖 `torch.compile`）
-- [ ] Muon 优化器（仅矩阵参数；embedding 仍走 AdamW）
-- [ ] 参数分组路由（matrix → Muon，embedding/scalar → AdamW）
-
-### Tier 4 —— 性能 / 进阶（可选）
+### Tier 3 —— 性能 / 进阶（可选）
 
 - [ ] FP8 matmul：包一层 `torch._scaled_mm` + 自定义 `autograd.Function`
 - [ ] FlashAttention-3 兼容层 + SDPA fallback（对齐 `nanochat/flash_attention.py`）
-- [ ] Muon+AdamW 的 DDP 变体
-- [ ] `torch.compile` 兼容性
 
 ### 新增算子流程
 
