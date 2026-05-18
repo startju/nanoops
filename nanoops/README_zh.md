@@ -52,7 +52,7 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 ### Tier 1 —— 核心 block
 
 - [x] `nn.Linear` / `F.linear`
-- [ ] `nn.Embedding`
+- [x] `nn.Embedding` / `F.embedding`
 - [ ] `F.rms_norm`（模型里唯一用到的 normalization）
 - [ ] `F.relu`（MLP 用的是 `relu(x) ** 2`）
 - [ ] `F.softmax`

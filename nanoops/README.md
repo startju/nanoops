@@ -60,7 +60,7 @@ adds optional fast-path variants.
 ### Tier 1 — core blocks
 
 - [x] `nn.Linear` / `F.linear`
-- [ ] `nn.Embedding`
+- [x] `nn.Embedding` / `F.embedding`
 - [ ] `F.rms_norm` (used as the only normalization)
 - [ ] `F.relu` (MLP uses `relu(x) ** 2`)
 - [ ] `F.softmax`
