@@ -148,3 +148,45 @@ def embedding(indices: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     new_indices = indices.reshape(-1)
     out = Lookup.apply(new_indices, weight)
     return out.reshape(*indices_shape, -1)
+
+class RMSNorm(torch.autograd.Function):
+    """Root-mean-square normalization, mirroring `torch.nn.functional.rms_norm` semantics."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        weight: torch.Tensor | None,
+        eps: float,
+    ) -> torch.Tensor:
+        assert input.ndim == 2, f"input must be 2D, got {input.ndim}D"
+        if weight is not None:
+            assert weight.ndim == 1, f"weight must be 1D, got {weight.ndim}D"
+            assert input.shape[-1] == weight.shape[0], (
+                f"last dim of input ({input.shape[-1]}) must match weight shape ({weight.shape[0]})"
+            )
+        # Use rsqrt + multiply instead of sqrt + divide:
+        # - rsqrt() is a single fused op (one CUDA instruction on NVIDIA HW)
+        # - fp32 mul throughput is ~30x fp32 div on Ampere/Hopper
+        # - more numerically stable in fp16/bf16
+        rsqrt = input.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+        y = input * rsqrt
+        ctx.save_for_backward(weight, rsqrt, y)
+        output = y * weight if weight is not None else y
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, None]:
+        weight, rsqrt, y = ctx.saved_tensors
+        # grad_weight uses original grad_output (= g); grad_input uses
+        # g_eff = g·w (or just g when weight is None) — see README appendix.
+        if weight is not None:
+            grad_weight = (grad_output * y).sum(dim=0)
+            g_eff = grad_output * weight
+        else:
+            grad_weight = None
+            g_eff = grad_output
+        grad_input = rsqrt * (g_eff - y * (g_eff * y).mean(dim=-1, keepdim=True))
+        return grad_input, grad_weight, None
