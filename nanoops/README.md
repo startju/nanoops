@@ -62,7 +62,7 @@ adds optional fast-path variants.
 - [x] `nn.Linear` / `F.linear`
 - [x] `nn.Embedding` / `F.embedding`
 - [x] `nn.RMSNorm` / `F.rms_norm` (used as the only normalization)
-- [ ] `F.relu` (MLP uses `relu(x) ** 2`)
+- [x] `F.relu` (MLP uses `relu(x) ** 2`)
 - [ ] `F.softmax`
 - [ ] `F.cross_entropy` (with `ignore_index`)
 - [x] `torch.outer`

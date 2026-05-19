@@ -277,3 +277,39 @@ def stack(
     )
     unsqueezed = [t.unsqueeze(dim) for t in tensors]
     return cat(unsqueezed, dim=dim)
+
+
+class Relu(torch.autograd.Function):
+    """Elementwise ReLU. Backward saves the output `y` (PyTorch's choice).
+
+    Memory note: y has the same size/dtype as the input. The minimal-info
+    alternative — save just a bool mask (1 byte/elem vs bf16's 2) — is
+    *worse* in nanchat's actual usage `F.relu(x).square()`, because the
+    downstream `.square()` independently saves the same y for its own
+    backward. Saving y here lets autograd share one tensor reference across
+    both backwards; saving a mask would force two separate allocations
+    (mask + y), using more memory than this scheme despite the mask being
+    smaller in isolation.
+
+    Subgradient at x=0 taken as 0 (PyTorch convention).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor
+    ) -> torch.Tensor:
+        y = x.clamp(min=0)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> torch.Tensor:
+        (y,) = ctx.saved_tensors
+        return grad_output * (y > 0)  # y > 0 iff x > 0
+
+
+def relu(input: torch.Tensor) -> torch.Tensor:
+    """Mirrors `F.relu` (the `inplace` flag is not supported)."""
+    return Relu.apply(input)
