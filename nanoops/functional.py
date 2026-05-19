@@ -1,5 +1,7 @@
 """Functional ops, mirroring `torch.nn.functional`."""
 
+from __future__ import annotations
+
 import torch
 
 
@@ -219,3 +221,34 @@ def outer(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     assert left.ndim == 1, f"left must be 1D, got {left.ndim}D"
     assert right.ndim == 1, f"right must be 1D, got {right.ndim}D"
     return Mm.apply(left.unsqueeze(-1), right.unsqueeze(0))
+
+
+class Cat(torch.autograd.Function):
+    """Concatenation along a dim, mirroring `torch.cat` semantics.
+
+    Signature note: `dim` is the FIRST positional parameter (before `*tensors`)
+    because Python requires `*args` to be the last positional parameter. The
+    functional `cat()` wrapper re-orders to PyTorch's `(tensors, dim)` convention.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        dim: int,
+        *tensors: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.dim = dim
+        ctx.sizes = [t.shape[dim] for t in tensors]
+        return torch.cat(tensors, dim=dim)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> "tuple[None, *tuple[torch.Tensor, ...]]":
+        grads = torch.split(grad_output, ctx.sizes, dim=ctx.dim)
+        return (None, *grads)  # None for dim (int, non-differentiable)
+
+
+def cat(tensors, dim: int = 0) -> torch.Tensor:
+    """Mirrors `torch.cat`. Reorders args so dim goes to Cat's first slot."""
+    return Cat.apply(dim, *tensors)

@@ -66,7 +66,8 @@ adds optional fast-path variants.
 - [ ] `F.softmax`
 - [ ] `F.cross_entropy` (with `ignore_index`)
 - [x] `torch.outer`
-- [ ] `torch.cat`, `torch.stack`
+- [x] `torch.cat`
+- [ ] `torch.stack`
 - [ ] `torch.sigmoid`, `torch.tanh` (gates + logit softcap)
 
 ### Tier 2 — attention

@@ -58,7 +58,8 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 - [ ] `F.softmax`
 - [ ] `F.cross_entropy`（带 `ignore_index`）
 - [x] `torch.outer`
-- [ ] `torch.cat` / `torch.stack`
+- [x] `torch.cat`
+- [ ] `torch.stack`
 - [ ] `torch.sigmoid` / `torch.tanh`（gate 与 logit softcap）
 
 ### Tier 2 —— 注意力
