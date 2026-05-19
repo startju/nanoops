@@ -208,3 +208,14 @@ def rms_norm(
     input_flat = input.reshape(-1, D)
     out_flat = RMSNorm.apply(input_flat, weight, eps)
     return out_flat.reshape(input_shape)
+
+def outer(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Mirrors `torch.outer`. Both inputs must be 1D.
+
+    Implemented as a 2D matmul of column x row: (M, 1) @ (1, N) -> (M, N).
+    No new autograd Function needed — Mm's backward plus autograd's view
+    backward together give the right (M,) and (N,) gradients.
+    """
+    assert left.ndim == 1, f"left must be 1D, got {left.ndim}D"
+    assert right.ndim == 1, f"right must be 1D, got {right.ndim}D"
+    return Mm.apply(left.unsqueeze(-1), right.unsqueeze(0))

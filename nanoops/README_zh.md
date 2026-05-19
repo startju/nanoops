@@ -53,11 +53,12 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 
 - [x] `nn.Linear` / `F.linear`
 - [x] `nn.Embedding` / `F.embedding`
-- [ ] `F.rms_norm`（模型里唯一用到的 normalization）
+- [x] `nn.RMSNorm` / `F.rms_norm`（模型里唯一用到的 normalization）
 - [ ] `F.relu`（MLP 用的是 `relu(x) ** 2`）
 - [ ] `F.softmax`
 - [ ] `F.cross_entropy`（带 `ignore_index`）
-- [ ] `torch.outer` / `torch.cat` / `torch.stack`
+- [x] `torch.outer`
+- [ ] `torch.cat` / `torch.stack`
 - [ ] `torch.sigmoid` / `torch.tanh`（gate 与 logit softcap）
 
 ### Tier 2 —— 注意力
