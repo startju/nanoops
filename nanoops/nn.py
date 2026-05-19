@@ -78,3 +78,47 @@ class Embedding(nn.Module):
 
     def extra_repr(self) -> str:
         return f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}"
+
+
+class RMSNorm(nn.Module):
+    """Drop-in replacement for `torch.nn.RMSNorm`.
+
+    Init: weight all-ones (so initial behavior is pure normalization, network
+    learns the scale). nanochat uses `elementwise_affine=False` — see
+    `nanochat/gpt.py:9` "no learnable params in rmsnorm".
+
+    Not implemented: multi-dim `normalized_shape` (only `(D,)` is accepted).
+    """
+
+    def __init__(
+        self,
+        normalized_shape: int | tuple[int, ...],
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
+        else:
+            self.register_parameter("weight", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.weight is not None:
+            nn.init.ones_(self.weight)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(input, self.normalized_shape, self.weight, self.eps)
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.normalized_shape}, eps={self.eps}, "
+            f"elementwise_affine={self.weight is not None}"
+        )
