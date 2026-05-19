@@ -231,3 +231,76 @@ rescaling of $x$ gets undone by $n$), so the corresponding component of $g$
 doesn't propagate back — we subtract it before scaling. The same "subtract
 the projection along the normalized direction" pattern recurs in softmax and
 LayerNorm backward.
+
+### Softmax
+
+Per slice of length $D$ along the softmax dim, forward:
+
+$$
+y_i = \frac{e^{x_i}}{\sum_j e^{x_j}}, \qquad \sum_i y_i = 1
+$$
+
+(In practice subtract $\max(x)$ from $x$ before $\exp$ — pure numerical
+stability, doesn't change derivatives.)
+
+**Jacobian.** Quotient rule on $y_i = e^{x_i} / Z$ where $Z = \sum_k e^{x_k}$:
+
+$$
+\frac{\partial y_i}{\partial x_j} = \frac{(\partial_j e^{x_i}) \cdot Z - e^{x_i} \cdot (\partial_j Z)}{Z^2}
+$$
+
+Two pieces:
+
+- $\partial_j e^{x_i} = \delta_{ij} \cdot e^{x_i}$ ($e^{x_i}$ depends only on $x_i$).
+- $\partial_j Z = \partial_j \sum_k e^{x_k} = e^{x_j}$ (the sum's derivative picks the $j$-th term).
+
+Plugging in:
+
+$$
+\frac{\partial y_i}{\partial x_j} = \frac{e^{x_i}}{Z} \delta_{ij} - \frac{e^{x_i} \cdot e^{x_j}}{Z^2} = y_i (\delta_{ij} - y_j)
+$$
+
+The first term is "diagonal scaling by $y_i$"; the second is a dense outer
+product $y_i y_j$ that couples every $(i, j)$ — softmax has a fully
+non-diagonal Jacobian like RmsNorm.
+
+**Chain through to $\partial L / \partial x_j$:**
+
+$$
+\frac{\partial L}{\partial x_j} = \sum_i g_i \cdot y_i (\delta_{ij} - y_j) = y_j g_j - y_j \sum_i g_i y_i = y_j \left( g_j - \langle g, y \rangle \right)
+$$
+
+where $\langle g, y \rangle = \sum_i g_i y_i$ is the inner product along the
+softmax dim.
+
+**Final form** (vector, per slice):
+
+$$
+\boxed{\ \frac{\partial L}{\partial x} = y \odot \left( g - \langle g, y \rangle \right)\ }
+$$
+
+In code: `(g * y).sum(dim=dim, keepdim=True)` for the inner product, then
+`y * (g - inner)`.
+
+**Why this matters for nanoops.** Backward needs only $y$ (the output), not
+$x$ — same memory trick as RmsNorm. The full $(D, D)$ Jacobian is never
+materialized; the analytic simplification reduces it to one sum-reduction
+plus one elementwise multiply chain.
+
+**Comparison with RmsNorm.** Both share the "subtract a projection along the
+normalized direction" structure:
+
+| Op | scale factor | projection | reduction |
+|---|---|---|---|
+| RmsNorm | $1/n$ (scalar per slice) | $y \cdot \text{mean}(g \odot y)$ | mean (divide by $D$) |
+| Softmax | $y$ (elementwise) | $\langle g, y \rangle$ (scalar per slice) | sum (no divide) |
+
+Different scale, different reduction — but **the same backward pattern**:
+the gradient component lying along the op's *null direction* doesn't
+propagate; subtract it before scaling.
+
+For softmax specifically, the null direction is the constant vector
+$\mathbf{1}$: adding a constant to every $x_i$ leaves $y$ unchanged (the
+constant cancels in numerator and denominator). The $\langle g, y \rangle$
+subtraction removes exactly the component of $g$ aligned with that null
+direction.

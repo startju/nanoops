@@ -215,3 +215,67 @@ $(\dots, D)$ 的 tensor——LLM 规模下是真金白银的显存。
 RmsNorm 把这个方向"压平了"（任何沿 $y$ 方向的拉伸都被 $n$ 自动除掉），
 所以这个方向上的 $g$ 不能传回去——必须先减掉再 scale。同样的"减去
 归一化方向上的投影"结构在 softmax 和 LayerNorm 的反向里会再次出现。
+
+### Softmax
+
+最后一维长度 $D$，一个 slice 内 forward：
+
+$$
+y_i = \frac{e^{x_i}}{\sum_j e^{x_j}}, \qquad \sum_i y_i = 1
+$$
+
+（实际实现里 $x$ 先减去 $\max(x)$ 再取 exp——纯数值稳定，不影响导数。）
+
+**Jacobian.** 对 $y_i = e^{x_i} / Z$ 用商法则（$Z = \sum_k e^{x_k}$）：
+
+$$
+\frac{\partial y_i}{\partial x_j} = \frac{(\partial_j e^{x_i}) \cdot Z - e^{x_i} \cdot (\partial_j Z)}{Z^2}
+$$
+
+两个分量：
+
+- $\partial_j e^{x_i} = \delta_{ij} \cdot e^{x_i}$（$e^{x_i}$ 只依赖 $x_i$）。
+- $\partial_j Z = \partial_j \sum_k e^{x_k} = e^{x_j}$（求和导数挑出第 $j$ 项）。
+
+代入：
+
+$$
+\frac{\partial y_i}{\partial x_j} = \frac{e^{x_i}}{Z} \delta_{ij} - \frac{e^{x_i} \cdot e^{x_j}}{Z^2} = y_i (\delta_{ij} - y_j)
+$$
+
+第一项是"按 $y_i$ 对角缩放"；第二项 $y_i y_j$ 是稠密的外积，**耦合每对
+$(i, j)$**——和 RmsNorm 一样是非对角 Jacobian。
+
+**链式法则展开 $\partial L / \partial x_j$：**
+
+$$
+\frac{\partial L}{\partial x_j} = \sum_i g_i \cdot y_i (\delta_{ij} - y_j) = y_j g_j - y_j \sum_i g_i y_i = y_j \left( g_j - \langle g, y \rangle \right)
+$$
+
+其中 $\langle g, y \rangle = \sum_i g_i y_i$ 是沿 softmax dim 的内积。
+
+**最终形式**（向量，per slice）：
+
+$$
+\boxed{\ \frac{\partial L}{\partial x} = y \odot \left( g - \langle g, y \rangle \right)\ }
+$$
+
+代码上：`(g * y).sum(dim=dim, keepdim=True)` 算内积，然后 `y * (g - inner)`。
+
+**对 nanoops 的意义。** 反向**只需要 $y$**（forward 输出），**不需要 $x$**——
+和 RmsNorm 一样的省内存技巧。完整 $(D, D)$ Jacobian **从未被物化**：
+化简后只剩一次 sum-reduction + 一次 elementwise mul 链。
+
+**和 RmsNorm 的对比。** 二者都是"减去归一化方向上的投影"结构：
+
+| 算子 | scale factor | projection | reduction |
+|---|---|---|---|
+| RmsNorm | $1/n$（标量，per slice） | $y \cdot \text{mean}(g \odot y)$ | mean（除以 $D$） |
+| Softmax | $y$（elementwise） | $\langle g, y \rangle$（标量，per slice） | sum（不除） |
+
+scale 不同、reduction 不同，但**反向的 pattern 完全一致**：**沿算子 null
+方向的梯度分量不传递；减掉后再 scale。**
+
+Softmax 的 null 方向是常数向量 $\mathbf{1}$：所有 $x_i$ 同加一个常数，
+$y$ 不变（分子分母里常数抵消）。$\langle g, y \rangle$ 这一步正好把
+$g$ 在这个 null 方向上的投影减掉。
