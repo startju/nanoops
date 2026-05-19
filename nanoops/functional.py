@@ -229,6 +229,16 @@ class Cat(torch.autograd.Function):
     Signature note: `dim` is the FIRST positional parameter (before `*tensors`)
     because Python requires `*args` to be the last positional parameter. The
     functional `cat()` wrapper re-orders to PyTorch's `(tensors, dim)` convention.
+
+    Why `*tensors` and not `tensors: list[Tensor] | tuple[Tensor, ...]`:
+    `autograd.Function.apply()` only tracks gradients through tensors that are
+    individual positional arguments — it does NOT recurse into list/tuple
+    containers to find tensors. Passing a list as a single arg makes autograd
+    treat it as an opaque non-differentiable constant, so the backward graph
+    never gets built and the output ends up with no grad_fn. Splatting the
+    tensors via `*tensors` makes each one its own positional arg, which is
+    what autograd needs to set up the chain. (Type hints are static-analysis
+    only; they don't influence apply's runtime behavior.)
     """
 
     @staticmethod
@@ -249,6 +259,21 @@ class Cat(torch.autograd.Function):
         return (None, *grads)  # None for dim (int, non-differentiable)
 
 
-def cat(tensors, dim: int = 0) -> torch.Tensor:
+def cat(
+    tensors: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    dim: int = 0,
+) -> torch.Tensor:
     """Mirrors `torch.cat`. Reorders args so dim goes to Cat's first slot."""
     return Cat.apply(dim, *tensors)
+
+
+def stack(
+    tensors: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    dim: int = 0,
+) -> torch.Tensor:
+    """Mirrors `torch.stack` using `cat` and `unsqueeze`."""
+    assert all(t.shape == tensors[0].shape for t in tensors), (
+        f"all tensors must have the same shape; got {[tuple(t.shape) for t in tensors]}"
+    )
+    unsqueezed = [t.unsqueeze(dim) for t in tensors]
+    return cat(unsqueezed, dim=dim)

@@ -22,8 +22,14 @@ class Linear(nn.Module):
     `s = sqrt(3/n_embd)` is used for c_q/c_k/c_v) — see `nanochat/gpt.py`.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 device=None, dtype=None) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: str | torch.device | int | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
@@ -61,8 +67,13 @@ class Embedding(nn.Module):
       - sparse             (sparse gradient tensor + SparseAdam)
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int,
-                 device=None, dtype=None) -> None:
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        device: str | torch.device | int | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.num_embeddings = num_embeddings
@@ -95,8 +106,8 @@ class RMSNorm(nn.Module):
         normalized_shape: int | tuple[int, ...],
         eps: float = 1e-6,
         elementwise_affine: bool = True,
-        device=None,
-        dtype=None,
+        device: str | torch.device | int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
