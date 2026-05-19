@@ -75,6 +75,44 @@ class Add(torch.autograd.Function):
         )
 
 
+class Mul(torch.autograd.Function):
+    """Elementwise multiply with NumPy/PyTorch broadcasting semantics.
+
+    Memory note: unlike `Add` whose backward only needs operand shapes,
+    `Mul`'s backward needs each operand multiplied by the OTHER one
+    (dL/da = g * b, dL/db = g * a) — so we must save both tensors. For
+    (..., D) bf16 inputs that's 2 x (..., D) tensors held in ctx until
+    backward, roughly 4 bytes/elem. This is the cost of a non-constant
+    Jacobian even for an op as simple as elementwise multiply.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> torch.Tensor:
+        # Fail fast with a clear error if shapes are not broadcastable.
+        torch.broadcast_shapes(left.shape, right.shape)
+        ctx.save_for_backward(left, right)
+        return left * right
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        left, right = ctx.saved_tensors
+        # "Multiply by the other operand", then unbroadcast for shape.
+        grad_left = unbroadcast(grad_output * right, left.shape)
+        grad_right = unbroadcast(grad_output * left, right.shape)
+        return grad_left, grad_right
+
+
+def mul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Mirrors `torch.mul` / the `*` operator (elementwise with broadcasting)."""
+    return Mul.apply(left, right)
+
+
 def linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -279,17 +317,19 @@ def stack(
     return cat(unsqueezed, dim=dim)
 
 
-class Relu(torch.autograd.Function):
-    """Elementwise ReLU. Backward saves the output `y` (PyTorch's choice).
+class ReluSquare(torch.autograd.Function):
+    """Fused ReLU-squared: y = max(x, 0)**2 — nanchat's MLP activation.
 
-    Memory note: y has the same size/dtype as the input. The minimal-info
-    alternative — save just a bool mask (1 byte/elem vs bf16's 2) — is
-    *worse* in nanchat's actual usage `F.relu(x).square()`, because the
-    downstream `.square()` independently saves the same y for its own
-    backward. Saving y here lets autograd share one tensor reference across
-    both backwards; saving a mask would force two separate allocations
-    (mask + y), using more memory than this scheme despite the mask being
-    smaller in isolation.
+    Backward simplifies beautifully:
+        d(relu(x)^2) / dx = 2 * relu(x) * 1[x > 0] = 2 * relu(x)
+    The mask is redundant because relu(x) is already 0 wherever x ≤ 0,
+    so we don't need to save or apply it — backward is just `2 * y * g`,
+    one fused mul chain. Saves the relu output y (same memory as input).
+
+    Compared to composing `square(relu(x))`: this fuses both ops' backwards
+    into one analytic expression, ~3x fewer backward FLOPs and one fewer
+    intermediate tensor. The classic "fusion-as-optimization" pattern,
+    minus the GPU kernel — same idea as fused GELU / SwiGLU in production.
 
     Subgradient at x=0 taken as 0 (PyTorch convention).
     """
@@ -300,16 +340,16 @@ class Relu(torch.autograd.Function):
     ) -> torch.Tensor:
         y = x.clamp(min=0)
         ctx.save_for_backward(y)
-        return y
+        return y * y
 
     @staticmethod
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> torch.Tensor:
         (y,) = ctx.saved_tensors
-        return grad_output * (y > 0)  # y > 0 iff x > 0
+        return grad_output * 2 * y  # = 2 * relu(x) * g; mask absorbed into y
 
 
-def relu(input: torch.Tensor) -> torch.Tensor:
-    """Mirrors `F.relu` (the `inplace` flag is not supported)."""
-    return Relu.apply(input)
+def relu_square(input: torch.Tensor) -> torch.Tensor:
+    """Fused relu(x)**2 — nanchat's MLP activation."""
+    return ReluSquare.apply(input)
