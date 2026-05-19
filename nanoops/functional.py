@@ -149,6 +149,7 @@ def embedding(indices: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     out = Lookup.apply(new_indices, weight)
     return out.reshape(*indices_shape, -1)
 
+
 class RMSNorm(torch.autograd.Function):
     """Root-mean-square normalization, mirroring `torch.nn.functional.rms_norm` semantics."""
 
@@ -190,3 +191,20 @@ class RMSNorm(torch.autograd.Function):
             g_eff = grad_output
         grad_input = rsqrt * (g_eff - y * (g_eff * y).mean(dim=-1, keepdim=True))
         return grad_input, grad_weight, None
+
+
+def rms_norm(
+    input: torch.Tensor,
+    normalized_shape: tuple[int, ...],
+    weight: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    assert len(normalized_shape) == 1, (
+        f"nanoops rms_norm only supports 1D normalized_shape, got {normalized_shape}"
+    )
+    D = normalized_shape[0]
+    assert input.shape[-1] == D, f"input last dim {input.shape[-1]} != normalized_shape {D}"
+    input_shape = input.shape
+    input_flat = input.reshape(-1, D)
+    out_flat = RMSNorm.apply(input_flat, weight, eps)
+    return out_flat.reshape(input_shape)
