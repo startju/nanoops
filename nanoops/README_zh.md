@@ -60,7 +60,7 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 - [x] `torch.outer`
 - [x] `torch.cat`
 - [x] `torch.stack`
-- [ ] `torch.sigmoid` / `torch.tanh`（gate 与 logit softcap）
+- [x] `torch.sigmoid` / `torch.tanh`（gate 与 logit softcap）
 
 ### Tier 2 —— 注意力
 
@@ -376,3 +376,52 @@ $t = $ `ignore_index` 的位置对 loss 和 grad **贡献都为 0**。在 reduct
 **Reduction**（`'mean'` / `'sum'` / `'none'`）：`'mean'` 时把 `grad_x`
 除以 $N_{\text{valid}}$（不算 `ignore_index` 位置），`'sum'` 不变，`'none'`
 不缩放。
+
+### Sigmoid
+
+最简单的 "save y" 例子——bijective 的 elementwise 算子，反向公式可以**纯用
+输出 y 表达**。
+
+Forward:
+
+$$
+y = \sigma(x) = \frac{1}{1 + e^{-x}}
+$$
+
+**Backward.** 直接对商形式求导。设 $u = 1 + e^{-x}$，则 $y = 1/u$：
+
+$$
+\frac{dy}{dx} = -u^{-2} \cdot \frac{du}{dx} = -\frac{1}{(1+e^{-x})^2} \cdot (-e^{-x}) = \frac{e^{-x}}{(1+e^{-x})^2}
+$$
+
+这是对的，但还用着 $x$。为了 ctx 省内存，**用 $y$ 替换 $x$**：由
+$y = 1/(1+e^{-x})$ 得 $e^{-x} = (1-y)/y$，代回：
+
+$$
+\frac{dy}{dx} = \frac{(1-y)/y}{(1/y)^2} = (1-y) \cdot y = y(1-y)
+$$
+
+**最终形式：**
+
+$$
+\boxed{\ \frac{\partial L}{\partial x} = g \cdot y \cdot (1 - y)\ }
+$$
+
+**为什么是最干净的 "save y" 例子。** Sigmoid 是 **bijective**：给定
+$y \in (0, 1)$，可以唯一解出 $x = \log(y/(1-y))$。所以 $y$ **完全包含**反向
+所需的全部信息——再存 $x$ 是冗余。同样的内存（一份 $(\dots,)$ shape 的
+tensor）存 $x$ 或 $y$ 都行，但**用 $y$ 写反向公式更简洁**。
+
+对应到前面"Connection to ctx memory"那个三种情形表：sigmoid 是 **case A**
+（bijective）的典型——没有 null direction、没有 cancellation 戏法，**$y$
+代替 $x$ 直接就行**。
+
+**Tanh** 同款模式。Forward $y = \tanh(x)$；反向通过 $(e^x - e^{-x})/(e^x + e^{-x})$
+的商法则化简：
+
+$$
+\frac{d \tanh}{dx} = \frac{(e^x + e^{-x})^2 - (e^x - e^{-x})^2}{(e^x + e^{-x})^2} = 1 - \tanh^2(x) = 1 - y^2
+$$
+
+所以 $\partial L / \partial x = g \cdot (1 - y^2)$，也是纯用 $y$ 表达。
+和 sigmoid 一样是 "bijective / save y" 的故事。

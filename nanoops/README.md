@@ -68,7 +68,7 @@ adds optional fast-path variants.
 - [x] `torch.outer`
 - [x] `torch.cat`
 - [x] `torch.stack`
-- [ ] `torch.sigmoid`, `torch.tanh` (gates + logit softcap)
+- [x] `torch.sigmoid`, `torch.tanh` (gates + logit softcap)
 
 ### Tier 2 — attention
 
@@ -409,3 +409,55 @@ Zero out the corresponding rows of `grad_x` before any reduction.
 **Reduction** (`'mean'` / `'sum'` / `'none'`): scale `grad_x` by
 $1 / N_{\text{valid}}$ for `'mean'` (where $N_{\text{valid}}$ excludes
 `ignore_index` positions), by $1$ for `'sum'`, or no scaling for `'none'`.
+
+### Sigmoid
+
+The simplest "save y" example — a bijective elementwise op whose backward
+formula can be written purely in terms of the output.
+
+Forward:
+
+$$
+y = \sigma(x) = \frac{1}{1 + e^{-x}}
+$$
+
+**Backward.** Direct chain rule via the quotient form. Let $u = 1 + e^{-x}$,
+so $y = 1/u$:
+
+$$
+\frac{dy}{dx} = -u^{-2} \cdot \frac{du}{dx} = -\frac{1}{(1+e^{-x})^2} \cdot (-e^{-x}) = \frac{e^{-x}}{(1+e^{-x})^2}
+$$
+
+This is correct but still expressed in $x$. To save the per-op memory, rewrite
+in terms of $y$. From $y = 1/(1+e^{-x})$ we get $e^{-x} = (1-y)/y$, so
+
+$$
+\frac{dy}{dx} = \frac{(1-y)/y}{(1/y)^2} = (1-y) \cdot y = y(1-y)
+$$
+
+**Final form:**
+
+$$
+\boxed{\ \frac{\partial L}{\partial x} = g \cdot y \cdot (1 - y)\ }
+$$
+
+**Why this is the cleanest "save y" example.** Sigmoid is **bijective**:
+given $y \in (0, 1)$, you can solve for $x = \log(y/(1-y))$ uniquely. So
+$y$ contains all the information needed for backward; saving $x$ would be
+redundant. The same memory (one $(...,)$ tensor of the input's shape) holds
+either $x$ or $y$ — but backward formula is cleaner in $y$.
+
+Connecting to the "Connection to ctx memory" recipe earlier in this
+appendix: sigmoid is exactly **case A** (bijective). No null direction, no
+quirky cancellation — just substitute $y$ wherever $x$ appears in the
+backward and you're done.
+
+**Tanh** follows the same pattern. Forward $y = \tanh(x)$; backward derives
+to $1 - y^2$ via quotient rule on $(e^x - e^{-x})/(e^x + e^{-x})$:
+
+$$
+\frac{d \tanh}{dx} = \frac{(e^x + e^{-x})^2 - (e^x - e^{-x})^2}{(e^x + e^{-x})^2} = 1 - \tanh^2(x) = 1 - y^2
+$$
+
+So $\partial L / \partial x = g \cdot (1 - y^2)$, again purely in $y$. Same
+"bijective / save y" story as sigmoid.

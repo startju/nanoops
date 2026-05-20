@@ -597,3 +597,60 @@ def cross_entropy(
         valid_count = (target != ignore_index).sum().to(per_sample.dtype)
         return per_sample.sum() / valid_count
     raise ValueError(f"unknown reduction: {reduction!r} (expected 'mean'/'sum'/'none')")
+
+
+class Sigmoid(torch.autograd.Function):
+    """Elementwise sigmoid: y = 1 / (1 + exp(-x)).
+
+    Backward: dL/dx = g * y * (1 - y) — uses only y. Sigmoid is bijective,
+    so y uniquely determines x; saving y (the output) is the natural choice
+    (same memory as saving x, but lets backward use the y(1-y) form directly).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor
+    ) -> torch.Tensor:
+        y = torch.sigmoid(x)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> torch.Tensor:
+        (y,) = ctx.saved_tensors
+        return grad_output * y * (1 - y)
+
+
+def sigmoid(input: torch.Tensor) -> torch.Tensor:
+    """Mirrors `torch.sigmoid`."""
+    return Sigmoid.apply(input)
+
+
+class Tanh(torch.autograd.Function):
+    """Elementwise tanh: y = tanh(x).
+
+    Backward: dL/dx = g * (1 - y^2) — uses only y. Like sigmoid, tanh is
+    bijective; saving the output y is the natural choice.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor
+    ) -> torch.Tensor:
+        y = torch.tanh(x)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> torch.Tensor:
+        (y,) = ctx.saved_tensors
+        return grad_output * (1 - y * y)
+
+
+def tanh(input: torch.Tensor) -> torch.Tensor:
+    """Mirrors `torch.tanh`."""
+    return Tanh.apply(input)
