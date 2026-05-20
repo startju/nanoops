@@ -63,7 +63,7 @@ adds optional fast-path variants.
 - [x] `nn.Embedding` / `F.embedding`
 - [x] `nn.RMSNorm` / `F.rms_norm` (used as the only normalization)
 - [x] `relu_square` — fused `relu(x)**2`, mirrors nanchat's `F.relu(x).square()`
-- [ ] `F.softmax`
+- [x] `F.softmax`
 - [ ] `F.cross_entropy` (with `ignore_index`)
 - [x] `torch.outer`
 - [x] `torch.cat`

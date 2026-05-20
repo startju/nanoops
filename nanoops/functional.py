@@ -353,3 +353,36 @@ class ReluSquare(torch.autograd.Function):
 def relu_square(input: torch.Tensor) -> torch.Tensor:
     """Fused relu(x)**2 — nanchat's MLP activation."""
     return ReluSquare.apply(input)
+
+class Softmax(torch.autograd.Function):
+    """Softmax along a dim, mirroring `torch.nn.functional.softmax` semantics."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        dim: int,
+    ) -> torch.Tensor:
+        input_max = input.amax(dim=dim, keepdim=True)
+        input_exp = (input - input_max).exp()
+        sum_exp = input_exp.sum(dim=dim, keepdim=True)
+        output = input_exp / sum_exp
+        ctx.save_for_backward(output)
+        ctx.dim = dim
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        (output,) = ctx.saved_tensors
+        dim = ctx.dim
+        inner_gy = (grad_output * output).sum(dim=dim, keepdim=True)  # <g, y>
+        grad_input = output * (grad_output - inner_gy)                # y * (g - <g, y>)
+        return grad_input, None  # None for dim (int, non-differentiable)
+
+
+def softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Mirrors `torch.nn.functional.softmax`. Default dim=-1 (PyTorch's
+    default is None and warns; we pick the common case)."""
+    return Softmax.apply(input, dim)
