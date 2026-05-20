@@ -464,6 +464,26 @@ class CrossEntropy(torch.autograd.Function):
     See README appendix for the derivation; the boxed result is
     `dL/dx = softmax(x) - one_hot(target)`.
 
+    Honest performance note: nanoops wins on memory but loses on time.
+    At the same NT=16K, V=32K, bf16 benchmark on a 3090, one fwd+bwd takes:
+
+        PyTorch F.cross_entropy (eager)        :  9.2 ms   (baseline)
+        torch.compile (default, fused Triton)  :  4.1 ms   (2.3x faster)
+        nanoops CrossEntropy (this class)      : 16.3 ms   (1.8x SLOWER)
+
+    The slowness is structural: nanoops's Python-level autograd Function
+    dispatches ~15-20 individual PyTorch ops per fwd+bwd, each paying
+    ~30-50 us of dispatch + autograd machinery (the chunked LSE loop alone
+    is ~8 op-dispatches per chunk). PyTorch eager calls a single fused
+    C++ `cross_entropy_loss`; `torch.compile` further fuses everything
+    into one Triton kernel. Closing this gap requires kernel-level fusion
+    (Triton / CUDA), which is out of scope for nanoops.
+
+    So: read this class to understand what fusion buys you in memory and
+    why production code (Liger Kernel, Flash CE, `torch.compile`) does it
+    at the kernel level. Don't use this class as a drop-in replacement
+    expecting the same throughput.
+
     Returns per-sample loss (shape matches `target`); `'mean'` / `'sum'`
     reduction is handled by the `cross_entropy()` functional wrapper.
 
