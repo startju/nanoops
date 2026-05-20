@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import os
 from typing import Iterator
 
 import torch
@@ -117,6 +118,21 @@ def patch_nanchat() -> list[str]:
     """Permanently swap nanoops into nanchat. Returns the list of patched op names."""
     _apply()
     return [f"F.{n}" for n in _F_OVERRIDES] + [f"torch.{n}" for n in _TORCH_OVERRIDES]
+
+
+def maybe_patch_nanchat(env_var: str = "NANOOPS") -> bool:
+    """If `$NANOOPS` is set (any truthy value), apply the patch and print
+    the swap summary. Returns whether the patch was applied.
+
+    This is the entry point training scripts (`scripts/base_train.py`)
+    call unconditionally — centralizing the env-var check so call sites
+    stay one line.
+    """
+    if not os.environ.get(env_var):
+        return False
+    patched_names = patch_nanchat()
+    print(f"[nanoops] swapped in: {', '.join(patched_names)}")
+    return True
 
 
 @contextlib.contextmanager

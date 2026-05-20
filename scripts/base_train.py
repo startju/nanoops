@@ -35,13 +35,11 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 
-# Opt-in nanoops swap: set NANOOPS=1 to route F.linear/embedding/rms_norm/
-# cross_entropy/softmax/SDPA through nanoops's teaching implementations.
-# Default (unset) keeps PyTorch ops — speedrun and production are unaffected.
-if os.environ.get("NANOOPS"):
-    from nanoops.integration import patch_nanchat
-    _patched_ops = patch_nanchat()
-    print(f"[nanoops] swapped in: {', '.join(_patched_ops)}")
+# Opt-in nanoops swap: set NANOOPS=1 to route F.* + torch.sigmoid/tanh
+# through nanoops's teaching implementations. The env-var check + print
+# live inside maybe_patch_nanchat(); this call is a no-op if NANOOPS is unset.
+from nanoops.integration import maybe_patch_nanchat
+maybe_patch_nanchat()
 
 print_banner()
 
