@@ -76,36 +76,13 @@ adds optional fast-path variants.
 - [x] `F.scaled_dot_product_attention` (naive `softmax(QK/√d) V`; full nanchat parity: is_causal + attn_mask + enable_gqa)
 - [x] `torch.where`, `torch.roll` (eval / loss masking)
 
-### Tier 3 — fused kernels in Triton (optional)
+### Tier 3 — fused Triton kernels (optional)
 
-This tier is where nanoops graduates from "Python composition of autograd
-Functions" to **actual fused GPU kernels written in Triton**. The teaching
-goal shifts: instead of "what closed-form backward saves memory in the
-autograd graph?", the question becomes "what single GPU kernel can replace
-N PyTorch ops + N-1 intermediate allocations?".
-
-All items below are to be implemented as **Triton kernels** with thin
-`autograd.Function` Python wrappers (forward + backward kernels both in
-Triton). Same end-to-end signature as the Tier 1/2 ops; what's different
-is that ctx no longer materializes intermediates because the kernel
-recomputes from saved inputs on-chip.
-
-- [ ] **FlashAttention SDPA**: tiled QK^T + online softmax + PV in a single
-      kernel. Saves only log-sum-exp + max stats (O(B·H·L)); recomputes P
-      tile-by-tile in backward. Replaces the naive Tier 2 SDPA's O(B·H·L²) ctx.
-      Optional FA-3 kernel shim + SDPA fallback for hardware dispatch
-      (mirrors `nanochat/flash_attention.py`).
-- [ ] **`logit_softcap`**: `softcap * tanh(x / softcap)` (`gpt.py:472`).
-      Fused elementwise kernel — backward only needs `tanh_out` on-chip.
-- [ ] **`mlp_relu_square`**: `linear(relu²(linear(x)))` (full MLP block at
-      `gpt.py:135–138`). Fuses 2 matmuls + activation; needs only `h1`
-      saved (recover `r` and `h2` from `h1`'s sign + `h1²` in the kernel).
-- [ ] **`sigmoid_gated_mul`**: `sigmoid(a) * b` (smear / VE gate at
-      `gpt.py:94, 436, 444, 448`). Fused elementwise — saves sigmoid output + `b`.
-- [ ] **`rms_norm_linear`**: `linear(rms_norm(x), W)` (pre-norm projection).
-      Fuses normalize + projection in one kernel. Tricky for nanchat's QKV
-      fan-out (one norm → 3 projections share input); only a clean win on
-      the output projection.
+- [ ] FlashAttention SDPA (O(L) ctx via LSE+max recompute) + optional FA-3 shim
+- [ ] `logit_softcap`: `softcap * tanh(x / softcap)` (`gpt.py:472`)
+- [ ] `mlp_relu_square`: `linear(relu²(linear(x)))` (`gpt.py:135–138`)
+- [ ] `sigmoid_gated_mul`: `sigmoid(a) * b` (smear / VE gate)
+- [ ] `rms_norm_linear`: `linear(rms_norm(x), W)`
 
 ### Conventions for each new op
 

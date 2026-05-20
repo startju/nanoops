@@ -70,30 +70,11 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 
 ### Tier 3 —— 用 Triton 写的融合 kernel（可选）
 
-这一层是 nanoops 从「Python 拼装 autograd Function」毕业到 **真正的 GPU
-fused kernel（用 Triton 写）**。教学目标也变了：从「什么样的闭式 backward
-能省掉 autograd graph 里的中间张量？」变成「一个 GPU kernel 能替掉
-N 个 PyTorch 算子 + N-1 个中间分配吗？」。
-
-下面所有条目都用 **Triton kernel** 实现，Python 那层只是薄薄的
-`autograd.Function` 包装（forward 和 backward 两个 kernel 都用 Triton 写）。
-对外 API 跟 Tier 1/2 一样；区别是 ctx 不再物化中间张量——kernel 直接在
-on-chip memory 上从保存的输入重算。
-
-- [ ] **FlashAttention SDPA**：在一个 kernel 里 tile QK^T + 在线 softmax + PV。
-      只存 log-sum-exp + max（O(B·H·L)），backward 一块一块地重算 P。
-      替掉 Tier 2 朴素 SDPA 的 O(B·H·L²) ctx。可选搭配 FA-3 kernel shim +
-      SDPA fallback 做硬件 dispatch（对齐 `nanochat/flash_attention.py`）。
-- [ ] **`logit_softcap`**：`softcap * tanh(x / softcap)`（`gpt.py:472`）。
-      融合 elementwise kernel，backward 只需 on-chip 上的 `tanh_out`。
-- [ ] **`mlp_relu_square`**：`linear(relu²(linear(x)))`（完整 MLP 块，
-      `gpt.py:135–138`）。融合两个 matmul + 激活；只存 `h1`（`r` 和 `h2`
-      在 kernel 里由 `h1` 的符号和 `h1²` 重算）。
-- [ ] **`sigmoid_gated_mul`**：`sigmoid(a) * b`（smear / VE gate，
-      `gpt.py:94, 436, 444, 448`）。融合 elementwise——存 sigmoid 输出 + `b`。
-- [ ] **`rms_norm_linear`**：`linear(rms_norm(x), W)`（pre-norm + 投影）。
-      一个 kernel 同时做归一化和投影。**棘手**：nanchat 的 QKV 是一个 norm 喂
-      3 个投影（fan-out），只能融合在 output projection 上。
+- [ ] FlashAttention SDPA（用 LSE+max 重算 P，ctx 降到 O(L)）+ 可选 FA-3 shim
+- [ ] `logit_softcap`：`softcap * tanh(x / softcap)`（`gpt.py:472`）
+- [ ] `mlp_relu_square`：`linear(relu²(linear(x)))`（`gpt.py:135–138`）
+- [ ] `sigmoid_gated_mul`：`sigmoid(a) * b`（smear / VE gate）
+- [ ] `rms_norm_linear`：`linear(rms_norm(x), W)`
 
 ### 新增算子流程
 
