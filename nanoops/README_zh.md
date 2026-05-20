@@ -447,20 +447,37 @@ $$
 
 输出沿最后一维 $\text{cat}(y_1, y_2)$。
 
-**Backward.** 因为 forward 是关于 $x$ 的**线性变换**，所以 $\partial y / \partial x = R(\theta)$。
-链式法则：
+**Backward.** 两条路推同一个结果——基础链式法则 和 矩阵代数捷径。
+
+*基础路径。* 从 forward 公式直接读出四个偏导：
 
 $$
-\frac{\partial L}{\partial x} = R(\theta)^T \cdot g
+\frac{\partial y_1}{\partial x_1} = \cos\theta, \quad
+\frac{\partial y_1}{\partial x_2} = \sin\theta, \quad
+\frac{\partial y_2}{\partial x_1} = -\sin\theta, \quad
+\frac{\partial y_2}{\partial x_2} = \cos\theta
 $$
 
-旋转矩阵是**正交矩阵**，所以 $R(\theta)^T = R(\theta)^{-1} = R(-\theta)$：
+链式法则（记 $g_1 = \partial L / \partial y_1$，$g_2 = \partial L / \partial y_2$）：
+
+$$
+\frac{\partial L}{\partial x_1} = g_1 \cdot \frac{\partial y_1}{\partial x_1} + g_2 \cdot \frac{\partial y_2}{\partial x_1} = g_1 \cos\theta + g_2 (-\sin\theta) = g_1 \cos\theta - g_2 \sin\theta
+$$
+
+$$
+\frac{\partial L}{\partial x_2} = g_1 \cdot \frac{\partial y_1}{\partial x_2} + g_2 \cdot \frac{\partial y_2}{\partial x_2} = g_1 \sin\theta + g_2 \cos\theta
+$$
+
+*矩阵代数路径（同样结果，换个视角）。* Forward 是 $x$ 的**线性变换**，
+所以 $\partial y / \partial x = R(\theta)$。向量形式链式法则：
+$\partial L / \partial x = R(\theta)^T \cdot g$。旋转矩阵正交：
+$R(\theta)^T = R(\theta)^{-1} = R(-\theta)$，即
 
 $$
 R(\theta)^T = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
 $$
 
-所以：
+两条路给出同一个结果：
 
 $$
 \boxed{\ g_x^1 = g_1 \cos\theta - g_2 \sin\theta, \qquad g_x^2 = g_1 \sin\theta + g_2 \cos\theta\ }

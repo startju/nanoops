@@ -484,20 +484,38 @@ $$
 
 The output is $\text{cat}(y_1, y_2)$ along the last dim.
 
-**Backward.** Forward is linear in $x$, so $\partial y / \partial x = R(\theta)$.
-Chain rule:
+**Backward.** Two derivations side by side — the elementary chain rule, and
+the matrix-algebra shortcut.
+
+*Elementary path.* From the forward formulas, the four partial derivatives are:
 
 $$
-\frac{\partial L}{\partial x} = R(\theta)^T \cdot g
+\frac{\partial y_1}{\partial x_1} = \cos\theta, \quad
+\frac{\partial y_1}{\partial x_2} = \sin\theta, \quad
+\frac{\partial y_2}{\partial x_1} = -\sin\theta, \quad
+\frac{\partial y_2}{\partial x_2} = \cos\theta
 $$
 
-For a rotation matrix $R(\theta)^T = R(\theta)^{-1} = R(-\theta)$:
+Chain rule (write $g_1 = \partial L / \partial y_1$, $g_2 = \partial L / \partial y_2$):
+
+$$
+\frac{\partial L}{\partial x_1} = g_1 \cdot \frac{\partial y_1}{\partial x_1} + g_2 \cdot \frac{\partial y_2}{\partial x_1} = g_1 \cos\theta + g_2 (-\sin\theta) = g_1 \cos\theta - g_2 \sin\theta
+$$
+
+$$
+\frac{\partial L}{\partial x_2} = g_1 \cdot \frac{\partial y_1}{\partial x_2} + g_2 \cdot \frac{\partial y_2}{\partial x_2} = g_1 \sin\theta + g_2 \cos\theta
+$$
+
+*Matrix-algebra path (same result, different angle).* Forward is linear in $x$,
+so $\partial y / \partial x = R(\theta)$. Chain rule in vector form:
+$\partial L / \partial x = R(\theta)^T \cdot g$. For a rotation matrix
+$R(\theta)^T = R(\theta)^{-1} = R(-\theta)$:
 
 $$
 R(\theta)^T = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
 $$
 
-So:
+Both paths give the same boxed result:
 
 $$
 \boxed{\ g_x^1 = g_1 \cos\theta - g_2 \sin\theta, \qquad g_x^2 = g_1 \sin\theta + g_2 \cos\theta\ }
