@@ -1,58 +1,19 @@
 """Integration test: swap nanoops into nanchat's actual GPT.
 
 Builds a tiny nanchat GPT, runs it twice with identical seeds and data:
-once with PyTorch's torch.nn.functional, once with nanoops monkey-patched
-into nanchat.gpt's `F` namespace. Compares the loss curves to verify
-nanoops produces numerically identical results when dropped into the
-real nanchat training loop.
+once with PyTorch's torch.nn.functional, once with nanoops swapped into
+nanchat's `F` namespace via `nanoops.integration.patched()`. Compares the
+loss curves to verify nanoops produces numerically identical results when
+dropped into the real nanchat training loop.
 
-What's swapped (via patching gpt_mod.F at import time):
-  - F.rms_norm     -> nanoops.functional.rms_norm     (used in `norm()`)
-  - F.linear       -> nanoops.functional.linear        (used in nanchat's Linear.forward)
-  - F.cross_entropy-> nanoops.functional.cross_entropy (used in GPT.forward loss)
-
-What's NOT swapped (kept as PyTorch):
-  - F.scaled_dot_product_attention   (Tier 2, no nanoops version)
-  - F.relu / .square() chain         (nanoops has relu_square but the
-                                     gpt.py call is `F.relu(x).square()`,
-                                     not easily monkey-patchable)
-  - F.softmax, F.embedding (used in inference / minor paths)
-  - torch.outer/cat/sigmoid/tanh     (accessed as torch.X, not F.X)
-
-So the test exercises the three biggest ops (linear, rms_norm, cross_entropy)
-running through nanoops's custom autograd Functions inside nanchat's real
-model architecture (with FA3 fallback SDPA, rotary, smear gate, etc.).
+Patch scope is defined in `nanoops/integration.py` (single source of truth;
+the same hook is used by `scripts/base_train.py` when `NANOOPS=1` is set).
 """
 
-import contextlib
 import torch
 
-import nanochat.gpt as gpt_mod
-import nanoops.functional as nF
+from nanoops.integration import patched as nanoops_swapped_in
 from nanochat.gpt import GPTConfig, GPT
-
-
-@contextlib.contextmanager
-def nanoops_swapped_in():
-    """Patch nanchat.gpt's F namespace to use nanoops for select ops."""
-    original_F = gpt_mod.F
-
-    class PatchedF:
-        # Override with nanoops where available
-        rms_norm = staticmethod(nF.rms_norm)
-        cross_entropy = staticmethod(nF.cross_entropy)
-        linear = staticmethod(nF.linear)
-
-    # Fall through every other attribute to the original F
-    for attr in dir(original_F):
-        if not attr.startswith("_") and not hasattr(PatchedF, attr):
-            setattr(PatchedF, attr, getattr(original_F, attr))
-
-    gpt_mod.F = PatchedF
-    try:
-        yield
-    finally:
-        gpt_mod.F = original_F
 
 
 def _tiny_config() -> GPTConfig:

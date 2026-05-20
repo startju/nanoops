@@ -34,6 +34,15 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+
+# Opt-in nanoops swap: set NANOOPS=1 to route F.linear/embedding/rms_norm/
+# cross_entropy/softmax/SDPA through nanoops's teaching implementations.
+# Default (unset) keeps PyTorch ops — speedrun and production are unaffected.
+if os.environ.get("NANOOPS"):
+    from nanoops.integration import patch_nanchat
+    _patched_ops = patch_nanchat()
+    print(f"[nanoops] swapped in: F.{', F.'.join(_patched_ops)}")
+
 print_banner()
 
 # -----------------------------------------------------------------------------
