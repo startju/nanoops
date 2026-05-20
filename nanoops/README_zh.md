@@ -266,6 +266,28 @@ $$
 和 RmsNorm 一样的省内存技巧。完整 $(D, D)$ Jacobian **从未被物化**：
 化简后只剩一次 sum-reduction + 一次 elementwise mul 链。
 
+**插一段：什么是 "null direction"？** 算子的 null direction 是这样一种输入
+扰动方向——沿它移动输入，输出**完全不变**（数学定义：Jacobian 的零空间里
+的向量）。因为 $L$ 通过 $y$ 依赖 $x$，沿 null direction 移动 $x$ 不改 $y$，
+就不可能改 $L$，所以 $\partial L / \partial x$ 沿这个方向**必须严格为 0**。
+backward 公式必须减掉 upstream grad 在 null direction 上的投影，**否则链式
+法则会无中生有地编造梯度信号**——和"输出不变"这个事实矛盾。RmsNorm 的
+`mean(g ⊙ y)` 和 Softmax 的 `⟨g, y⟩` 减法做的正是这个修正。
+
+**和 ctx 内存的关联：什么时候 backward 能 "save y" 而不存 x？** 能不能只存
+`y`（加上 `1/n` 这种标量元数据）取决于反向公式是否需要 forward $x \to y$
+过程中**丢掉的信息**：
+
+| Forward 形状 | Save `y` 可行？ | 原因 |
+|---|---|---|
+| Bijective（sigmoid, tanh） | ✓ | $y$ 唯一确定 $x$，没丢信息 |
+| 有 null direction 且 grad 沿其为 0（RmsNorm, Softmax, ReLU²） | ✓ | 丢的信息在 null direction 上；backward 对它不变 |
+| Backward 显式需要 $x$（如 Linear 的 $\partial L/\partial W = g \otimes x$） | ✗ | 必须存 $x$；只看 $y$ 推不出 backward 需要的量 |
+
+**新 autograd Function 的设计配方**：先推 backward，然后检查公式里**还有没有 $x$**。
+如果有，看能不能用 $y$ 表达（比如 sigmoid backward 把 $\sigma(x)(1-\sigma(x))$
+改写成 $y(1-y)$）。如果实在改不掉，就必须存 $x$。
+
 **和 RmsNorm 的对比。** 二者都是"减去归一化方向上的投影"结构：
 
 | 算子 | scale factor | projection | reduction |

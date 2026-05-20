@@ -287,6 +287,32 @@ $x$ — same memory trick as RmsNorm. The full $(D, D)$ Jacobian is never
 materialized; the analytic simplification reduces it to one sum-reduction
 plus one elementwise multiply chain.
 
+**Aside: what's a "null direction"?** A null direction of an op is an input
+perturbation that leaves the output unchanged — formally, a vector in the
+Jacobian's null space. Because $L$ depends on $x$ only through $y$, moving
+$x$ along a null direction can't change $y$, so it can't change $L$ either,
+so $\partial L / \partial x$ must be exactly zero along it. The backward
+formula has to subtract any component of the upstream gradient that would
+project onto a null direction — otherwise the chain rule starts inventing
+gradient signal where the math says there is none. The `mean(g ⊙ y)` (in
+RmsNorm) and `⟨g, y⟩` (in Softmax) subtractions are exactly these
+corrections.
+
+**Connection to ctx memory: when can backward `save y` instead of `x`?** Whether
+you can save just `y` (plus scalar metadata like `1/n`) depends on whether the
+backward formula needs information that was *lost* in the forward $x \to y$:
+
+| Forward shape | Save `y` works? | Why |
+|---|---|---|
+| Bijective (sigmoid, tanh) | ✓ | $y$ uniquely determines $x$ — no info lost |
+| Has null direction with grad-zero along it (RmsNorm, Softmax, ReLU²) | ✓ | The lost info lives in the null direction; backward is invariant to it |
+| Backward formula explicitly needs $x$ (e.g. Linear's $\partial L/\partial W = g \otimes x$) | ✗ | Must save $x$; $y$ alone underdetermines what backward needs |
+
+**Recipe for a new autograd Function**: derive the backward, then check whether
+the resulting formula still contains $x$. If yes, see if $x$ can be replaced
+by an expression in $y$ (e.g. `sigmoid_backward` rewrites $\sigma(x)(1-\sigma(x))$
+as $y(1-y)$). If you can't eliminate $x$, you must save it.
+
 **Comparison with RmsNorm.** Both share the "subtract a projection along the
 normalized direction" structure:
 
