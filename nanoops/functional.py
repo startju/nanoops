@@ -552,3 +552,48 @@ class CrossEntropy(torch.autograd.Function):
         # Return one grad per forward input: (input, target, dim, ignore_index).
         # Only `input` is differentiable; the rest are ints / non-tensor.
         return grad_input, None, None, None
+
+
+def cross_entropy(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+    dim: int = -1,
+) -> torch.Tensor:
+    """Mirrors `torch.nn.functional.cross_entropy`.
+
+    Wraps the fused `CrossEntropy` autograd Function and applies reduction.
+    See `CrossEntropy` for the algorithm and the memory / time trade-offs;
+    this wrapper just adds reduction.
+
+    Args:
+      input:        Logits of shape (..., C); class dim defaults to -1.
+      target:       Integer class indices, shape matching input minus dim.
+                    Positions equal to `ignore_index` contribute 0 to both
+                    loss and gradient.
+      ignore_index: Target value to skip. Defaults to -100 (PyTorch default);
+                    nanchat passes -1 explicitly.
+      reduction:    "mean" (default) / "sum" / "none". "mean" divides by the
+                    number of *non-ignored* positions, matching PyTorch
+                    (returns NaN if all positions are ignored).
+      dim:          Class dim. Defaults to -1 (PyTorch hardcodes class to
+                    dim 1; we expose `dim` for flexibility).
+
+    Not supported (vs PyTorch):
+      - `weight` (per-class loss weighting).
+      - `label_smoothing`.
+      - Deprecated `size_average` / `reduce` flags.
+    """
+    per_sample = CrossEntropy.apply(input, target, dim, ignore_index)
+    if reduction == "none":
+        return per_sample
+    if reduction == "sum":
+        return per_sample.sum()
+    if reduction == "mean":
+        # PyTorch convention: divide by N_valid (excluding ignore_index), not
+        # by total. Cast to float to avoid integer division. If everything is
+        # ignored, valid_count is 0 and we return NaN (matching PyTorch).
+        valid_count = (target != ignore_index).sum().to(per_sample.dtype)
+        return per_sample.sum() / valid_count
+    raise ValueError(f"unknown reduction: {reduction!r} (expected 'mean'/'sum'/'none')")

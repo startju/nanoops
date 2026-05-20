@@ -64,7 +64,7 @@ adds optional fast-path variants.
 - [x] `nn.RMSNorm` / `F.rms_norm` (used as the only normalization)
 - [x] `relu_square` — fused `relu(x)**2`, mirrors nanchat's `F.relu(x).square()`
 - [x] `F.softmax`
-- [ ] `F.cross_entropy` (with `ignore_index`)
+- [x] `F.cross_entropy` (with `ignore_index`)
 - [x] `torch.outer`
 - [x] `torch.cat`
 - [x] `torch.stack`

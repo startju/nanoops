@@ -56,7 +56,7 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 - [x] `nn.RMSNorm` / `F.rms_norm`（模型里唯一用到的 normalization）
 - [x] `relu_square` —— 融合 `relu(x)**2`，对应 nanchat 的 `F.relu(x).square()`
 - [x] `F.softmax`
-- [ ] `F.cross_entropy`（带 `ignore_index`）
+- [x] `F.cross_entropy`（带 `ignore_index`）
 - [x] `torch.outer`
 - [x] `torch.cat`
 - [x] `torch.stack`
