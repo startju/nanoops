@@ -654,3 +654,66 @@ class Tanh(torch.autograd.Function):
 def tanh(input: torch.Tensor) -> torch.Tensor:
     """Mirrors `torch.tanh`."""
     return Tanh.apply(input)
+
+
+class ApplyRotaryEmb(torch.autograd.Function):
+    """Apply rotary positional embedding to a 4D tensor's last-dim halves.
+
+    Mirrors `nanchat/gpt.py:57` apply_rotary_emb. Treats the last dim as
+    two halves (x1, x2) and rotates each pair (x1[i], x2[i]) by the angle
+    encoded in (cos[i], sin[i]):
+
+        y1 = x1 * cos + x2 * sin
+        y2 = -x1 * sin + x2 * cos
+
+    In matrix form this is R(θ) applied to a 2-vector. Rotation matrices
+    are orthogonal: R(θ)^T = R(-θ). So backward is the SAME forward shape
+    with sin negated:
+
+        grad_x1 = g1 * cos - g2 * sin
+        grad_x2 = g1 * sin + g2 * cos
+
+    Memory: ctx saves only (cos, sin) — precomputed lookup tables, usually
+    shared across the entire attention call. NO x or y is saved (backward
+    is purely linear in grad_output, with cos/sin as multipliers).
+
+    cos and sin come from non-differentiable arange/outer/cos/sin
+    precomputation (see `nanchat/gpt.py:_precompute_rotary_embeddings`),
+    so backward returns None for both.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        assert x.ndim == 4, f"x must be 4D (B, T, n_head, head_dim), got {x.ndim}D"
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = -x1 * sin + x2 * cos
+        ctx.save_for_backward(cos, sin)
+        return torch.cat([y1, y2], dim=-1)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
+        cos, sin = ctx.saved_tensors
+        d = grad_output.shape[-1] // 2
+        g1, g2 = grad_output[..., :d], grad_output[..., d:]
+        # R(-θ): same forward formula with sin → -sin.
+        grad_x1 = g1 * cos - g2 * sin
+        grad_x2 = g1 * sin + g2 * cos
+        grad_x = torch.cat([grad_x1, grad_x2], dim=-1)
+        # cos and sin are precomputed constants, not differentiable.
+        return grad_x, None, None
+
+
+def apply_rotary_emb(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Rotary positional embedding, mirroring `nanchat/gpt.py:57`."""
+    return ApplyRotaryEmb.apply(x, cos, sin)

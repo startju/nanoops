@@ -70,7 +70,7 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 
 ### Tier 3 —— 性能 / 进阶（可选）
 
-- [ ] FP8 matmul：包一层 `torch._scaled_mm` + 自定义 `autograd.Function`
+- ~~FP8 matmul：包一层 `torch._scaled_mm` + 自定义 `autograd.Function`~~ —— **跳过**：nanchat 自己已经在 `nanochat/fp8.py` 里做完了（含自定义 autograd，FP8 tensor 而非 fp32 存 ctx，见 commit d9678ff）。nanoops 再写一份是重复造轮子。
 - [ ] FlashAttention-3 兼容层 + SDPA fallback（对齐 `nanochat/flash_attention.py`）
 
 ### 新增算子流程
@@ -425,3 +425,68 @@ $$
 
 所以 $\partial L / \partial x = g \cdot (1 - y^2)$，也是纯用 $y$ 表达。
 和 sigmoid 一样是 "bijective / save y" 的故事。
+
+### Rotary positional embedding（旋转位置编码）
+
+整个 nanoops 里**最对称的算子**：**反向就是 forward 把 $\sin$ 取反**——
+来自旋转矩阵的正交性。
+
+**Forward.** 4D 输入 $x \in \mathbb{R}^{B \times T \times H \times d}$，
+最后一维劈成两半 $x_1 = x[\dots, :d/2]$ 和 $x_2 = x[\dots, d/2:]$。每对
+$(x_1, x_2)$ 被角度 $\theta$（编码在 $(\cos, \sin)$ 里）旋转：
+
+$$
+\begin{pmatrix} y_1 \\ y_2 \end{pmatrix} = R(\theta) \begin{pmatrix} x_1 \\ x_2 \end{pmatrix}, \qquad R(\theta) = \begin{pmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{pmatrix}
+$$
+
+展开：
+
+$$
+y_1 = x_1 \cos\theta + x_2 \sin\theta, \qquad y_2 = -x_1 \sin\theta + x_2 \cos\theta
+$$
+
+输出沿最后一维 $\text{cat}(y_1, y_2)$。
+
+**Backward.** 因为 forward 是关于 $x$ 的**线性变换**，所以 $\partial y / \partial x = R(\theta)$。
+链式法则：
+
+$$
+\frac{\partial L}{\partial x} = R(\theta)^T \cdot g
+$$
+
+旋转矩阵是**正交矩阵**，所以 $R(\theta)^T = R(\theta)^{-1} = R(-\theta)$：
+
+$$
+R(\theta)^T = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
+$$
+
+所以：
+
+$$
+\boxed{\ g_x^1 = g_1 \cos\theta - g_2 \sin\theta, \qquad g_x^2 = g_1 \sin\theta + g_2 \cos\theta\ }
+$$
+
+**这就是 forward 公式把 $\sin \to -\sin$**——同一段 kernel，反向旋转一次。
+backward = "反向旋转"。
+
+**为什么 $R^T = R^{-1}$。** 旋转矩阵是正交的，直接验证：
+
+$$
+R(\theta)^T R(\theta) = \begin{pmatrix} \cos & -\sin \\ \sin & \cos \end{pmatrix} \begin{pmatrix} \cos & \sin \\ -\sin & \cos \end{pmatrix} = \begin{pmatrix} \cos^2 + \sin^2 & \cos\sin - \sin\cos \\ \sin\cos - \cos\sin & \sin^2 + \cos^2 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}
+$$
+
+$\cos^2 + \sin^2 = 1$ 这个恒等式做了所有的活。
+
+**内存和 ctx。** 反向只依赖 $g$, $\cos$, $\sin$——**不依赖 $x$ 或 $y$**。
+ctx 只存 $(\cos, \sin)$，这俩是预计算的查找表，整个 attention 调用里共用
+（存的是引用，不是新分配）。`ApplyRotaryEmb.forward` **完全不存 $x$**，
+是整个 nanoops 里 ctx 占用最小的算子之一。
+
+$\cos$ 和 $\sin$ 由非可导的 `arange + outer + cos()/sin()` 预算出来（见
+`nanchat/gpt.py:_precompute_rotary_embeddings`），所以 backward 对它们
+返回 `None`。
+
+**为什么比 RmsNorm / Softmax 干净这么多。** 那些算子的归一化**依赖数据**——
+backward 需要 $y$（或 $x$）因为 Jacobian 取决于输入值。Rotary 的 Jacobian
+就是 $R(\theta)$，**只取决于位置不取决于输入张量值**——所以**根本没必要
+从 $x$ 里存什么**。

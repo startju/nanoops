@@ -72,13 +72,14 @@ def precompute_rotary(ops, device):
     return cos[None, :, None, :], sin[None, :, None, :]
 
 
-def apply_rotary(x, cos, sin, ops):
-    """Rotate the last dim in two halves, then re-cat — nanchat's exact recipe."""
+def _torch_apply_rotary(x, cos, sin):
+    """Manual rotary for the PyTorch op table — same math as nanoops's
+    ApplyRotaryEmb, just inlined so we don't depend on a nanchat import."""
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = -x1 * sin + x2 * cos
-    return ops["cat"]([y1, y2], dim=-1)
+    return torch.cat([y1, y2], dim=-1)
 
 
 def attn_block(x, p, cos, sin, ops):
@@ -88,8 +89,8 @@ def attn_block(x, p, cos, sin, ops):
     q = ops["linear"](h, p["q_w"]).view(B, T, N_HEAD, HEAD_DIM)
     k = ops["linear"](h, p["k_w"]).view(B, T, N_HEAD, HEAD_DIM)
     v = ops["linear"](h, p["v_w"]).view(B, T, N_HEAD, HEAD_DIM)
-    q = apply_rotary(q, cos, sin, ops)
-    k = apply_rotary(k, cos, sin, ops)
+    q = ops["rotary"](q, cos, sin)
+    k = ops["rotary"](k, cos, sin)
     # (B, T, H, D_head) -> (B, H, T, D_head)
     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     # SDPA stays PyTorch in both variants (nanoops Tier 2)
@@ -141,6 +142,7 @@ PT_OPS = {
     "outer": torch.outer,
     "cat": torch.cat,
     "cross_entropy": F.cross_entropy,
+    "rotary": _torch_apply_rotary,
 }
 NO_OPS = {
     "embedding": nF.embedding,
@@ -152,6 +154,7 @@ NO_OPS = {
     "outer": nF.outer,
     "cat": nF.cat,
     "cross_entropy": nF.cross_entropy,
+    "rotary": nF.apply_rotary_emb,
 }
 
 

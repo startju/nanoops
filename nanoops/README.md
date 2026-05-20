@@ -78,7 +78,7 @@ adds optional fast-path variants.
 
 ### Tier 3 — performance / advanced (optional)
 
-- [ ] FP8 matmul wrapper around `torch._scaled_mm` + custom `autograd.Function`
+- ~~FP8 matmul wrapper around `torch._scaled_mm` + custom `autograd.Function`~~ — **skip**: nanchat already has this in `nanochat/fp8.py` with custom autograd (saving FP8 tensors in ctx instead of fp32, per commit d9678ff). Re-implementing in nanoops would duplicate working production code.
 - [ ] FlashAttention-3 shim with SDPA fallback (mirrors `nanochat/flash_attention.py`)
 
 ### Conventions for each new op
@@ -461,3 +461,72 @@ $$
 
 So $\partial L / \partial x = g \cdot (1 - y^2)$, again purely in $y$. Same
 "bijective / save y" story as sigmoid.
+
+### Rotary positional embedding
+
+The most symmetric op in the codebase: **backward is the same forward
+formula with $\sin$ negated**. Comes from the rotation matrix being
+orthogonal.
+
+**Forward.** For a 4D input $x \in \mathbb{R}^{B \times T \times H \times d}$,
+split the last dim into halves $x_1 = x[\dots, :d/2]$ and $x_2 = x[\dots, d/2:]$.
+Each pair $(x_1, x_2)$ is rotated by angle $\theta$ encoded in $(\cos, \sin)$:
+
+$$
+\begin{pmatrix} y_1 \\ y_2 \end{pmatrix} = R(\theta) \begin{pmatrix} x_1 \\ x_2 \end{pmatrix}, \qquad R(\theta) = \begin{pmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{pmatrix}
+$$
+
+Component form:
+
+$$
+y_1 = x_1 \cos\theta + x_2 \sin\theta, \qquad y_2 = -x_1 \sin\theta + x_2 \cos\theta
+$$
+
+The output is $\text{cat}(y_1, y_2)$ along the last dim.
+
+**Backward.** Forward is linear in $x$, so $\partial y / \partial x = R(\theta)$.
+Chain rule:
+
+$$
+\frac{\partial L}{\partial x} = R(\theta)^T \cdot g
+$$
+
+For a rotation matrix $R(\theta)^T = R(\theta)^{-1} = R(-\theta)$:
+
+$$
+R(\theta)^T = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
+$$
+
+So:
+
+$$
+\boxed{\ g_x^1 = g_1 \cos\theta - g_2 \sin\theta, \qquad g_x^2 = g_1 \sin\theta + g_2 \cos\theta\ }
+$$
+
+**This is literally the forward formula with $\sin \to -\sin$.** Same kernel,
+opposite rotation direction. Backward = "un-rotate".
+
+**Why $R^T = R^{-1}$.** Rotation matrices are orthogonal, which you can verify
+directly:
+
+$$
+R(\theta)^T R(\theta) = \begin{pmatrix} \cos & -\sin \\ \sin & \cos \end{pmatrix} \begin{pmatrix} \cos & \sin \\ -\sin & \cos \end{pmatrix} = \begin{pmatrix} \cos^2 + \sin^2 & \cos\sin - \sin\cos \\ \sin\cos - \cos\sin & \sin^2 + \cos^2 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}
+$$
+
+The $\cos^2 + \sin^2 = 1$ identity does all the work.
+
+**Memory and ctx.** Backward depends only on $g$, $\cos$, $\sin$ — **not on
+$x$ or $y$**. ctx saves only $(\cos, \sin)$, which are precomputed lookup
+tables shared across the whole attention call (a reference, not a fresh
+allocation). nanoops's `ApplyRotaryEmb.forward` does not save $x$ at all,
+making this one of the cheapest ctx footprints in the codebase.
+
+$\cos$ and $\sin$ are computed once from `arange` + `outer` + `cos()`/`sin()`
+(see `nanchat/gpt.py:_precompute_rotary_embeddings`) and are not
+differentiable, so backward returns `None` for both.
+
+**Why this is so much cleaner than RmsNorm / Softmax.** Those ops have
+*data-dependent* normalization — backward needs $y$ (or $x$) because the
+Jacobian depends on the input values. Rotary's Jacobian is just $R(\theta)$,
+a function of position only — completely independent of the input tensor's
+values. So there's nothing to save from $x$ at all.
