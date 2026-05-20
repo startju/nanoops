@@ -60,6 +60,17 @@ _TORCH_OVERRIDES = {
 }
 
 
+# Module-level functions in nanchat that have nanoops equivalents but are NOT
+# looked up via F namespace (so the F-namespace patch doesn't touch them).
+# Format: (module_path, attr_name) -> replacement.
+_MODULE_FUNC_OVERRIDES = {
+    # nanchat defines apply_rotary_emb as a top-level function in gpt.py and
+    # calls it directly via module lookup (`gpt.apply_rotary_emb(...)`).
+    # Replacing this attribute swaps in nanoops's autograd Function version.
+    ("nanochat.gpt", "apply_rotary_emb"): nF.apply_rotary_emb,
+}
+
+
 def _patched_mlp_forward(self, x):
     """nanchat MLP.forward, but `F.relu(x).square()` -> `nF.relu_square(x)`.
 
@@ -107,8 +118,9 @@ def _make_patched_F() -> object:
 
 
 def _apply() -> dict[str, dict]:
-    """Apply F-namespace + torch.X + MLP.forward patches. Returns originals dict."""
-    originals: dict[str, dict] = {"F": {}, "torch": {}, "method": {}}
+    """Apply F-namespace + torch.X + module-func + method patches.
+    Returns originals dict for restore."""
+    originals: dict[str, dict] = {"F": {}, "torch": {}, "module_func": {}, "method": {}}
     # F-namespace patch
     proxy = _make_patched_F()
     for modname in _TARGET_MODULES:
@@ -120,6 +132,11 @@ def _apply() -> dict[str, dict]:
     for name, op in _TORCH_OVERRIDES.items():
         originals["torch"][name] = getattr(torch, name)
         setattr(torch, name, op)
+    # Module-level function attribute patch (e.g. nanchat.gpt.apply_rotary_emb)
+    for (modname, attr_name), replacement in _MODULE_FUNC_OVERRIDES.items():
+        mod = importlib.import_module(modname)
+        originals["module_func"][(modname, attr_name)] = getattr(mod, attr_name)
+        setattr(mod, attr_name, replacement)
     # MLP.forward: route the `F.relu(x).square()` chain to fused relu_square
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
@@ -132,6 +149,8 @@ def _restore(originals: dict[str, dict]) -> None:
         importlib.import_module(modname).F = original_F
     for name, op in originals["torch"].items():
         setattr(torch, name, op)
+    for (modname, attr_name), original in originals["module_func"].items():
+        setattr(importlib.import_module(modname), attr_name, original)
     for (modname, cls_name, method_name), original in originals["method"].items():
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
@@ -143,6 +162,7 @@ def patch_nanchat() -> list[str]:
     return (
         [f"F.{n}" for n in _F_OVERRIDES]
         + [f"torch.{n}" for n in _TORCH_OVERRIDES]
+        + [f"{mod}.{attr}" for mod, attr in _MODULE_FUNC_OVERRIDES]
         + ["MLP.forward(relu_square fused)"]
     )
 
