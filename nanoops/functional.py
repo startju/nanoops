@@ -717,3 +717,85 @@ def apply_rotary_emb(
 ) -> torch.Tensor:
     """Rotary positional embedding, mirroring `nanchat/gpt.py:57`."""
     return ApplyRotaryEmb.apply(x, cos, sin)
+
+
+class Where(torch.autograd.Function):
+    """Elementwise `torch.where(cond, a, b)` with grad routing by `cond`.
+
+    Forward picks `a` where cond is True, else `b`. Backward routes the
+    upstream grad to whichever operand was selected: dL/da is g masked by
+    cond, dL/db is g masked by ~cond. `cond` is bool and non-differentiable.
+
+    Broadcasting: cond/a/b can have different broadcastable shapes; the
+    backward unbroadcasts each per-operand grad back to the operand's
+    original shape (same `unbroadcast` helper as `Add` / `Mul`).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        condition: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(condition)
+        ctx.a_shape = a.shape
+        ctx.b_shape = b.shape
+        return torch.where(condition, a, b)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[None, torch.Tensor, torch.Tensor]:
+        (condition,) = ctx.saved_tensors
+        # Bool * float promotes False->0, True->1 — gradient routing without
+        # allocating intermediate zero tensors.
+        grad_a = unbroadcast(grad_output * condition, ctx.a_shape)
+        grad_b = unbroadcast(grad_output * (~condition), ctx.b_shape)
+        return None, grad_a, grad_b  # condition is bool, non-differentiable
+
+
+def where(
+    condition: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """Mirrors `torch.where(condition, a, b)` (3-arg form)."""
+    return Where.apply(condition, a, b)
+
+
+class Roll(torch.autograd.Function):
+    """Cyclic shift along given dim(s), mirroring `torch.roll`.
+
+    Forward applies the shift; backward applies the inverse shift
+    (negate shifts, keep dims). Bijective op — backward saves no tensor,
+    just the integer shift/dim params on ctx.
+
+    `shifts` can be `int` or tuple; `dims` can be `int`, tuple, or `None`
+    (None flattens the tensor first, same as `torch.roll`).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        shifts,
+        dims=None,
+    ) -> torch.Tensor:
+        ctx.shifts = shifts
+        ctx.dims = dims
+        return torch.roll(input, shifts, dims)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
+        shifts = ctx.shifts
+        if isinstance(shifts, (list, tuple)):
+            neg_shifts = tuple(-s for s in shifts)
+        else:
+            neg_shifts = -shifts
+        return torch.roll(grad_output, neg_shifts, ctx.dims), None, None
+
+
+def roll(input: torch.Tensor, shifts, dims=None) -> torch.Tensor:
+    """Mirrors `torch.roll`. shifts: int or tuple; dims: int, tuple, or None."""
+    return Roll.apply(input, shifts, dims)

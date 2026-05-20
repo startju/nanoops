@@ -64,9 +64,9 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 
 ### Tier 2 —— 注意力
 
-- [ ] `apply_rotary_emb`（cos/sin 表继续用 PyTorch）
+- [x] `apply_rotary_emb`（cos/sin 表继续用 PyTorch）
 - [ ] `F.scaled_dot_product_attention`（先用朴素的 `softmax(QK/√d) V`）
-- [ ] `torch.where` / `torch.roll`（eval 与 loss masking 用）
+- [x] `torch.where` / `torch.roll`（eval 与 loss masking 用）
 
 ### Tier 3 —— 性能 / 进阶（可选）
 
@@ -436,8 +436,11 @@ $$
 $(x_1, x_2)$ 被角度 $\theta$（编码在 $(\cos, \sin)$ 里）旋转：
 
 $$
-\begin{pmatrix} y_1 \\ y_2 \end{pmatrix} = R(\theta) \begin{pmatrix} x_1 \\ x_2 \end{pmatrix}, \qquad R(\theta) = \begin{pmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{pmatrix}
+\begin{pmatrix} y_1 & y_2 \end{pmatrix} = \begin{pmatrix} x_1 & x_2 \end{pmatrix} \cdot R(\theta), \qquad R(\theta) = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
 $$
+
+（PyTorch 约定：feature 维在最后，所以把 $(x_1, x_2)$ 当成**行向量**，
+$R(\theta)$ 从右边乘上去。）
 
 展开：
 
@@ -468,13 +471,13 @@ $$
 \frac{\partial L}{\partial x_2} = g_1 \cdot \frac{\partial y_1}{\partial x_2} + g_2 \cdot \frac{\partial y_2}{\partial x_2} = g_1 \sin\theta + g_2 \cos\theta
 $$
 
-*矩阵代数路径（同样结果，换个视角）。* Forward 是 $x$ 的**线性变换**，
-所以 $\partial y / \partial x = R(\theta)$。向量形式链式法则：
-$\partial L / \partial x = R(\theta)^T \cdot g$。旋转矩阵正交：
+*矩阵代数路径（同样结果，换个视角）。* Forward 是 $x$ 的**线性变换**：
+$y = x \cdot R(\theta)$。行向量约定下链式法则给出
+$\partial L / \partial x = g \cdot R(\theta)^T$。旋转矩阵正交：
 $R(\theta)^T = R(\theta)^{-1} = R(-\theta)$，即
 
 $$
-R(\theta)^T = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
+R(\theta)^T = \begin{pmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{pmatrix}
 $$
 
 两条路给出同一个结果：
@@ -489,7 +492,7 @@ backward = "反向旋转"。
 **为什么 $R^T = R^{-1}$。** 旋转矩阵是正交的，直接验证：
 
 $$
-R(\theta)^T R(\theta) = \begin{pmatrix} \cos & -\sin \\ \sin & \cos \end{pmatrix} \begin{pmatrix} \cos & \sin \\ -\sin & \cos \end{pmatrix} = \begin{pmatrix} \cos^2 + \sin^2 & \cos\sin - \sin\cos \\ \sin\cos - \cos\sin & \sin^2 + \cos^2 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}
+R(\theta) R(\theta)^T = \begin{pmatrix} \cos & -\sin \\ \sin & \cos \end{pmatrix} \begin{pmatrix} \cos & \sin \\ -\sin & \cos \end{pmatrix} = \begin{pmatrix} \cos^2 + \sin^2 & \cos\sin - \sin\cos \\ \sin\cos - \cos\sin & \sin^2 + \cos^2 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}
 $$
 
 $\cos^2 + \sin^2 = 1$ 这个恒等式做了所有的活。
@@ -507,3 +510,80 @@ $\cos$ 和 $\sin$ 由非可导的 `arange + outer + cos()/sin()` 预算出来（
 backward 需要 $y$（或 $x$）因为 Jacobian 取决于输入值。Rotary 的 Jacobian
 就是 $R(\theta)$，**只取决于位置不取决于输入张量值**——所以**根本没必要
 从 $x$ 里存什么**。
+
+### 平凡反向算子：Where 和 Roll
+
+为完整性补两个算子——它们的反向都是一行公式，但分别是前面 "Connection to
+ctx memory" 表里 **case A** 和 **case B** 最干净的例子。
+
+**Where**: $y = \text{where}(\text{cond}, a, b)$——`cond` 为真时取 $a$，
+否则取 $b$。
+
+反向按 mask 路由 upstream grad：
+
+$$
+\frac{\partial L}{\partial a} = g \odot \mathbf{1}[\text{cond}], \qquad
+\frac{\partial L}{\partial b} = g \odot \mathbf{1}[\neg\text{cond}]
+$$
+
+梯度只流向被选中的那个操作数；另一个操作数在该位置接收 0。ctx 只存 `cond`
+（bool，1 字节/元素）。
+
+这是 ctx-memory 表里 **case B** 模式最纯粹的形式：存在 "null direction"
+（在 cond=False 的位置扰动 $a$，或在 cond=True 的位置扰动 $b$，都不改 $y$），
+而该方向上的梯度天然为零。bool mask 携带了 backward 需要的全部信息。
+
+和 ReLU 的 `g * (x > 0)` 是同样的 "gradient gating" 思想，但**更通用**——
+mask 可以来自任何条件（`x > threshold`、`mask_token != PAD`、attention 因果
+mask 等），不限于 $x > 0$。
+
+**Roll**: $y = \text{roll}(x, \text{shifts}, \text{dims})$——沿指定维度循环
+移位。
+
+反向应用逆排列：
+
+$$
+\frac{\partial L}{\partial x} = \text{roll}(g, -\text{shifts}, \text{dims})
+$$
+
+ctx **完全不存任何 tensor**——只存整数 `(shifts, dims)` 参数。Roll 是
+bijective 的（排列必有逆），所以 $y$ 完全决定 $x$——但我们连 $y$ 都不需要，
+因为反向公式只引用移位参数。这是 ctx-memory 表里 **case A** 加上额外亮点：
+**ctx tensor 占用为零**。
+
+`shifts` 和 `dims` 是 Python int/tuple，不可导；backward 对它们都返回 `None`。
+
+### 模式：正交变换的反向是"免费"的
+
+上面 Rotary 和 Roll 两节背后有一个结构同构值得点明。两者 forward 都是 $x$
+的**线性变换**（乘某个矩阵 $M$，按 PyTorch 行向量约定，feature 维在最后）：
+
+- Rotary: $y = x \cdot R(\theta)$，$R(\theta)$ 是 2×2 旋转矩阵
+- Roll:   $y = x \cdot P$，$P$ 是置换矩阵
+
+两个矩阵都是**正交矩阵**：$M M^T = I$，等价于 $M^T = M^{-1}$。$y = x M$ 的
+链式法则是 $\partial L / \partial x = g \cdot M^T$，所以对正交 $M$：
+
+$$
+\frac{\partial L}{\partial x} = g \cdot M^{-1}
+$$
+
+一句话：**backward 就是 forward 的逆作用到 grad_output 上**。
+
+| Op | Forward 矩阵 $M$ | $M^{-1}$ | 代码里的 Backward |
+|---|---|---|---|
+| Rotary | $R(\theta)$ | $R(-\theta)$ | forward 公式把 $\sin \to -\sin$ |
+| Roll | $P_k$（移位 $k$） | $P_{-k}$（移位 $-k$） | forward 算子把 $k \to -k$ |
+
+"免费"指的是什么：**不需要物化 Jacobian、不需要存 $x$ 或 $y$、不需要代数化简**。
+**同一段 forward kernel 把唯一的变换参数取反，就是 backward**。
+
+为什么这能成立：正交矩阵的转置**就是**它的逆——两者重合。所以链式法则要求的
+"Jacobian 转置" = 我们熟悉的"逆操作"。对非正交线性算子（比如一般的矩阵乘，
+$W$ 不方或不正交），$W^T \neq W^{-1}$，必须老老实实算转置矩阵乘——这就是
+`Mm` 的反向里 $W^T$ 显式出现的原因（`grad_left = grad_output @ right.T`），
+而那是**不能**化成"forward 把某个参数翻一下"的。
+
+如果将来给 nanoops 加新的线性算子，发现它的矩阵是正交的——DCT、实数版 FFT
+（差个 scale 因子）、Walsh-Hadamard 变换、有符号置换等——它的反向都套这个
+模板。

@@ -72,9 +72,9 @@ adds optional fast-path variants.
 
 ### Tier 2 — attention
 
-- [ ] `apply_rotary_emb` (cos/sin tables stay on PyTorch)
+- [x] `apply_rotary_emb` (cos/sin tables stay on PyTorch)
 - [ ] `F.scaled_dot_product_attention` (start with the naive `softmax(QK/√d) V`)
-- [ ] `torch.where`, `torch.roll` (eval / loss masking)
+- [x] `torch.where`, `torch.roll` (eval / loss masking)
 
 ### Tier 3 — performance / advanced (optional)
 
@@ -473,8 +473,11 @@ split the last dim into halves $x_1 = x[\dots, :d/2]$ and $x_2 = x[\dots, d/2:]$
 Each pair $(x_1, x_2)$ is rotated by angle $\theta$ encoded in $(\cos, \sin)$:
 
 $$
-\begin{pmatrix} y_1 \\ y_2 \end{pmatrix} = R(\theta) \begin{pmatrix} x_1 \\ x_2 \end{pmatrix}, \qquad R(\theta) = \begin{pmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{pmatrix}
+\begin{pmatrix} y_1 & y_2 \end{pmatrix} = \begin{pmatrix} x_1 & x_2 \end{pmatrix} \cdot R(\theta), \qquad R(\theta) = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
 $$
+
+(PyTorch convention: features sit on the last dim, so we treat $(x_1, x_2)$
+as a row vector and apply $R(\theta)$ from the right.)
 
 Component form:
 
@@ -506,13 +509,13 @@ $$
 \frac{\partial L}{\partial x_2} = g_1 \cdot \frac{\partial y_1}{\partial x_2} + g_2 \cdot \frac{\partial y_2}{\partial x_2} = g_1 \sin\theta + g_2 \cos\theta
 $$
 
-*Matrix-algebra path (same result, different angle).* Forward is linear in $x$,
-so $\partial y / \partial x = R(\theta)$. Chain rule in vector form:
-$\partial L / \partial x = R(\theta)^T \cdot g$. For a rotation matrix
+*Matrix-algebra path (same result, different angle).* Forward is linear in $x$:
+$y = x \cdot R(\theta)$. With row vectors, chain rule gives
+$\partial L / \partial x = g \cdot R(\theta)^T$. For a rotation matrix
 $R(\theta)^T = R(\theta)^{-1} = R(-\theta)$:
 
 $$
-R(\theta)^T = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
+R(\theta)^T = \begin{pmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{pmatrix}
 $$
 
 Both paths give the same boxed result:
@@ -528,7 +531,7 @@ opposite rotation direction. Backward = "un-rotate".
 directly:
 
 $$
-R(\theta)^T R(\theta) = \begin{pmatrix} \cos & -\sin \\ \sin & \cos \end{pmatrix} \begin{pmatrix} \cos & \sin \\ -\sin & \cos \end{pmatrix} = \begin{pmatrix} \cos^2 + \sin^2 & \cos\sin - \sin\cos \\ \sin\cos - \cos\sin & \sin^2 + \cos^2 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}
+R(\theta) R(\theta)^T = \begin{pmatrix} \cos & -\sin \\ \sin & \cos \end{pmatrix} \begin{pmatrix} \cos & \sin \\ -\sin & \cos \end{pmatrix} = \begin{pmatrix} \cos^2 + \sin^2 & \cos\sin - \sin\cos \\ \sin\cos - \cos\sin & \sin^2 + \cos^2 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}
 $$
 
 The $\cos^2 + \sin^2 = 1$ identity does all the work.
@@ -548,3 +551,92 @@ differentiable, so backward returns `None` for both.
 Jacobian depends on the input values. Rotary's Jacobian is just $R(\theta)$,
 a function of position only — completely independent of the input tensor's
 values. So there's nothing to save from $x$ at all.
+
+### Trivial-backward ops: Where and Roll
+
+Two ops worth noting for completeness — their backwards are one-liners,
+but they're the cleanest possible illustrations of **case A** and **case B**
+from the "Connection to ctx memory" table earlier in this appendix.
+
+**Where**: $y = \text{where}(\text{cond}, a, b)$ — pick $a$ where `cond` is
+true, else $b$.
+
+Backward routes the upstream grad by the mask:
+
+$$
+\frac{\partial L}{\partial a} = g \odot \mathbf{1}[\text{cond}], \qquad
+\frac{\partial L}{\partial b} = g \odot \mathbf{1}[\neg\text{cond}]
+$$
+
+Grad flows only where that operand was actually picked; the other operand
+gets zero at that position. ctx saves only `cond` (bool, 1 byte/elem).
+
+This is the **case B** pattern in its purest form: there's a "null direction"
+(perturbing $a$ at positions where cond=False, or perturbing $b$ at positions
+where cond=True, doesn't change $y$), and gradient along it is zero by
+construction. The bool mask carries all the information backward needs.
+
+Same gradient-gating idea as ReLU's `g * (x > 0)` — but **more general**, since
+the mask can come from any condition (`x > threshold`, `mask_token != PAD`,
+attention causality mask, etc.), not just $x > 0$.
+
+**Roll**: $y = \text{roll}(x, \text{shifts}, \text{dims})$ — cyclic shift along
+given dim(s).
+
+Backward applies the inverse permutation:
+
+$$
+\frac{\partial L}{\partial x} = \text{roll}(g, -\text{shifts}, \text{dims})
+$$
+
+ctx saves **no tensor at all** — only the integer `(shifts, dims)` params as
+plain attributes. Roll is bijective (a permutation always has an inverse),
+so $y$ fully determines $x$ — but we don't even need $y$, since the backward
+formula only references the shift parameters. This is the **case A** pattern
+with an extra flourish: zero tensor footprint in ctx.
+
+`shifts` and `dims` are Python ints / tuples, non-differentiable; backward
+returns `None` for both.
+
+### Pattern: orthogonal transformations have "free" backwards
+
+The Rotary and Roll sections above share a structural identity worth
+spelling out. Both forwards are *linear* in $x$ (matrix multiplication by
+some $M$, with PyTorch's row-vector convention where features sit on the
+last dim):
+
+- Rotary: $y = x \cdot R(\theta)$ where $R(\theta)$ is a 2×2 rotation matrix
+- Roll:   $y = x \cdot P$ where $P$ is a permutation matrix
+
+Both matrices are **orthogonal**: $M M^T = I$, equivalently $M^T = M^{-1}$.
+The chain rule for $y = x M$ is $\partial L / \partial x = g \cdot M^T$,
+so for orthogonal $M$:
+
+$$
+\frac{\partial L}{\partial x} = g \cdot M^{-1}
+$$
+
+In words: **backward is the inverse forward applied to grad_output**.
+
+| Op | Forward matrix $M$ | $M^{-1}$ | Backward in code |
+|---|---|---|---|
+| Rotary | $R(\theta)$ | $R(-\theta)$ | run forward formula with $\sin \to -\sin$ |
+| Roll | $P_k$ (shift by $k$) | $P_{-k}$ (shift by $-k$) | run forward op with $k \to -k$ |
+
+What "free" means here: **no Jacobian materialization, no saved tensors of
+$x$ or $y$, no closed-form simplification needed**. The same forward kernel
+with the single transformation parameter negated computes the backward.
+
+Why this works: an orthogonal matrix's transpose IS its inverse — they
+coincide. So "Jacobian transpose" (which chain rule demands) equals
+"inverse Jacobian" (which corresponds to a familiar inverse operation).
+For non-orthogonal linear ops (like a generic matmul with non-square or
+non-orthogonal $W$), $W^T \neq W^{-1}$ and you have to actually carry out
+the transpose-matmul; that's why $W^T$ shows up explicitly in `Mm`'s
+backward (`grad_left = grad_output @ right.T`) and *isn't* expressible as
+"forward with one parameter flipped".
+
+If you ever add a new linear op to nanoops and notice its matrix is
+orthogonal — DCT, the real-valued FFT (up to a scaling factor),
+Walsh-Hadamard, signed permutations, etc. — its backward fits this template
+out of the box.
