@@ -330,3 +330,82 @@ $\mathbf{1}$: adding a constant to every $x_i$ leaves $y$ unchanged (the
 constant cancels in numerator and denominator). The $\langle g, y \rangle$
 subtraction removes exactly the component of $g$ aligned with that null
 direction.
+
+### Cross-entropy (fused log-softmax + NLL)
+
+For a single sample (one slice along the class dim of length $C$) with logits
+$x \in \mathbb{R}^C$ and integer target $t \in \{0, \dots, C-1\}$:
+
+$$
+L = -\log(\text{softmax}(x)_t) = -x_t + \log \sum_j e^{x_j}
+$$
+
+The second form is **log-sum-exp minus the target logit** — the fused view
+that PyTorch's `F.cross_entropy` uses, avoiding any explicit softmax tensor
+in forward (with the same max-subtract trick inside LSE for stability as
+Softmax).
+
+**Backward.** Differentiate term by term:
+
+- $\partial(-x_t)/\partial x_j = -\delta_{jt}$ (−1 at the target index, 0 elsewhere).
+- $\partial(\log \sum_k e^{x_k})/\partial x_j = e^{x_j}/Z = y_j$ (chain rule: $\log \to 1/Z$, sum derivative picks $e^{x_j}$).
+
+Adding the two:
+
+$$
+\boxed{\ \frac{\partial L}{\partial x} = \text{softmax}(x) - \text{one\_hot}(t)\ }
+$$
+
+The full $(C, C)$ softmax Jacobian **never gets materialized** — log's $1/Z$
+and softmax's Jacobian cancel into a single elementwise subtraction. This is
+one of the most elegant simplifications in deep learning.
+
+**Why the fusion cancels so cleanly.** If you composed naively as
+`nll(log(softmax(x)), t)`:
+
+- $\log$ backward: $g_y = -\frac{1}{y_t}\,\delta_{it}$ (a $1/y_t$ singularity at the target!)
+- Softmax backward: $y \odot (g_y - \langle g_y, y \rangle)$
+
+Substituting: $\langle g_y, y \rangle = (-1/y_t) \cdot y_t = -1$, so
+$g_x = y \odot g_y + y = y - \text{one\_hot}(t)$ — the $y_t$ at the target
+position cancels the $1/y_t$. Same answer, but the naive path:
+
+- creates an intermediate $-1/y_t$ that **underflows in bf16** when $y_t$ is small,
+- materializes the softmax Jacobian's $\langle g, y \rangle$ inner product,
+- runs through 3 separate backward functions instead of one.
+
+The fused derivation makes the cancellation obvious upfront and avoids the
+numerical hazard.
+
+**Memory and ctx.** Save only $y$ (the softmax output) and $t$ (the target
+indices). The full backward is one elementwise subtraction plus a scatter
+into the target positions:
+
+```python
+grad_x = y                  # copy softmax output
+grad_x[range(N), t] -= 1    # subtract 1 at each target
+```
+
+**Comparison with what we've seen so far.**
+
+| Op | Backward simplification | What "disappears" |
+|---|---|---|
+| RmsNorm | $(1/n)(g - y \cdot \text{mean}(g \odot y))$ | sqrt + division chain |
+| Softmax | $y \odot (g - \langle g, y \rangle)$ | full $(D, D)$ Jacobian materialization |
+| ReLU² | $2 y g$ | mask op + multiply chain |
+| **Cross-entropy** | $y - \text{one\_hot}(t)$ | **softmax Jacobian AND log's $1/y$ — both cancel** |
+
+Cross-entropy is the **most dramatic** of these: two non-trivial ops ($\log$
+and $\text{softmax}$) compose into a single subtraction. The cancellation is
+no accident — $\log \circ \text{softmax}$ is the canonical "log-likelihood"
+function whose gradient w.r.t. unnormalized logits is *always* "prediction
+minus target" for any classification-style loss. That's what makes
+cross-entropy + softmax the universal classification loss.
+
+**`ignore_index`** (nanchat uses `ignore_index=-1` at `gpt.py:477`): positions
+where $t = $ `ignore_index` contribute 0 to the loss AND 0 to the gradient.
+Zero out the corresponding rows of `grad_x` before any reduction.
+
+**Reduction** (`'mean'` / `'sum'` / `'none'`): scale `grad_x` by
+$1 / N_{\text{valid}}$ for `'mean'` (where $N_{\text{valid}}$ excludes
+`ignore_index` positions), by $1$ for `'sum'`, or no scaling for `'none'`.

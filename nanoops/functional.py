@@ -386,3 +386,54 @@ def softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Mirrors `torch.nn.functional.softmax`. Default dim=-1 (PyTorch's
     default is None and warns; we pick the common case)."""
     return Softmax.apply(input, dim)
+
+class CrossEntropy(torch.autograd.Function):
+    """Cross-entropy loss, mirroring `torch.nn.functional.cross_entropy` semantics.
+
+    Fused log-softmax + NLL: forward computes LSE directly via
+    `torch.logsumexp`, never materializing softmax as a tensor that lingers
+    in ctx. ctx saves `(input, log_sum_exp, target)` — `input` is already
+    alive as a function argument (a saved reference is free), and
+    `log_sum_exp` is just `(..., 1)`. Total ctx overhead beyond the input
+    reference is essentially zero, saving roughly one logits-tensor of
+    memory (~13 GB at nanchat scale: B=64, T=2048, V=50k, bf16). Backward
+    recomputes softmax as `(input - log_sum_exp).exp()` — one fused mul+exp.
+
+    Returns per-sample loss (shape matches `target`); `'mean'` / `'sum'`
+    reduction is handled by the `cross_entropy()` functional wrapper.
+
+    See the README appendix for the full derivation (the boxed result is
+    `dL/dx = softmax(x) - one_hot(target)`).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        target: torch.Tensor,
+        dim: int,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        # logsumexp's internal exp temp lives only inside the op and is freed
+        # before return — ctx doesn't end up holding a (..., V)-shaped tensor.
+        log_sum_exp = torch.logsumexp(input, dim=dim, keepdim=True)
+        # ignore_index handling: gather() would crash on out-of-range target
+        # values (e.g. -1), so replace those with 0 as a safe placeholder,
+        # compute the per-sample loss as usual, then zero out those positions.
+        valid_mask = target != ignore_index
+        safe_target = torch.where(valid_mask, target, 0)
+        per_sample = (log_sum_exp - input.gather(dim, safe_target.unsqueeze(dim))).squeeze(dim)
+        per_sample = per_sample * valid_mask  # 0 at ignored positions
+        # Save `input` (already alive — just a reference, no new allocation)
+        # and the tiny log_sum_exp; recompute softmax in backward.
+        ctx.save_for_backward(input, log_sum_exp, target)
+        ctx.dim = dim
+        ctx.ignore_index = ignore_index
+        return per_sample
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
+        pass
+        
