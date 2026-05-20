@@ -55,8 +55,11 @@ _TARGET_MODULES = [
     # bare `nn.Linear` could slip in via future code. Patching here is
     # cheap insurance — within one NANOOPS=1 process, replacing PyTorch's
     # F.embedding / F.linear with nanoops's is exactly the intent.
-    "torch.nn.modules.sparse",   # nn.Embedding -> F.embedding
-    "torch.nn.modules.linear",   # nn.Linear -> F.linear
+    "torch.nn.modules.sparse",          # nn.Embedding -> F.embedding
+    "torch.nn.modules.linear",          # nn.Linear -> F.linear
+    "torch.nn.modules.normalization",   # nn.RMSNorm / nn.LayerNorm -> F.rms_norm / F.layer_norm
+    "torch.nn.modules.loss",            # nn.CrossEntropyLoss -> F.cross_entropy
+    "torch.nn.modules.activation",      # nn.Softmax -> F.softmax
 ]
 
 

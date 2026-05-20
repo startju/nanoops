@@ -405,9 +405,22 @@ class Softmax(torch.autograd.Function):
         return grad_input, None  # None for dim (int, non-differentiable)
 
 
-def softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
+def softmax(
+    input: torch.Tensor,
+    dim: int = -1,
+    _stacklevel: int = 3,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """Mirrors `torch.nn.functional.softmax`. Default dim=-1 (PyTorch's
-    default is None and warns; we pick the common case)."""
+    default is None and warns; we pick the common case).
+
+    `_stacklevel` and `dtype` are accepted for signature compatibility with
+    `torch.nn.functional.softmax` (so `nn.Softmax.forward()` can route here
+    via monkey-patching); `_stacklevel` is ignored, `dtype` triggers a cast
+    of the input before softmax (matching PyTorch's behavior).
+    """
+    if dtype is not None:
+        input = input.to(dtype)
     return Softmax.apply(input, dim)
 
 
@@ -580,8 +593,12 @@ class CrossEntropy(torch.autograd.Function):
 def cross_entropy(
     input: torch.Tensor,
     target: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    size_average=None,  # deprecated in PyTorch
     ignore_index: int = -100,
+    reduce=None,  # deprecated in PyTorch
     reduction: str = "mean",
+    label_smoothing: float = 0.0,
     dim: int = -1,
 ) -> torch.Tensor:
     """Mirrors `torch.nn.functional.cross_entropy`.
@@ -607,7 +624,17 @@ def cross_entropy(
       - `weight` (per-class loss weighting).
       - `label_smoothing`.
       - Deprecated `size_average` / `reduce` flags.
+    Signatures are accepted (for nn.CrossEntropyLoss.forward routing) but
+    non-default values raise NotImplementedError.
     """
+    if weight is not None:
+        raise NotImplementedError("nanoops.cross_entropy: weight not supported")
+    if label_smoothing != 0.0:
+        raise NotImplementedError("nanoops.cross_entropy: label_smoothing not supported")
+    if size_average is not None or reduce is not None:
+        raise NotImplementedError(
+            "nanoops.cross_entropy: deprecated size_average/reduce not supported"
+        )
     per_sample = CrossEntropy.apply(input, target, dim, ignore_index)
     if reduction == "none":
         return per_sample
