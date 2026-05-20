@@ -59,6 +59,22 @@ _TORCH_OVERRIDES = {
     "tanh": nF.tanh,
 }
 
+
+def _patched_mlp_forward(self, x):
+    """nanchat MLP.forward, but `F.relu(x).square()` -> `nF.relu_square(x)`.
+
+    `F.relu(x).square()` is a TWO-op chain: F.relu returns a fresh tensor,
+    then `.square()` is a tensor method on it. Neither a single F-namespace
+    patch nor a single torch.X patch can route the chain to nanoops's fused
+    `relu_square` — we have to replace the whole forward. nanchat has exactly
+    one such site (`gpt.py:137` MLP.forward), so a targeted class-method
+    swap is the minimal fix.
+    """
+    x = self.c_fc(x)
+    x = nF.relu_square(x)
+    x = self.c_proj(x)
+    return x
+
 _TARGET_MODULES = [
     # nanchat modules — call F.* directly
     "nanochat.gpt",
@@ -91,8 +107,8 @@ def _make_patched_F() -> object:
 
 
 def _apply() -> dict[str, dict]:
-    """Apply F-namespace + torch.X patches. Returns originals dict for restore."""
-    originals: dict[str, dict] = {"F": {}, "torch": {}}
+    """Apply F-namespace + torch.X + MLP.forward patches. Returns originals dict."""
+    originals: dict[str, dict] = {"F": {}, "torch": {}, "method": {}}
     # F-namespace patch
     proxy = _make_patched_F()
     for modname in _TARGET_MODULES:
@@ -104,6 +120,10 @@ def _apply() -> dict[str, dict]:
     for name, op in _TORCH_OVERRIDES.items():
         originals["torch"][name] = getattr(torch, name)
         setattr(torch, name, op)
+    # MLP.forward: route the `F.relu(x).square()` chain to fused relu_square
+    gpt_mod = importlib.import_module("nanochat.gpt")
+    originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
+    gpt_mod.MLP.forward = _patched_mlp_forward
     return originals
 
 
@@ -112,12 +132,19 @@ def _restore(originals: dict[str, dict]) -> None:
         importlib.import_module(modname).F = original_F
     for name, op in originals["torch"].items():
         setattr(torch, name, op)
+    for (modname, cls_name, method_name), original in originals["method"].items():
+        cls = getattr(importlib.import_module(modname), cls_name)
+        setattr(cls, method_name, original)
 
 
 def patch_nanchat() -> list[str]:
     """Permanently swap nanoops into nanchat. Returns the list of patched op names."""
     _apply()
-    return [f"F.{n}" for n in _F_OVERRIDES] + [f"torch.{n}" for n in _TORCH_OVERRIDES]
+    return (
+        [f"F.{n}" for n in _F_OVERRIDES]
+        + [f"torch.{n}" for n in _TORCH_OVERRIDES]
+        + ["MLP.forward(relu_square fused)"]
+    )
 
 
 def maybe_patch_nanchat(env_var: str = "NANOOPS") -> bool:
