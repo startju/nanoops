@@ -661,7 +661,11 @@ class Sigmoid(torch.autograd.Function):
     def forward(
         ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor
     ) -> torch.Tensor:
-        y = torch.sigmoid(x)
+        # Use the tensor method `x.sigmoid()` rather than `torch.sigmoid(x)`:
+        # `nanoops.integration` monkey-patches `torch.sigmoid` to *this*
+        # function, so calling `torch.sigmoid(x)` here would infinitely
+        # recurse. Tensor methods aren't shadowed by that patch.
+        y = x.sigmoid()
         ctx.save_for_backward(y)
         return y
 
@@ -689,7 +693,9 @@ class Tanh(torch.autograd.Function):
     def forward(
         ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor
     ) -> torch.Tensor:
-        y = torch.tanh(x)
+        # See Sigmoid.forward for why we use the tensor method here instead
+        # of the top-level `torch.tanh` function.
+        y = x.tanh()
         ctx.save_for_backward(y)
         return y
 

@@ -1,8 +1,16 @@
 """Monkey-patch helpers to swap nanoops into nanchat.
 
-Replaces the `F` (torch.nn.functional) namespace in each nanchat module with
-a proxy whose specific attributes route through nanoops. Everything not
-overridden falls through to the real `torch.nn.functional`.
+Two layers of patching:
+
+1. **F namespace** — replaces the `F` (torch.nn.functional) attribute on each
+   target module with a proxy whose specific attributes route through nanoops.
+   Everything not overridden falls through to the real `torch.nn.functional`.
+
+2. **torch top-level functions** — overrides individual attributes on the
+   `torch` module itself (sigmoid, tanh). nanchat calls these as
+   `torch.sigmoid(x)` / `torch.tanh(x)`, not via the F namespace. Targeted
+   per-attribute swaps (NOT a full-module proxy) so the rest of `torch`
+   stays untouched.
 
 Two entry points:
   - `patch_nanchat()`: permanent swap (used by `scripts/base_train.py` when
@@ -12,15 +20,12 @@ Two entry points:
 
 Patched ops:
     F.linear, F.embedding, F.rms_norm, F.cross_entropy, F.softmax,
-    F.scaled_dot_product_attention.
+    F.scaled_dot_product_attention, torch.sigmoid, torch.tanh.
 
 NOT patched (intentional):
   - F.relu — nanchat does `F.relu(x).square()` (a chain of two ops); nanoops's
     fused `relu_square` would need to replace the whole chain at a different
     call site, not the `F.relu` slot.
-  - torch.sigmoid / torch.tanh — accessed via `torch.X`, not `F.X`. Patching
-    `torch` globally is too invasive; module-level proxies aren't worth the
-    complexity for these two ops.
 """
 
 from __future__ import annotations
@@ -29,18 +34,28 @@ import contextlib
 import importlib
 from typing import Iterator
 
+import torch
 import torch.nn.functional as F_orig
 
 import nanoops.functional as nF
 
 
-_OVERRIDES = {
+_F_OVERRIDES = {
     "linear": nF.linear,
     "embedding": nF.embedding,
     "rms_norm": nF.rms_norm,
     "cross_entropy": nF.cross_entropy,
     "softmax": nF.softmax,
     "scaled_dot_product_attention": nF.scaled_dot_product_attention,
+}
+
+_TORCH_OVERRIDES = {
+    # Patched as attributes directly on the `torch` module — nanchat calls
+    # `torch.sigmoid(x)` / `torch.tanh(x)` (not via F namespace). Scope is the
+    # whole Python process, but only these two names are touched; the rest of
+    # `torch` is untouched.
+    "sigmoid": nF.sigmoid,
+    "tanh": nF.tanh,
 }
 
 _TARGET_MODULES = [
@@ -69,32 +84,39 @@ def _make_patched_F() -> object:
     for attr in dir(F_orig):
         if not attr.startswith("_"):
             setattr(proxy, attr, getattr(F_orig, attr))
-    for name, op in _OVERRIDES.items():
+    for name, op in _F_OVERRIDES.items():
         setattr(proxy, name, op)
     return proxy
 
 
-def _apply() -> dict[str, object]:
-    """Patch the `F` attribute of every target module. Returns originals dict."""
-    originals: dict[str, object] = {}
+def _apply() -> dict[str, dict]:
+    """Apply F-namespace + torch.X patches. Returns originals dict for restore."""
+    originals: dict[str, dict] = {"F": {}, "torch": {}}
+    # F-namespace patch
     proxy = _make_patched_F()
     for modname in _TARGET_MODULES:
         mod = importlib.import_module(modname)
         if hasattr(mod, "F"):
-            originals[modname] = mod.F
+            originals["F"][modname] = mod.F
             mod.F = proxy
+    # torch.X attribute patch
+    for name, op in _TORCH_OVERRIDES.items():
+        originals["torch"][name] = getattr(torch, name)
+        setattr(torch, name, op)
     return originals
 
 
-def _restore(originals: dict[str, object]) -> None:
-    for modname, original_F in originals.items():
+def _restore(originals: dict[str, dict]) -> None:
+    for modname, original_F in originals["F"].items():
         importlib.import_module(modname).F = original_F
+    for name, op in originals["torch"].items():
+        setattr(torch, name, op)
 
 
 def patch_nanchat() -> list[str]:
     """Permanently swap nanoops into nanchat. Returns the list of patched op names."""
     _apply()
-    return list(_OVERRIDES.keys())
+    return [f"F.{n}" for n in _F_OVERRIDES] + [f"torch.{n}" for n in _TORCH_OVERRIDES]
 
 
 @contextlib.contextmanager

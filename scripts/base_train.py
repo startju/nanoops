@@ -41,7 +41,7 @@ from scripts.base_eval import evaluate_core
 if os.environ.get("NANOOPS"):
     from nanoops.integration import patch_nanchat
     _patched_ops = patch_nanchat()
-    print(f"[nanoops] swapped in: F.{', F.'.join(_patched_ops)}")
+    print(f"[nanoops] swapped in: {', '.join(_patched_ops)}")
 
 print_banner()
 
