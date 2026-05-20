@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -799,3 +801,170 @@ class Roll(torch.autograd.Function):
 def roll(input: torch.Tensor, shifts, dims=None) -> torch.Tensor:
     """Mirrors `torch.roll`. shifts: int or tuple; dims: int, tuple, or None."""
     return Roll.apply(input, shifts, dims)
+
+
+class ScaledDotProductAttention(torch.autograd.Function):
+    """Naive (non-Flash) scaled dot-product attention with explicit backward.
+
+    Forward (row-vector convention, features on last dim):
+        S = (Q @ K^T) * scale         # scores, shape (..., L, S)
+        S += mask / -inf where masked # optional causal or attn_mask
+        P = softmax(S, dim=-1)        # attention probs
+        O = P @ V                     # output, shape (..., L, D_v)
+
+    Backward (closed form, derivable from chain rule over the three ops):
+        dV = P^T @ g
+        dP = g @ V^T
+        dS = P * (dP - sum(P * dP, dim=-1, keepdim=True))      # softmax_backward
+        dQ = (dS * scale) @ K
+        dK = (dS * scale)^T @ Q
+
+    ctx saves Q, K, V (originals; pre-GQA-expand), and P. Saving P is the
+    "naive" memory strategy — O(B*H*L*S). Flash Attention saves only the
+    normalization stats (L = log-sum-exp, M = max), recomputes P from Q/K
+    in backward at O(B*H*L) extra compute but O(B*H*L) memory. We do not.
+
+    Args
+    ----
+    query, key, value : Tensor
+        Shapes (..., L, D_k), (..., S, D_k), (..., S, D_v).
+    attn_mask : Tensor or None
+        bool tensor → True keeps the position, False masks (sets score to -inf).
+        float tensor → added to scores (use -inf or large negative to mask).
+        Mutually exclusive with is_causal.
+    is_causal : bool
+        Lower-triangular causal mask (tril with diagonal=S-L offset, so it
+        works for both L==S training and L<S cached generation).
+    scale : float or None
+        Defaults to 1/sqrt(d_k).
+    enable_gqa : bool
+        Grouped-query attention. If True and Q has more heads than K/V,
+        repeats K/V along the heads dim by factor G = H_q / H_kv.
+        Forward expands K/V via repeat_interleave; backward sums grads
+        from the G replicas back into H_kv slots (via unflatten + sum).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> torch.Tensor:
+        if is_causal and attn_mask is not None:
+            raise ValueError("is_causal and attn_mask are mutually exclusive")
+
+        d_k = query.shape[-1]
+        if scale is None:
+            scale = 1.0 / math.sqrt(d_k)
+
+        # GQA: repeat K/V heads to match Q heads.
+        H_q = query.shape[-3] if query.ndim >= 3 else 1
+        H_kv = key.shape[-3] if key.ndim >= 3 else 1
+        if enable_gqa and H_q != H_kv:
+            assert H_q % H_kv == 0, (
+                f"GQA needs H_q ({H_q}) divisible by H_kv ({H_kv})"
+            )
+            G = H_q // H_kv
+            key_e = key.repeat_interleave(G, dim=-3)
+            value_e = value.repeat_interleave(G, dim=-3)
+        else:
+            G = 1
+            key_e, value_e = key, value
+
+        # scores = Q @ K^T * scale
+        scores = (query @ key_e.transpose(-2, -1)) * scale
+
+        if is_causal:
+            L, S = scores.shape[-2], scores.shape[-1]
+            # Upper-left aligned causal (matches PyTorch SDPA semantics).
+            # For L==S this is standard lower-triangular. For L != S, the
+            # causal triangle sits at the top-left of the L×S grid, NOT
+            # right-aligned to the K edge — this is PyTorch's documented
+            # convention. Cached-generation use cases (where you want
+            # right-aligned causal) should pass an explicit attn_mask.
+            causal_mask = torch.ones(L, S, dtype=torch.bool, device=scores.device).tril()
+            scores = scores.masked_fill(~causal_mask, float("-inf"))
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                scores = scores.masked_fill(~attn_mask, float("-inf"))
+            else:
+                scores = scores + attn_mask
+
+        probs = torch.softmax(scores, dim=-1)
+        output = probs @ value_e
+
+        ctx.save_for_backward(query, key, value, probs)
+        ctx.scale = scale
+        ctx.G = G
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
+        query, key, value, probs = ctx.saved_tensors
+        scale = ctx.scale
+        G = ctx.G
+
+        # Re-expand K/V to match probs's head count (cheap; same op as forward).
+        if G > 1:
+            key_e = key.repeat_interleave(G, dim=-3)
+            value_e = value.repeat_interleave(G, dim=-3)
+        else:
+            key_e, value_e = key, value
+
+        # dL/dV_e = P^T @ g
+        grad_value_e = probs.transpose(-2, -1) @ grad_output
+
+        # dL/dP = g @ V_e^T
+        grad_probs = grad_output @ value_e.transpose(-2, -1)
+
+        # softmax_backward: dL/dS = P * (dP - sum(P*dP, dim=-1, keepdim))
+        # Note: masked positions have P=0, so dS=0 there — masks naturally
+        # don't propagate grad. Also: this is the same formula nanoops's
+        # Softmax uses (the "save y, not x" trick).
+        grad_scores = probs * (grad_probs - (probs * grad_probs).sum(dim=-1, keepdim=True))
+
+        # Fold scale into dS once, used by both dQ and dK.
+        grad_scores = grad_scores * scale
+
+        # dL/dQ = dS @ K_e
+        grad_query = grad_scores @ key_e
+
+        # dL/dK_e = dS^T @ Q
+        grad_key_e = grad_scores.transpose(-2, -1) @ query
+
+        # GQA backward: collapse G replicas of K/V back into H_kv heads.
+        # repeat_interleave([a, b], G, dim=-3) -> [a]*G ++ [b]*G; backward
+        # sums each G-block back to a single element.
+        if G > 1:
+            # (..., H_q, S, D) -> (..., H_kv, G, S, D) -> sum over G (dim=-3).
+            grad_key = grad_key_e.unflatten(-3, (-1, G)).sum(dim=-3)
+            grad_value = grad_value_e.unflatten(-3, (-1, G)).sum(dim=-3)
+        else:
+            grad_key = grad_key_e
+            grad_value = grad_value_e
+
+        # query, key, value, attn_mask, is_causal, scale, enable_gqa
+        return grad_query, grad_key, grad_value, None, None, None, None
+
+
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """Mirrors `F.scaled_dot_product_attention` (causal + mask + GQA)."""
+    return ScaledDotProductAttention.apply(
+        query, key, value, attn_mask, is_causal, scale, enable_gqa
+    )

@@ -73,13 +73,39 @@ adds optional fast-path variants.
 ### Tier 2 — attention
 
 - [x] `apply_rotary_emb` (cos/sin tables stay on PyTorch)
-- [ ] `F.scaled_dot_product_attention` (start with the naive `softmax(QK/√d) V`)
+- [x] `F.scaled_dot_product_attention` (naive `softmax(QK/√d) V`; full nanchat parity: is_causal + attn_mask + enable_gqa)
 - [x] `torch.where`, `torch.roll` (eval / loss masking)
 
-### Tier 3 — performance / advanced (optional)
+### Tier 3 — fused kernels in Triton (optional)
 
-- ~~FP8 matmul wrapper around `torch._scaled_mm` + custom `autograd.Function`~~ — **skip**: nanchat already has this in `nanochat/fp8.py` with custom autograd (saving FP8 tensors in ctx instead of fp32, per commit d9678ff). Re-implementing in nanoops would duplicate working production code.
-- [ ] FlashAttention-3 shim with SDPA fallback (mirrors `nanochat/flash_attention.py`)
+This tier is where nanoops graduates from "Python composition of autograd
+Functions" to **actual fused GPU kernels written in Triton**. The teaching
+goal shifts: instead of "what closed-form backward saves memory in the
+autograd graph?", the question becomes "what single GPU kernel can replace
+N PyTorch ops + N-1 intermediate allocations?".
+
+All items below are to be implemented as **Triton kernels** with thin
+`autograd.Function` Python wrappers (forward + backward kernels both in
+Triton). Same end-to-end signature as the Tier 1/2 ops; what's different
+is that ctx no longer materializes intermediates because the kernel
+recomputes from saved inputs on-chip.
+
+- [ ] **FlashAttention SDPA**: tiled QK^T + online softmax + PV in a single
+      kernel. Saves only log-sum-exp + max stats (O(B·H·L)); recomputes P
+      tile-by-tile in backward. Replaces the naive Tier 2 SDPA's O(B·H·L²) ctx.
+      Optional FA-3 kernel shim + SDPA fallback for hardware dispatch
+      (mirrors `nanochat/flash_attention.py`).
+- [ ] **`logit_softcap`**: `softcap * tanh(x / softcap)` (`gpt.py:472`).
+      Fused elementwise kernel — backward only needs `tanh_out` on-chip.
+- [ ] **`mlp_relu_square`**: `linear(relu²(linear(x)))` (full MLP block at
+      `gpt.py:135–138`). Fuses 2 matmuls + activation; needs only `h1`
+      saved (recover `r` and `h2` from `h1`'s sign + `h1²` in the kernel).
+- [ ] **`sigmoid_gated_mul`**: `sigmoid(a) * b` (smear / VE gate at
+      `gpt.py:94, 436, 444, 448`). Fused elementwise — saves sigmoid output + `b`.
+- [ ] **`rms_norm_linear`**: `linear(rms_norm(x), W)` (pre-norm projection).
+      Fuses normalize + projection in one kernel. Tricky for nanchat's QKV
+      fan-out (one norm → 3 projections share input); only a clean win on
+      the output projection.
 
 ### Conventions for each new op
 
@@ -640,3 +666,91 @@ If you ever add a new linear op to nanoops and notice its matrix is
 orthogonal — DCT, the real-valued FFT (up to a scaling factor),
 Walsh-Hadamard, signed permutations, etc. — its backward fits this template
 out of the box.
+
+### ScaledDotProductAttention
+
+This is the **capstone Tier 2 op** — it fuses two matmuls and one softmax into
+a single autograd.Function, with the backward derived as the closed-form chain
+through all three. Same trick as `CrossEntropy` (fused logsoftmax + nll), but
+applied to attention.
+
+**Forward** (PyTorch row-vector convention, features on the last dim):
+
+$$
+S = \frac{Q K^T}{\sqrt{d_k}}, \qquad P = \text{softmax}(S, \text{dim}=-1), \qquad O = P V
+$$
+
+Shapes: $Q \in \mathbb{R}^{... \times L \times d_k}$, $K \in \mathbb{R}^{... \times S \times d_k}$,
+$V \in \mathbb{R}^{... \times S \times d_v}$, $O \in \mathbb{R}^{... \times L \times d_v}$.
+Optional causal/attn_mask sets entries of $S$ to $-\infty$ before softmax;
+masked entries become exactly $0$ in $P$.
+
+**Backward.** Given upstream $g = \partial L / \partial O$, we chain through
+three operations. None of the steps require materializing the Jacobians — every
+gradient is a single matmul or a closed-form softmax pull-back.
+
+*Step 1: through $O = P V$.* Same template as `Mm`:
+
+$$
+\frac{\partial L}{\partial V} = P^T g, \qquad \frac{\partial L}{\partial P} = g V^T
+$$
+
+(For nanoops's row-vector convention: $g \in \mathbb{R}^{L \times d_v}$,
+so $P^T g \in \mathbb{R}^{S \times d_v}$ has $V$'s shape, and $g V^T \in \mathbb{R}^{L \times S}$ has $P$'s shape.)
+
+*Step 2: through $P = \text{softmax}(S)$.* This is the exact same softmax-backward
+formula derived earlier in this appendix — saved in nanoops's `Softmax` class as
+the "save $y$, not $x$" trick. Per row:
+
+$$
+\frac{\partial L}{\partial S} = P \odot \left(\frac{\partial L}{\partial P} - \text{sum}\!\left(P \odot \frac{\partial L}{\partial P}, \text{dim}=-1, \text{keepdim}=\text{True}\right)\right)
+$$
+
+The sum-correction is the part that makes softmax-backward dense — every output
+probability depends on every input score (they all share the same denominator),
+so the gradient must subtract a row-shared scalar.
+
+**Why masks don't need special-case handling.** At masked positions $P_{ij} = 0$,
+so $\partial L / \partial S_{ij} = P_{ij} \cdot (\dots) = 0$. The gradient is
+naturally zero there — no extra masking needed in backward.
+
+*Step 3: through $S = QK^T / \sqrt{d_k}$.* Two matmul backwards, scaled:
+
+$$
+\frac{\partial L}{\partial Q} = \frac{1}{\sqrt{d_k}} \frac{\partial L}{\partial S} \cdot K, \qquad \frac{\partial L}{\partial K} = \frac{1}{\sqrt{d_k}} \left(\frac{\partial L}{\partial S}\right)^T \! Q
+$$
+
+Boxing the final closed-form:
+
+$$
+\boxed{
+\begin{aligned}
+\frac{\partial L}{\partial V} &= P^T g \\
+\frac{\partial L}{\partial Q} &= \tfrac{1}{\sqrt{d_k}} \,\bigl[P \odot (g V^T - \text{sum}(P \odot g V^T, \text{dim}=-1, \text{keepdim}))\bigr] \cdot K \\
+\frac{\partial L}{\partial K} &= \tfrac{1}{\sqrt{d_k}} \,\bigl[P \odot (g V^T - \text{sum}(P \odot g V^T, \text{dim}=-1, \text{keepdim}))\bigr]^T \! \cdot Q
+\end{aligned}
+}
+$$
+
+**Memory and ctx.** nanoops's `ScaledDotProductAttention.forward` saves
+$(Q, K, V, P)$ — four tensors. The expensive one is $P$ at shape
+$(B, H, L, S)$ — that's the **naive** memory strategy: $O(B \cdot H \cdot L \cdot S)$,
+or $O(B \cdot H \cdot L^2)$ for self-attention. This is what FlashAttention
+optimizes away: by saving only the per-row normalization stats (log-sum-exp and
+max, each $O(B \cdot H \cdot L)$) and recomputing $P$ tile-by-tile in backward,
+ctx memory drops by a factor of $S$. nanoops's Tier 3 plan is to implement that
+version in Triton (see TODO).
+
+**GQA (Grouped Query Attention).** When `enable_gqa=True` and $H_q > H_{kv}$,
+forward expands $K, V$ along the heads dim by a factor $G = H_q / H_{kv}$ using
+`repeat_interleave`. Backward then collapses the expanded grads back to
+$H_{kv}$ heads via `unflatten + sum` — the `repeat`/`unflatten+sum` pair is the
+standard `repeat_interleave` adjoint. ctx saves the **un-expanded** $K, V$
+(re-expands cheaply in backward) so we don't pay the $G\times$ memory tax twice.
+
+**Why this op is so satisfying to derive.** Every step uses a backward
+**already derived in this appendix**: matmul (Mm), softmax (Softmax),
+elementwise scaling (Mul). SDPA is just three of them strung together — the
+"fused" thing is that they sit inside one `autograd.Function` so PyTorch's
+autograd engine sees a single node instead of a chain, and we can hand-allocate
+ctx (just $Q, K, V, P$) instead of letting autograd save every intermediate.
