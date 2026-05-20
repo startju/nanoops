@@ -43,7 +43,21 @@ _OVERRIDES = {
     "scaled_dot_product_attention": nF.scaled_dot_product_attention,
 }
 
-_TARGET_MODULES = ["nanochat.gpt", "nanochat.flash_attention", "nanochat.engine"]
+_TARGET_MODULES = [
+    # nanchat modules — call F.* directly
+    "nanochat.gpt",
+    "nanochat.flash_attention",
+    "nanochat.engine",
+    # PyTorch nn module internals — `nn.X.forward()` looks up F.* from
+    # its own host module's namespace, not from any of the nanchat modules
+    # above. nanchat overrides `Linear.forward` so `nn.Linear` is moot in
+    # practice, but `nn.Embedding` is used as-is (wte, value_embeds), and
+    # bare `nn.Linear` could slip in via future code. Patching here is
+    # cheap insurance — within one NANOOPS=1 process, replacing PyTorch's
+    # F.embedding / F.linear with nanoops's is exactly the intent.
+    "torch.nn.modules.sparse",   # nn.Embedding -> F.embedding
+    "torch.nn.modules.linear",   # nn.Linear -> F.linear
+]
 
 
 def _make_patched_F() -> object:

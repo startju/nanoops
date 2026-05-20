@@ -176,7 +176,28 @@ class Lookup(torch.autograd.Function):
         return None, grad_weight
 
 
-def embedding(indices: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def embedding(
+    indices: torch.Tensor,
+    weight: torch.Tensor,
+    padding_idx: int | None = None,
+    max_norm: float | None = None,
+    norm_type: float = 2.0,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+) -> torch.Tensor:
+    # Signature matches torch.nn.functional.embedding so that
+    # nn.Embedding.forward() (which always passes all 7 args from its config)
+    # can route through this function via monkey-patching. nanoops doesn't
+    # implement padding_idx / max_norm / scale_grad_by_freq / sparse — accept
+    # only the (None/False/default) values that nanchat actually uses.
+    if padding_idx is not None:
+        raise NotImplementedError("nanoops.embedding: padding_idx not supported")
+    if max_norm is not None:
+        raise NotImplementedError("nanoops.embedding: max_norm not supported")
+    if scale_grad_by_freq:
+        raise NotImplementedError("nanoops.embedding: scale_grad_by_freq not supported")
+    if sparse:
+        raise NotImplementedError("nanoops.embedding: sparse not supported")
     # weight: (V, D); input: (...) -> (..., D)
     # Layout (why (V, D), not (D, V)):
     #   Under row-major storage, `weight[i]` reads D contiguous floats
