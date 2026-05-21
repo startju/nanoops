@@ -817,14 +817,15 @@ class CrossEntropy(torch.autograd.Function):
          and `log_sum_exp` is `(..., 1)`. Backward recomputes softmax via
          `(input - log_sum_exp).exp_()`. Saves ~1x logits of long-lived
          memory vs PyTorch (which keeps log_softmax in ctx until backward).
-      2. LSE by default uses `chunked_logsumexp` (online softmax in
-         Python), which keeps the transient exp tensor bounded by
-         `chunk_size / V` of full logits (~1/8 at default chunk_size).
-         Sets `NANOOPS_PLAIN_LSE=1` to switch to `torch.logsumexp` (one
-         fused C++ kernel, ~5% faster but materializes the full `exp` —
-         ~256 MB extra peak at nanchat scale). Default keeps chunked for
-         memory headroom + showing the online-softmax algorithm (same
-         trick Flash Attention uses).
+      2. LSE uses `chunked_logsumexp` (online softmax in Python), which
+         keeps the transient exp tensor bounded by `chunk_size / V` of
+         full logits (~1/8 at default chunk_size). A/B'd against plain
+         `torch.logsumexp` on nanchat d20 — peak memory and wall time
+         were byte-identical: backward's `(input - log_sum_exp).exp_()`
+         already allocates the full softmax tensor, so it dominates the
+         peak regardless of forward's choice. Kept chunked for the
+         online-softmax algorithm demonstration (same trick Flash
+         Attention uses for tile-wise normalization).
 
     Backward optimizations (all in-place to keep peak at 1x softmax):
       3. `(input - log_sum_exp).exp_()` — in-place exp on the sub temp;
@@ -871,15 +872,13 @@ class CrossEntropy(torch.autograd.Function):
         dim: int,
         ignore_index: int = -100,
     ) -> torch.Tensor:
-        # Default: chunked_logsumexp (online softmax in Python) for ~1/8
-        # the transient memory of the fused C++ kernel.
-        # Opt-in: NANOOPS_PLAIN_LSE=1 switches to torch.logsumexp (fused
-        # kernel, ~5% faster, but materializes the full exp temp = full
-        # logits size). See class docstring for the trade-off discussion.
-        if os.environ.get("NANOOPS_PLAIN_LSE"):
-            log_sum_exp = torch.logsumexp(input, dim=dim, keepdim=True)
-        else:
-            log_sum_exp = chunked_logsumexp(input, dim=dim, keepdim=True)
+        # chunked_logsumexp (online softmax) keeps the transient exp
+        # bounded by chunk_size/V of full logits. A/B'd vs torch.logsumexp
+        # on nanchat d20: byte-identical peak memory + wall time — the
+        # backward's full softmax recompute already sets the peak ceiling,
+        # so forward's chunking choice is invisible end-to-end. Kept for
+        # the algorithm demonstration (same online-softmax trick as Flash).
+        log_sum_exp = chunked_logsumexp(input, dim=dim, keepdim=True)
         # ignore_index handling: gather() would crash on out-of-range target
         # values (e.g. -1), so replace those with 0 as a safe placeholder,
         # compute the per-sample loss as usual, then zero out those positions.
