@@ -109,7 +109,7 @@ bash nanoops/train.sh --depth=20 --device-batch-size=4
 #   NANOOPS=1                                       activates the integration
 #   PYTORCH_ALLOC_CONF=expandable_segments:True     recovers fragmentation
 #   NANOOPS_MLP_CHECKPOINT=1                        ~3.7 GiB peak savings
-#   NANOOPS_L_ATTN_CHECKPOINT=1                     full-attn layer checkpoint;
+#   NANOOPS_OFFLOAD_OPTIM=1                         Muon+AdamW state on CPU;
 #                                                    needed to fit d24+B=1
 #
 # Opt-in experimental knobs:

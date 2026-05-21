@@ -95,7 +95,7 @@ bash nanoops/train.sh --depth=20 --device-batch-size=4
 #   NANOOPS=1                                       启用 nanoops 集成
 #   PYTORCH_ALLOC_CONF=expandable_segments:True     回收碎片化内存
 #   NANOOPS_MLP_CHECKPOINT=1                        省 ~3.7 GiB peak
-#   NANOOPS_L_ATTN_CHECKPOINT=1                     全 attention 层 checkpoint;
+#   NANOOPS_OFFLOAD_OPTIM=1                         Muon+AdamW state 移到 CPU pinned;
 #                                                    d24+B=1 装下的必要条件
 #
 # Opt-in 实验开关：

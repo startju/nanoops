@@ -40,13 +40,14 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$PYTORCH_ALLOC_CONF}"
 # ATTN checkpoint's 0.96 s/GiB. The freed headroom is what lets larger
 # --depth runs fit on a 24 GiB card. Opt out by unsetting before bash.
 export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
-# Attention activation checkpoint — was needed when SlidingWindowSDPA
-# saved per-chunk P matrices (~900 MB ctx on d24). SlidingWindowSDPA
-# now uses the Flash-style LSE-only ctx (saves just one (..., q_sz, 1)
-# log-sum-exp per chunk, re-derives P in backward from Q@K^T + LSE), so
-# this checkpoint is largely redundant. Left OFF by default — set to 1
-# if a deeper config still hits OOM.
-# export NANOOPS_L_ATTN_CHECKPOINT=1
+# Optimizer CPU offload ON by default — moves DistMuonAdamW's per-rank
+# Muon + AdamW state (~2.5 GB + ~300 MB on d24 under ZeRO-1) to CPU
+# pinned memory; H2D/D2H per optimizer step adds ~0.4% wall time but
+# frees the GPU headroom that finally cleared d24+B=1's iter-3 OOM
+# cliff (every Python-level checkpoint/LSE trick we tried first failed
+# to escape that exact 21.58 GiB allocated + 1.35 GiB fragmentation
+# pattern). Opt out with empty value.
+export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
