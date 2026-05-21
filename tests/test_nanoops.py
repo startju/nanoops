@@ -9,8 +9,12 @@ import nanoops.functional as nF
 
 
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("shape", [(4, 8), (2, 3, 8), (16,)])
+@pytest.mark.parametrize("shape", [(4, 8), (2, 3, 8), (8,)])
 def test_linear_functional_matches_torch(shape, bias):
+    # Each shape's LAST dim must equal in_features (8) for matmul to work.
+    # The previous (16,) entry was a parametrize bug — 1D input was meant
+    # to exercise the "single sample, no batch dim" path, but the last dim
+    # was wrong, making tF.linear itself raise before parity could be checked.
     torch.manual_seed(0)
     in_features, out_features = 8, 5
     x = torch.randn(*shape)
