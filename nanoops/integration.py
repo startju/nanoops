@@ -106,18 +106,22 @@ def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
     for the full-attention (L) layers — leave sliding (S) layers alone.
 
     Rationale: full-attention layers store moderate activations (Q, K, V
-    + Flash backend internal buffers) without the savings SlidingWindowSDPA
-    already provides for S layers. Checkpointing just the L layers (6/24
-    for d24 SSSL) saves their activation footprint at the cost of
-    re-running their forward once during backward — much cheaper than
-    re-running 18 chunked sliding forwards.
+    + the chunked sliding_window_sdpa P matrices that the patched
+    _sdpa_attention now uses for L too) without the savings sliding
+    chunked already provides for S layers' small bands. Checkpointing
+    just the L layers (e.g. 6/24 for d24 SSSL) saves their activation
+    footprint at the cost of re-running their forward once during
+    backward — much cheaper than re-running 18 chunked sliding forwards
+    of the S layers.
 
-    Only triggers during training (kv_cache is None). Inference paths
-    bypass.
+    Always on during training (kv_cache is None) for full-attention
+    layers — this is the headroom that lets d24+B=1 fit at all on a
+    24 GiB card (without it the run OOMs at iter 3-6 from fragmentation).
+    Inference paths (kv_cache present) and S layers bypass.
     """
     Tq = x.size(1)
     is_full = window_size[0] < 0 or window_size[0] >= Tq
-    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and kv_cache is None and is_full:
+    if kv_cache is None and is_full:
         return _ckpt.checkpoint(
             _orig_attn_forward, self, x, ve, cos_sin, window_size, kv_cache,
             use_reentrant=False,
@@ -286,8 +290,7 @@ def patch_nanchat() -> list[str]:
     names.append("nanochat.flash_attention._sdpa_attention(sliding_window_sdpa)")
     if os.environ.get("NANOOPS_MLP_CHECKPOINT"):
         names.append("MLP.forward(activation checkpoint)")
-    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
-        names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
+    names.append("CausalSelfAttention.forward(L-only activation checkpoint, default)")
     names.append("_sdpa_attention(full-attn → chunked sliding, default)")
     return names
 
