@@ -102,27 +102,22 @@ def _mlp_inner(self, x):
 
 
 def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
-    """Wraps CausalSelfAttention.forward with torch.utils.checkpoint ONLY
-    for the full-attention (L) layers — leave sliding (S) layers alone.
-
-    Rationale: full-attention layers store moderate activations (Q, K, V
-    + the chunked sliding_window_sdpa P matrices that the patched
-    _sdpa_attention now uses for L too) without the savings sliding
-    chunked already provides for S layers' small bands. Checkpointing
-    just the L layers (e.g. 6/24 for d24 SSSL) saves their activation
-    footprint at the cost of re-running their forward once during
-    backward — much cheaper than re-running 18 chunked sliding forwards
-    of the S layers.
+    """Wraps CausalSelfAttention.forward with torch.utils.checkpoint for
+    ALL attention layers (both sliding S and full L). Earlier this only
+    wrapped L layers — that's what the L_ prefix on the env var still
+    refers to — but the S layers' chunked SDPA P-matrix ctx (~38 MB/layer
+    × 18 layers = ~700 MB) is also significant on tight d24+B=1 budgets,
+    and recomputing it isn't dramatically more expensive than the L
+    layers'. Checkpointing both gives ~1 GiB more permanent headroom
+    that pushed d24+B=1 OOM past iter 22 (vs L-only's iter 22-ish OOM
+    cliff at exactly the 1.35 GiB fragmentation pool).
 
     Train via `NANOOPS_L_ATTN_CHECKPOINT=1`. nanoops/train.sh exports it
     by default, so user-facing default is ON; setting the var empty
-    (`NANOOPS_L_ATTN_CHECKPOINT= bash nanoops/train.sh`) disables.
-    Only triggers during training (kv_cache is None) for full-attention
-    layers. Inference paths and S layers bypass.
+    disables. Only triggers during training (kv_cache is None).
+    Inference (kv_cache present) bypasses.
     """
-    Tq = x.size(1)
-    is_full = window_size[0] < 0 or window_size[0] >= Tq
-    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and kv_cache is None and is_full:
+    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and kv_cache is None:
         return _ckpt.checkpoint(
             _orig_attn_forward, self, x, ve, cos_sin, window_size, kv_cache,
             use_reentrant=False,
