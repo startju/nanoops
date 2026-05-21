@@ -85,3 +85,28 @@ def test_gqa_4x():
 def test_gqa_non_chunked():
     """GQA + W >= L (no chunking) — still needs to repeat_interleave correctly."""
     _check(q_shape=(2, 8, 16, 16), k_shape=(2, 2, 16, 16), W=16)
+
+
+def test_chunk_size_decoupled_from_window():
+    """C < W: multiple chunks per window. Output must still match the full-mask reference."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 32, 16, dtype=torch.float64, requires_grad=True)
+    k = torch.randn(2, 4, 32, 16, dtype=torch.float64, requires_grad=True)
+    v = torch.randn(2, 4, 32, 16, dtype=torch.float64, requires_grad=True)
+    W = 8
+    g = torch.randn(2, 4, 32, 16, dtype=torch.float64)
+
+    # Reference: chunked with default chunk_size (W // 2 = 4)
+    out_default = nF.sliding_window_sdpa(q, k, v, W)
+
+    # Same window, different chunk sizes — all should match
+    for C in (1, 2, 4, 8, 16, 32):
+        q1, k1, v1 = q.detach().clone().requires_grad_(True), k.detach().clone().requires_grad_(True), v.detach().clone().requires_grad_(True)
+        out = nF.sliding_window_sdpa(q1, k1, v1, W, chunk_size=C)
+        assert torch.allclose(out, out_default, atol=1e-10), \
+            f"chunk_size={C}: output mismatch (max diff {(out - out_default).abs().max()})"
+        out.backward(g)
+        # Backward shape sanity
+        assert q1.grad.shape == q.shape
+        assert k1.grad.shape == k.shape
+        assert v1.grad.shape == v.shape

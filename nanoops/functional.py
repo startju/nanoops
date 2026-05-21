@@ -1503,10 +1503,16 @@ class SlidingWindowSDPA(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, query, key, value, window_size, enable_gqa=False):
+    def forward(ctx, query, key, value, window_size, enable_gqa=False, chunk_size=None):
         B, H_q, L, D = query.shape
         H_kv = key.shape[-3]
         W = window_size
+        # Default chunk size is W // 2 — more chunks (8 vs 4 for nanchat W=512)
+        # but each chunk's score matrix is narrower (C + W - 1 cells per row
+        # instead of 2W - 1), so less compute wasted on masked positions.
+        # Trade-off vs C == W: more Python dispatch overhead, smaller GEMMs
+        # but less wasted FLOPs. Net is hardware-dependent; microbench to pick.
+        C = chunk_size if chunk_size is not None else max(1, W // 2)
         scale_val = 1.0 / math.sqrt(D)
 
         # GQA: repeat K/V heads to match Q's head count. Same trick as in
@@ -1528,8 +1534,10 @@ class SlidingWindowSDPA(torch.autograd.Function):
         chunk_info = []
         probs_list = []
 
-        for q_start in range(0, L, W):
-            q_end = min(q_start + W, L)
+        for q_start in range(0, L, C):
+            q_end = min(q_start + C, L)
+            # Sliding-window key range still depends on W (not C): each query
+            # sees its last W keys regardless of how we chunk the queries.
             k_start = max(0, q_start - W + 1)
             k_end = q_end
 
@@ -1609,8 +1617,8 @@ class SlidingWindowSDPA(torch.autograd.Function):
             grad_key = grad_key_e
             grad_value = grad_value_e
 
-        # window_size, enable_gqa are non-differentiable
-        return grad_query, grad_key, grad_value, None, None
+        # window_size, enable_gqa, chunk_size are non-differentiable
+        return grad_query, grad_key, grad_value, None, None, None
 
 
 @_allow_in_graph
@@ -1620,15 +1628,22 @@ def sliding_window_sdpa(
     value: torch.Tensor,
     window_size: int,
     enable_gqa: bool = False,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
     """Sliding-window causal SDPA. window_size = max number of past keys
     each query attends to (including itself), so window_size=L is full
     causal attention. Set enable_gqa=True for Grouped-Query Attention
     (H_q > H_kv); K/V get repeat_interleave'd to match H_q.
 
+    chunk_size controls how many queries each chunk processes. Decoupled
+    from window_size (defaults to window_size // 2 — see SlidingWindowSDPA
+    docstring for the C vs W trade-off table). Smaller chunk_size → less
+    wasted compute on masked positions but more Python dispatch overhead;
+    larger chunk_size → bigger GEMMs but more cells get masked out.
+
     Hooked into nanchat by `nanoops.integration.patch_nanchat()`: replaces
     nanchat.flash_attention._sdpa_attention so sliding training layers
     route here. Always on when NANOOPS=1. See SlidingWindowSDPA docstring
     for the empirical end-to-end findings (+6.2% tok/sec, -10.4% peak memory).
     """
-    return SlidingWindowSDPA.apply(query, key, value, window_size, enable_gqa)
+    return SlidingWindowSDPA.apply(query, key, value, window_size, enable_gqa, chunk_size)
