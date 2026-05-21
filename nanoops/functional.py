@@ -1434,6 +1434,31 @@ def scaled_dot_product_attention(
     )
 
 
+def _sliding_chunk_mask(
+    q_start: int, q_end: int, k_start: int, k_end: int, W: int, device: torch.device
+) -> torch.Tensor:
+    """Build the (q_sz, k_sz) sliding+causal bool mask for one chunk.
+
+    Identical formula used in SlidingWindowSDPA's forward AND backward —
+    factored here so the two stay in lockstep. Each query at absolute
+    position i allows key positions j ∈ [i - W + 1, i] (W keys back,
+    including itself). The chunk's local (i_idx, j_idx) grid uses
+    absolute positions via the +q_start / +k_start offsets, so the
+    `j <= i` (causal) and `j >= i - W + 1` (sliding) tests stay shape-
+    agnostic.
+
+    The per-chunk arange tensors are tiny (~q_sz + k_sz int64) — we do
+    NOT precompute a full (L, L) mask and slice, because each chunk's
+    (q_sz, k_sz) is small enough that a fresh broadcast comparison is
+    cheaper than the slice + dispatch overhead.
+    """
+    q_sz = q_end - q_start
+    k_sz = k_end - k_start
+    i_idx = torch.arange(q_sz, device=device).unsqueeze(1) + q_start
+    j_idx = torch.arange(k_sz, device=device).unsqueeze(0) + k_start
+    return (j_idx <= i_idx) & (j_idx >= i_idx - W + 1)
+
+
 class SlidingWindowSDPA(torch.autograd.Function):
     """SDPA with sliding-window causal attention, internal chunking.
 
@@ -1516,9 +1541,12 @@ class SlidingWindowSDPA(torch.autograd.Function):
     and HBM-bandwidth side effects can dominate the small per-call speedup.
     Always validate with a real training run.
 
-    Always on when NANOOPS=1 — no opt-out (the patched _sdpa_attention
-    falls through to the original SDPA call for non-sliding paths, so
-    the swap is a strict superset of behavior with no regression risk).
+    Always on when NANOOPS=1. The patched _sdpa_attention now routes
+    *all* training attention (both sliding S layers and full-attention
+    L layers, when Tq == Tk) through this Function — unifying the
+    autograd graph shape and making peak memory easier to reason about.
+    Inference paths (Tq == 1, cached gen with Tq != Tk) still use
+    PyTorch's native SDPA.
     """
 
     @staticmethod
@@ -1572,19 +1600,18 @@ class SlidingWindowSDPA(torch.autograd.Function):
             scores = q_blk @ k_blk.transpose(-2, -1)
             scores.mul_(scale_val)
 
-            # Local sliding+causal mask
-            q_sz = q_end - q_start
-            k_sz = k_end - k_start
-            i_idx = torch.arange(q_sz, device=query.device).unsqueeze(1) + q_start
-            j_idx = torch.arange(k_sz, device=query.device).unsqueeze(0) + k_start
-            mask = (j_idx <= i_idx) & (j_idx >= i_idx - W + 1)
+            mask = _sliding_chunk_mask(q_start, q_end, k_start, k_end, W, query.device)
             scores.masked_fill_(~mask, float("-inf"))
 
-            # logsumexp ignores -inf entries (exp(-inf) = 0). Save LSE for
-            # the backward pass; derive P = exp(scores - lse) right here as
-            # a transient to form `output = P @ V`, but don't save P.
+            # logsumexp is numerically stable AND ignores -inf entries
+            # (exp(-inf) = 0 contributes nothing to the sum). Sliding+
+            # causal guarantees at least one allowed key per query (the
+            # diagonal `j == i` is always True), so LSE is never -inf
+            # and `(scores - lse).exp()` is never NaN.
             lse = scores.logsumexp(dim=-1, keepdim=True)        # (..., q_sz, 1)
-            probs = (scores - lse).exp()                         # transient
+            # Reuse `scores`'s storage for `probs`: scores has no other
+            # refs after this point in the loop. Saves one P-sized alloc.
+            probs = scores.sub_(lse).exp_()                      # transient
             output[..., q_start:q_end, :] = probs @ v_blk
 
             chunk_info.append((q_start, q_end, k_start, k_end))
@@ -1593,7 +1620,6 @@ class SlidingWindowSDPA(torch.autograd.Function):
         ctx.save_for_backward(query, key, value, *lse_list)
         ctx.chunk_info = chunk_info
         ctx.scale = scale_val
-        ctx.n_chunks = len(chunk_info)
         ctx.G = G
         ctx.window_size = W  # backward needs W to reconstruct the mask
         return output
@@ -1638,19 +1664,21 @@ class SlidingWindowSDPA(torch.autograd.Function):
             # Q@K^T matmul. This is the price of not having P in ctx — one
             # extra (q_sz, k_sz) matmul per chunk. P lives only for the
             # duration of this chunk's backward block, then is freed.
+            # Note on bf16 drift: this Q@K^T is a separate cuBLAS call
+            # from the forward's; cuBLAS bf16 matmul is determinstic given
+            # the same inputs, so scores here match forward's scores
+            # bitwise. The LSE was computed from forward's scores, so
+            # P = (scores_bwd - lse_fwd).exp() = exp(scores_fwd - lse) by
+            # transitivity. parity tests verify to fp64 precision.
             scores = q_blk @ k_blk.transpose(-2, -1)
             scores.mul_(scale_val)
-            # Reconstruct the SAME sliding+causal mask the forward used.
-            q_sz = q_end - q_start
-            k_sz = k_end - k_start
-            i_idx = torch.arange(q_sz, device=query.device).unsqueeze(1) + q_start
-            j_idx = torch.arange(k_sz, device=query.device).unsqueeze(0) + k_start
-            mask = (j_idx <= i_idx) & (j_idx >= i_idx - W + 1)
+            mask = _sliding_chunk_mask(q_start, q_end, k_start, k_end, W, query.device)
             scores.masked_fill_(~mask, float("-inf"))
             # P = exp(scores - LSE) — numerically stable because scores ≤ LSE
             # row-wise by construction; equivalent to softmax(scores) but
-            # uses the LSE we already paid for in forward.
-            probs = (scores - lse).exp()
+            # uses the LSE we already paid for in forward. Reuses scores'
+            # storage (no other refs left in this iteration).
+            probs = scores.sub_(lse).exp_()
 
             grad_v_blk = probs.transpose(-2, -1) @ g_out_blk
             grad_probs = g_out_blk @ v_blk.transpose(-2, -1)

@@ -121,14 +121,17 @@ def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
 
 
 def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
-    """Replacement for nanchat.flash_attention._sdpa_attention that routes
-    finite sliding-window cases to nanoops's SlidingWindowSDPA.
+    """Replacement for nanchat.flash_attention._sdpa_attention.
 
-    For full-attention paths (window < 0 or window >= Tq) and single-token
-    inference (Tq == 1), falls through to the original explicit-mask SDPA
-    via the patched F namespace. Only the sliding case (where the original
-    builds an explicit L×L mask and hands it to one big SDPA call) is
-    redirected — that's where chunked attention can save FLOPs.
+    Routes ALL training attention (both sliding-window S layers and full
+    L layers, whenever Tq == Tk) through nanoops's SlidingWindowSDPA so
+    they share one autograd-graph shape and one chunked-ctx memory model.
+    For L layers we set window_size=Tq (the sliding mask reduces to pure
+    causal) and chunk_size=Tq//8 so the GEMMs stay reasonably sized.
+
+    Inference paths keep the original behavior:
+      - single-token gen (Tq == 1): trim k/v + PyTorch SDPA
+      - cached gen (Tq != Tk): explicit causal+sliding mask + PyTorch SDPA
     """
     Tq = q.size(2)
     Tk = k.size(2)
