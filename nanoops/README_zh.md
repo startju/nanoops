@@ -67,6 +67,7 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 - [x] `apply_rotary_emb`（cos/sin 表继续用 PyTorch）
 - [x] `F.scaled_dot_product_attention`（朴素 `softmax(QK/√d) V`；与 nanchat 全等：is_causal + attn_mask + enable_gqa）
 - [x] `torch.where` / `torch.roll`（eval 与 loss masking 用）
+- [x] `SlidingWindowSDPA`（一个 autograd.Function 内部做 chunked sliding window attention；支持 GQA；集成里默认开。**端到端 +44% vs PyTorch baseline，2× RTX 3090, d20**）
 
 ### Tier 3 —— 用 Triton 写的融合 kernel（可选）
 

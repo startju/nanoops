@@ -75,6 +75,7 @@ adds optional fast-path variants.
 - [x] `apply_rotary_emb` (cos/sin tables stay on PyTorch)
 - [x] `F.scaled_dot_product_attention` (naive `softmax(QK/√d) V`; full nanchat parity: is_causal + attn_mask + enable_gqa)
 - [x] `torch.where`, `torch.roll` (eval / loss masking)
+- [x] `SlidingWindowSDPA` (chunked sliding-window SDPA in one autograd.Function; GQA-aware; default-on via integration. **+44% end-to-end vs PyTorch baseline on 2× RTX 3090, d20**)
 
 ### Tier 3 — fused Triton kernels (optional)
 
