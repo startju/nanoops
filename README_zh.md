@@ -1,4 +1,4 @@
-# nanoops —— nanochat 的教学 fork
+# nanochat on 2× 3090 —— 教学 fork
 
 > English version: [README.md](README.md)
 
