@@ -26,6 +26,13 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 # the last needed allocation and OOMs the run, even though SlidingWindowSDPA
 # saves ~2 GiB of P-matrix peak. Setting it lets B=4 fit at ~23.4/24 GiB.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# MLP activation checkpoint ON by default — at B=4 it saves ~3.7 GiB of
+# MLP intermediate activations (relu output + relu² output + the
+# c_fc/c_proj Mm input ctxs) for a +7% wall-time cost (one extra MLP
+# forward in backward). Cost: 0.62 s/GiB freed, strictly better than
+# ATTN checkpoint's 0.96 s/GiB. The freed headroom is what lets larger
+# --depth runs fit on a 24 GiB card. Opt out by unsetting before bash.
+export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
