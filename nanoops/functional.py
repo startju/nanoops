@@ -364,7 +364,14 @@ class RMSNorm(torch.autograd.Function):
         else:
             grad_weight = None
             g_eff = grad_output
-        grad_input = rsqrt * (g_eff - y * (g_eff * y).mean(dim=-1, keepdim=True))
+        # Build grad_input = rsqrt * (g_eff - y * inner) with one alloc + a
+        # chain of in-place ops instead of `rsqrt * (g_eff - y * (g_eff*y).mean)`
+        # which churns 4 input-sized temps via Python operator chain. Same
+        # math, fewer alloc/free cycles.
+        inner = (g_eff * y).mean(dim=-1, keepdim=True)    # tiny (..., 1)
+        grad_input = y * inner                              # alloc 1 (broadcasts)
+        grad_input.neg_().add_(g_eff)                       # in-place: g_eff - y*inner
+        grad_input.mul_(rsqrt)                              # in-place: rsqrt * (above)
         return grad_input, grad_weight, None
 
 
@@ -595,7 +602,7 @@ def chunked_logsumexp(
         new_max = torch.maximum(running_max, chunk.amax(dim, keepdim=True))
         rebase = (running_max - new_max).exp()                        # rescale old sum
         chunk_sum = (chunk - new_max).exp_().sum(dim, keepdim=True)   # same .exp_() trick
-        running_sum = running_sum * rebase + chunk_sum
+        running_sum.mul_(rebase).add_(chunk_sum)                       # in-place chain
         running_max = new_max
     result = running_max + running_sum.log()
     return result if keepdim else result.squeeze(dim)
