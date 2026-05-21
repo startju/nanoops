@@ -231,6 +231,16 @@ def patched_step_muon(self, group):
         )
     red_dim = -1 if shape[-2] >= shape[-1] else -2
 
+    # Single-GPU's muon H2D copies the FULL state (no ZeRO sharding to
+    # only-copy-owned-slice), so we briefly need ~5 GiB of contiguous GPU
+    # space. The allocator cache from the preceding 256 fwd+bwd cycles
+    # holds lots of small/medium blocks that cudaMalloc can't merge into
+    # a 5 GiB request → OOM with reserved-but-unallocated. Returning the
+    # cache to the driver here costs ~tens of ms (cudaFree pool) but lets
+    # the big H2D find contiguous memory. Cheap vs the ~131 s single-GPU
+    # iter time.
+    torch.cuda.empty_cache()
+
     # H2D copy full state to GPU buffers
     mom_g = state["momentum_buffer"].to(device, non_blocking=True)
     mom2_g = state["second_momentum_buffer"].to(device, non_blocking=True)
