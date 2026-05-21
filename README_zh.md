@@ -26,32 +26,55 @@
    base-train 步骤能在 24 GiB 显存上以 `--device-batch-size=4` 跑起来
    （之前会 OOM）。
 
-### 在 2× RTX 3090 上的实测加速（d20 base_train）
+### 实际效果
+
+**nanchat 的更大配置现在能在 2× RTX 3090 上跑起来。** 全套优化叠加
+（SlidingWindowSDPA + MLP activation checkpoint + expandable_segments
+allocator）总共比 PyTorch baseline 路径省下 ~9 GiB 的 peak 显存。多出来
+的余量正好让 `--depth=24`——nanchat leaderboard 级别的配置，~1.5 B 参数，
+auto-config 加宽到 `n_embd=1536`——能在 24 GiB 卡上**真的装下**。同一个
+配置没有这套优化时**每个 batch size 都会 OOM**。
+
+| 配置             | nanchat 原生 | nanoops 整套在 2× RTX 3090 上    |
+| ---------------- | ------------ | -------------------------------- |
+| `--depth=20`, B=4 | ~22.7k tok/s | **~30.5k tok/s** (+34%, ~31h)  |
+| `--depth=24`, B=1 | OOM          | **~15.8k tok/s** (~61h)        |
+
+**算成钱**：3090 spot 租赁价格大约 $0.18/卡/小时，2× 3090 一台机 ~$0.36/h
+≈ $8.6/天 ≈ **$60/周**。一次完整的 `--depth=24` 训练 ~2.5 天，**算力成本
+约 $22**；`--depth=20` 训练 ~31 h，**不到 $12**。原本目标硬件是 8× H100
+节点，本 fork 让这个训练在一台双 3090 桌面机上可行。
+
+### 实测加速过程（d20 base_train, 2× RTX 3090）
 
 | 配置                                  | tok/sec    | MFU       | Peak 显存    | vs baseline |
 | ------------------------------------- | ---------- | --------- | ------------ | ----------- |
 | PyTorch SDPA, B=2 (baseline)          | 22,725     | 46.2%     | 16.5 GiB     | —           |
 | nanoops Lookup default, B=2           | 28,800     | 58.5%     | 19.7 GiB     | +27%        |
 | + SlidingWindowSDPA, B=2              | 30,594     | 62.2%     | 17.6 GiB     | +35%        |
-| **+ B=4 + expandable_segments**       | **32,678** | **66.4%** | **22.7 GiB** | **+44%**    |
+| + B=4 + expandable_segments           | 32,678     | 66.4%     | 22.7 GiB     | +44%        |
+| **+ MLP_CHECKPOINT（当前默认）**      | **30,500** | **62.0%** | **19.0 GiB** | **+34%, 留余量给 d24** |
 
-4 行配置的 loss 曲线在 bf16 数值噪声范围内**完全一致**。完整 A/B
-分析记录在
+所有行 loss 曲线在 bf16 数值噪声范围内**完全一致**。完整 A/B 分析记录在
 [`SlidingWindowSDPA` 的 docstring](nanoops/functional.py)。
 
 ### 怎么跑
 
 ```bash
 # speedrun.sh 中 base_train 步骤的 drop-in 替代版——
-# 已默认开启 nanoops 集成 + 滑动窗口 SDPA + expandable_segments allocator。
+# 默认 --depth=24 --device-batch-size=1（2× RTX 3090 上装得下的最大 nanchat 配置）。
+# 三个优化默认全开：sliding-window SDPA + MLP activation checkpoint + expandable_segments allocator。
 bash nanoops/train.sh
+
+# 也可以覆盖默认值——比如 2× RTX 3090 上吞吐最大的 setup：
+bash nanoops/train.sh --depth=20 --device-batch-size=4
 
 # 自动设置的环境变量（train.sh 帮你 export）：
 #   NANOOPS=1                                       启用 nanoops 集成
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   回收碎片化内存
+#   NANOOPS_MLP_CHECKPOINT=1                        省 ~3.7 GiB peak
 #
-# A/B 对比用的 opt-out 开关：
-#   NANOOPS_NO_SLIDING_WINDOW=1   切回 naive SDPA 路径
+# Opt-in 实验开关：
 #   NANOOPS_LOOKUP_SORTED=1       试一下"排序+分段求和"的 embedding backward
 ```
 

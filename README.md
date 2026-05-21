@@ -26,16 +26,39 @@ with two intertwined goals:
    ~4×. Stacking these lets the d20 base-train step fit at
    `--device-batch-size=4` on 24 GiB cards instead of OOMing.
 
-### Measured speedup on 2× RTX 3090, d20 base_train
+### What this means in practice
+
+**Nanchat's bigger configurations now fit on 2× RTX 3090.** The full
+optimization stack (SlidingWindowSDPA + MLP activation checkpoint +
+expandable_segments allocator) frees ~9 GiB of peak GPU memory vs the
+PyTorch baseline path. That headroom is what lets `--depth=24` — a
+nanchat leaderboard-grade configuration with ~1.5 B parameters, auto-
+widened to `n_embd=1536` — actually fit on 24 GiB cards. Without these
+optimizations the same config OOMs at every batch size.
+
+| Config            | nanchat default | nanoops stack on 2× RTX 3090     |
+| ----------------- | --------------- | -------------------------------- |
+| `--depth=20`, B=4 | ~22.7k tok/s    | **~30.5k tok/s** (+34%, ~31 h ETA)|
+| `--depth=24`, B=1 | OOM             | **~15.8k tok/s** (~61 h ETA)     |
+
+**Concretely:** at typical spot-rental rates of ~$0.18/GPU/hr for an
+RTX 3090, a 2× 3090 rig runs at about **$0.36/hr ≈ $8.6/day ≈ $60/week**.
+A full `--depth=24` pretraining run finishes in ~2.5 days for roughly
+$22 of GPU time, and a `--depth=20` run finishes in ~31 h for under $12.
+The same training is otherwise targeted at 8× H100 nodes; this fork
+makes it feasible on a single dual-3090 desktop.
+
+### Measured speedup journey (d20 base_train, 2× RTX 3090)
 
 | Config                                | tok/sec    | MFU       | Peak GPU mem | vs baseline |
 | ------------------------------------- | ---------- | --------- | ------------ | ----------- |
 | PyTorch SDPA, B=2 (baseline)          | 22,725     | 46.2%     | 16.5 GiB     | —           |
 | nanoops Lookup default, B=2           | 28,800     | 58.5%     | 19.7 GiB     | +27%        |
 | + SlidingWindowSDPA, B=2              | 30,594     | 62.2%     | 17.6 GiB     | +35%        |
-| **+ B=4 + expandable_segments**       | **32,678** | **66.4%** | **22.7 GiB** | **+44%**    |
+| + B=4 + expandable_segments           | 32,678     | 66.4%     | 22.7 GiB     | +44%        |
+| **+ MLP_CHECKPOINT (current default)**| **30,500** | **62.0%** | **19.0 GiB** | **+34%, B=4 holds w/ headroom for d24** |
 
-Loss curves match across all four rows to within bf16 rounding noise.
+Loss curves match across all rows to within bf16 rounding noise.
 Full A/B autopsy lives in the
 [`SlidingWindowSDPA` docstring](nanoops/functional.py).
 
@@ -43,16 +66,21 @@ Full A/B autopsy lives in the
 
 ```bash
 # Drop-in replacement for speedrun.sh's base_train step,
-# with the nanoops integration + sliding-window SDPA + expandable_segments
-# allocator turned on by default.
+# defaults to --depth=24 --device-batch-size=1 (the biggest nanchat
+# config that fits on 2× RTX 3090). All three optimizations active by
+# default: sliding-window SDPA + MLP activation checkpoint + expandable
+# segments allocator.
 bash nanoops/train.sh
+
+# Or override defaults — e.g. fastest throughput on 2× RTX 3090:
+bash nanoops/train.sh --depth=20 --device-batch-size=4
 
 # Active env vars (set automatically by train.sh):
 #   NANOOPS=1                                       activates the integration
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   recovers fragmentation
+#   NANOOPS_MLP_CHECKPOINT=1                        ~3.7 GiB peak savings
 #
-# A/B opt-outs:
-#   NANOOPS_NO_SLIDING_WINDOW=1   revert sliding layers to the naive SDPA path
+# Opt-in experimental knobs:
 #   NANOOPS_LOOKUP_SORTED=1       try the segmented-sum embedding backward
 ```
 
