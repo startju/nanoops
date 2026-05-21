@@ -223,19 +223,21 @@ class LookupSorted(torch.autograd.Function):
     Why we don't use it (measured on RTX 3090, V=32768, D=1280, N=4096,
     nanchat-like Zipf token distribution, max 15 duplicates per row):
 
-      ❌ Numerical accuracy: backward cumsum runs in input dtype. In bf16
-         (7-bit mantissa) the cumsum over 4096 rows accumulates ~10⁻¹
-         relative error vs Lookup — completely unusable for nanchat
-         training which is bf16. Lookup's pile-of-atomics path computes
-         each row sum independently with no long-range accumulation.
-
       ❌ Speed: at the realistic duplicate rate (max 15, mean 1.79),
          atomicAdd is fast on Ampere/Hopper and LookupSorted is ~4× SLOWER
          (1.84 ms vs 0.45 ms / iter for Lookup). The sort + permute +
          (N, D) cumsum overhead dwarfs the contention Lookup pays.
 
+      ⚠ Numerical safety required a fix: cumsum in bf16 (input dtype) over
+         thousands of rows accumulates >10% relative error in 7-bit
+         mantissa. We promote the cumsum accumulator to fp32 (see code
+         comment in backward) and cast back at the end — same trick as
+         PyTorch's internal embedding-backward CUDA kernel. Without the
+         promotion this would silently train wrong grads in bf16.
+
     Where the textbook argument WOULD have held: very heavy duplicate
-    counts (one row hit hundreds of times) AND fp32. Neither applies here.
+    counts (one row hit hundreds of times). Doesn't happen in LLM training
+    where vocab is large and any single token has at most O(seq_len) hits.
 
     Lesson: GPU "atomic-add is slow" intuition was true ~Pascal era;
     Ampere/Hopper atomic-add throughput improved enough that the
@@ -278,15 +280,30 @@ class LookupSorted(torch.autograd.Function):
         #    sorted order). Then:
         #      group_sum[i] = cumsum[group_ends[i]] - cumsum[group_ends[i-1]]
         #    (group_sum[0] is just cumsum[group_ends[0]]; no prior group.)
-        cumsum = sorted_grads.cumsum(0)
+        #
+        # FP32 ACCUMULATOR (only for low-precision inputs): bf16/fp16 cumsum
+        # over thousands of rows accumulates >10% relative error because
+        # each partial sum gets truncated to 7/10 mantissa bits and the
+        # `cumsum[end] - cumsum[start]` subtraction propagates that error
+        # into every group sum. Promote to fp32 in those cases; for fp32/
+        # fp64 inputs, run in input dtype to avoid the opposite problem
+        # (downgrading fp64 → fp32 would introduce its own error). Same
+        # trick as PyTorch's internal embedding-backward kernel.
+        cumsum_dtype = (
+            torch.float32
+            if sorted_grads.dtype in (torch.bfloat16, torch.float16)
+            else sorted_grads.dtype
+        )
+        cumsum = sorted_grads.cumsum(0, dtype=cumsum_dtype)
         group_ends = counts.cumsum(0).sub_(1)              # last index per group
         group_sums = cumsum.index_select(0, group_ends)    # alloc (G, D)
         if unique_rows.numel() > 1:
             group_sums[1:].sub_(cumsum.index_select(0, group_ends[:-1]))
 
         # 5. Dense write — each unique_rows[i] is unique, so this is a
-        #    contention-free scatter (one row touched at most once).
-        grad_weight[unique_rows] = group_sums
+        #    contention-free scatter (one row touched at most once). Cast
+        #    only happens when we promoted above; otherwise it's a no-op.
+        grad_weight[unique_rows] = group_sums.to(grad_weight.dtype)
         return None, grad_weight
 
 

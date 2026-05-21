@@ -76,3 +76,33 @@ def test_empty():
     """Empty indices — backward should produce all-zero grad."""
     indices = torch.tensor([], dtype=torch.int64)
     _check(indices, V=8, D=4)
+
+
+def test_bf16_no_accumulation_drift():
+    """bf16 with many duplicates per row exercises the fp32 cumsum promotion.
+
+    Without the promotion, cumsum's bf16 partial sums accumulate >10%
+    relative error vs Lookup at this N, and group_sum = cumsum[end] -
+    cumsum[start] propagates that error into every grad row.
+    """
+    torch.manual_seed(0)
+    V, D, N = 256, 64, 1024
+    indices = torch.randint(0, 16, (N,))  # only 16 unique rows → ~64 dups each
+    weight = torch.randn(V, D, dtype=torch.bfloat16)
+    g = torch.randn(N, D, dtype=torch.bfloat16)
+
+    w_naive = weight.clone().requires_grad_(True)
+    w_sorted = weight.clone().requires_grad_(True)
+    Lookup.apply(indices, w_naive).backward(g)
+    LookupSorted.apply(indices, w_sorted).backward(g)
+
+    # bf16 has 7-bit mantissa; per-row sums of ~64 bf16 grads can differ by
+    # a few ULPs between the two impls (Lookup atomic-adds, LookupSorted
+    # fp32 cumsum then casts). atol=0.01 catches the "no fp32 promotion"
+    # bug which gave ~1.7 max abs diff at this scale, while still allowing
+    # normal rounding noise.
+    max_diff = (w_naive.grad - w_sorted.grad).abs().max().item()
+    assert max_diff < 0.01, (
+        f"LookupSorted bf16 grad drifted from Lookup by {max_diff:.4f}; "
+        f"likely the cumsum fp32-promotion was lost."
+    )
