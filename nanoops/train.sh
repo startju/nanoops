@@ -31,7 +31,7 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 # Set BOTH so we work on either side of the rename. max_split_size_mb=128
 # caps any single allocator block at 128 MiB so a few big allocs can't
 # starve smaller ones via fragmentation.
-export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$PYTORCH_ALLOC_CONF}"
 # MLP activation checkpoint ON by default — at B=4 it saves ~3.7 GiB of
 # MLP intermediate activations (relu output + relu² output + the
