@@ -48,6 +48,16 @@ $22 of GPU time, and a `--depth=20` run finishes in ~31 h for under $12.
 The same training is otherwise targeted at 8× H100 nodes; this fork
 makes it feasible on a single dual-3090 desktop.
 
+**Good fit for learners.** Since one full d24 training only spends a
+fraction of a week's GPU budget, the remaining ~$40 / ~4-5 days of GPU
+time is yours to break the code on — read an op in `nanoops/functional.py`,
+swap an in-place trick out, add a print to a `.backward()`, kick off
+a 20-iter run, and watch the loss curve / MFU drift. The whole stack
+is small enough to step through in a debugger, and the bundled tests
+(`tests/test_nanoops_e2e.py`, `tests/test_sdpa_parity.py`, ...) cross-
+check every op against PyTorch's reference — so you always have ground
+truth to compare against.
+
 ### Measured speedup journey (d20 base_train, 2× RTX 3090)
 
 | Config                                | tok/sec    | MFU       | Peak GPU mem | vs baseline |

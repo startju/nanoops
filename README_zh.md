@@ -45,6 +45,14 @@ auto-config 加宽到 `n_embd=1536`——能在 24 GiB 卡上**真的装下**。
 约 $22**；`--depth=20` 训练 ~31 h，**不到 $12**。原本目标硬件是 8× H100
 节点，本 fork 让这个训练在一台双 3090 桌面机上可行。
 
+**很适合初学者上手**。一次 d24 训练只花掉一周 GPU 预算的一小部分，
+剩下的 ~$40 / ~4-5 天 GPU 时间正好用来"折腾"——读一下
+`nanoops/functional.py` 里某个算子的实现、把某个 in-place trick 改掉、
+往 `.backward()` 加个 print、跑个 20-iter 看 loss 曲线和 MFU 怎么变。
+整套代码量小到可以拿调试器一步步走完，配套测试
+（`tests/test_nanoops_e2e.py`, `tests/test_sdpa_parity.py` 等）会把每个
+算子跟 PyTorch reference 对拍——**永远有 ground truth 可以参照**。
+
 ### 实测加速过程（d20 base_train, 2× RTX 3090）
 
 | 配置                                  | tok/sec    | MFU       | Peak 显存    | vs baseline |
