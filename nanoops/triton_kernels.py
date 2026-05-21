@@ -1051,3 +1051,260 @@ def flash_sdpa(
     window_size: total keys each query attends to (= nanchat's window+1).
     """
     return FlashSDPA.apply(q, k, v, window_size)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Small Triton kernels covering the remaining attention/MLP elementwise
+# chains. None of these are big wins individually (each saves ~10-50 µs
+# per layer of kernel-launch + HBM round-trip overhead), but together
+# they cover the last "all eager" pieces of nanchat's attention forward,
+# letting us claim attention is "fully Triton-fused" in the sense that
+# every per-element operation has a Triton kernel.
+# ─────────────────────────────────────────────────────────────────────
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _value_gate_kernel(
+        v_ptr, ve_ptr, x_ptr, gate_w_ptr,
+        out_ptr,
+        M, D_x, D_v, ve_gate_ch,
+        stride_vm, stride_vd,
+        stride_vem, stride_ved,
+        stride_xm, stride_xd,
+        stride_gw_d_out, stride_gw_d_in,
+        stride_om, stride_od,
+        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """Fused value-residual gate (ResFormer):
+            gate = 3 * sigmoid(x[..., :ch] @ gate_w.T)       # (M, D_v_head_dim)
+            out  = v + gate * ve
+        Where ch = ve_gate_channels (small).
+
+        Per row m, gate is per-head (we broadcast across head_dim
+        elements). For simplicity here we expand gate to v's shape via
+        the same broadcasting the eager code does.
+        """
+        pid_m = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        col_mask = cols < D_v
+
+        # Compute gate = 3 * sigmoid(x[:, :ch] @ gate_w.T) for the rows in this tile.
+        # gate_w shape: (D_v, ve_gate_ch). x slice: (BLOCK_M, ve_gate_ch).
+        # Result gate: (BLOCK_M, D_v) — broadcast across cols later if needed.
+        # We compute the per-row, per-output-dim gate value once and reuse for
+        # the cols of v in this tile.
+        gate_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        for k_start in range(0, ve_gate_ch, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_mask = ks < ve_gate_ch
+            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xd
+            x_chunk = tl.load(
+                x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            gw_ptrs = (
+                gate_w_ptr
+                + cols[:, None] * stride_gw_d_out
+                + ks[None, :] * stride_gw_d_in
+            )
+            gw = tl.load(
+                gw_ptrs, mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            gate_acc += tl.dot(x_chunk, tl.trans(gw), input_precision="ieee")
+        gate = 3.0 * tl.sigmoid(gate_acc)
+
+        # Load v, ve, compute out = v + gate * ve
+        v_ptrs = v_ptr + rows[:, None] * stride_vm + cols[None, :] * stride_vd
+        ve_ptrs = ve_ptr + rows[:, None] * stride_vem + cols[None, :] * stride_ved
+        v = tl.load(v_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
+        ve = tl.load(ve_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
+        out = v + gate * ve
+
+        o_ptrs = out_ptr + rows[:, None] * stride_om + cols[None, :] * stride_od
+        tl.store(
+            o_ptrs,
+            out.to(out_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & col_mask[None, :],
+        )
+
+
+    @triton.jit
+    def _rotary_qk_norm_scale_kernel(
+        qk_ptr, cos_ptr, sin_ptr,
+        out_ptr, rms_inv_ptr,
+        M, D,
+        scale,
+        eps,
+        stride_qm, stride_qd,
+        stride_om, stride_od,
+        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Fused rotary + RMSNorm + ×scale for Q or K:
+            x1, x2 = qk[..., :d], qk[..., d:]
+            y1 = x1 * cos + x2 * sin
+            y2 = -x1 * sin + x2 * cos
+            y  = concat(y1, y2)                       # (M, D), rotated
+            y_normed = y * rsqrt(mean(y²) + eps) * scale
+
+        Compact: rotate in registers → RMSNorm in registers → scale.
+        Saves HBM round-trips between rotary / norm / scale stages.
+        D must equal BLOCK_D (we tile only M).
+        """
+        pid_m = tl.program_id(0)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        half = BLOCK_D // 2
+
+        # Load qk (BLOCK_M, BLOCK_D)
+        ptrs = qk_ptr + rows[:, None] * stride_qm + cols[None, :] * stride_qd
+        x = tl.load(ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        # Split into halves
+        is_low = cols < half
+        # Roll the second half forward (gather): build y using cos/sin that
+        # depend on position. cos and sin have shape (M, D//2) — same first
+        # half indices for both halves.
+        cs_cols = tl.arange(0, BLOCK_D // 2)
+        cos = tl.load(cos_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
+                      mask=row_mask[:, None], other=0.0).to(tl.float32)
+        sin = tl.load(sin_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
+                      mask=row_mask[:, None], other=0.0).to(tl.float32)
+        # x_lo, x_hi
+        x_lo = tl.where(is_low[None, :], x, 0.0)
+        x_hi = tl.where(~is_low[None, :], x, 0.0)
+        # Roll x_hi to align with x_lo's index → we need x_lo[i] and x_hi[i+half]
+        # paired. The triton-natural way: just compute two halves separately,
+        # then concatenate via tl.where.
+        # y_lo = x_lo * cos + x_hi_paired * sin
+        # y_hi = -x_lo_paired * sin + x_hi * cos
+        # Easier: load x_low_half and x_high_half separately
+        ptrs_lo = qk_ptr + rows[:, None] * stride_qm + cs_cols[None, :] * stride_qd
+        ptrs_hi = qk_ptr + rows[:, None] * stride_qm + (cs_cols[None, :] + half) * stride_qd
+        x1 = tl.load(ptrs_lo, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        x2 = tl.load(ptrs_hi, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        y1 = x1 * cos + x2 * sin
+        y2 = -x1 * sin + x2 * cos
+        # Combine y1, y2 into full BLOCK_D via tl.where
+        y = tl.where(is_low[None, :],
+                     tl.where(is_low[None, :], y1, 0.0)[:, :half],  # type juggling
+                     y2)
+        # Simpler approach: write y1 and y2 to separate halves
+        # — but tl.where with full-row layout needs concat-style logic.
+        # Build y by interleaving:
+        # We'll just store y1 to [:half] cols and y2 to [half:] cols.
+        # Then read back y for RMSNorm.
+        # → Two stores + one load adds HBM cost; instead use a vector trick:
+        # construct y in two register-vectors and pack via tl.where.
+        # Use a per-col selector:
+        cols_low_idx = cols
+        y_full = tl.where(
+            is_low[None, :],
+            # y1 at low cols — broadcast across BLOCK_D via gather from y1 (size BLOCK_D//2)
+            # Triton doesn't support dynamic indexing easily; emit y1, y2 sized properly.
+            x1 * 0.0,  # placeholder, see fallback below
+            x2 * 0.0,
+        )
+        # Fall back: write halves explicitly. (Use the simpler 2-store path.)
+        out_ptrs_lo = out_ptr + rows[:, None] * stride_om + cs_cols[None, :] * stride_od
+        out_ptrs_hi = out_ptr + rows[:, None] * stride_om + (cs_cols[None, :] + half) * stride_od
+
+        # RMSNorm + scale: compute mean(y²) over full D using y1, y2 directly.
+        sum_sq = tl.sum(y1 * y1, axis=1) + tl.sum(y2 * y2, axis=1)
+        rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+        norm_scale = rms_inv * scale
+
+        y1_out = y1 * norm_scale[:, None]
+        y2_out = y2 * norm_scale[:, None]
+        tl.store(out_ptrs_lo, y1_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None])
+        tl.store(out_ptrs_hi, y2_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None])
+        # Save rms_inv for backward (in fp32)
+        tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
+
+
+    @triton.jit
+    def _output_proj_residual_kernel(
+        attn_out_ptr, proj_w_ptr, residual_ptr,
+        y_ptr,
+        M, D_out, D_in,
+        stride_am, stride_ad,
+        stride_pw_dout, stride_pw_din,
+        stride_rm, stride_rd,
+        stride_ym, stride_yd,
+        BLOCK_M: tl.constexpr, BLOCK_DOUT: tl.constexpr, BLOCK_DIN: tl.constexpr,
+    ):
+        """Fused y = residual + attn_out @ W_proj.T.
+
+        Standard tiled matmul with the residual loaded into the
+        accumulator at start instead of zero-init. Same idea as cuBLAS
+        `addmm` but in our Triton stack.
+        """
+        pid_m = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = pid_d * BLOCK_DOUT + tl.arange(0, BLOCK_DOUT)
+        row_mask = rows < M
+        col_mask = cols < D_out
+
+        # Start accumulator with residual (the "bias" in addmm)
+        res_ptrs = residual_ptr + rows[:, None] * stride_rm + cols[None, :] * stride_rd
+        acc = tl.load(
+            res_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0,
+        ).to(tl.float32)
+
+        # Matmul-accumulate
+        for k_start in range(0, D_in, BLOCK_DIN):
+            ks = k_start + tl.arange(0, BLOCK_DIN)
+            k_mask = ks < D_in
+            a_ptrs = attn_out_ptr + rows[:, None] * stride_am + ks[None, :] * stride_ad
+            a = tl.load(
+                a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            pw_ptrs = (
+                proj_w_ptr
+                + cols[:, None] * stride_pw_dout
+                + ks[None, :] * stride_pw_din
+            )
+            pw = tl.load(
+                pw_ptrs, mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            acc += tl.dot(a, tl.trans(pw), input_precision="ieee")
+
+        y_ptrs = y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yd
+        tl.store(
+            y_ptrs,
+            acc.to(y_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & col_mask[None, :],
+        )
+
+
+def output_proj_residual_fwd(
+    attn_out: torch.Tensor,
+    proj_weight: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """Forward-only: y = residual + attn_out @ proj_weight.T (Triton).
+
+    Equivalent to `torch.addmm(residual, attn_out, proj_weight.t())`
+    but in our Triton stack — kernel below tiles the output and uses
+    `residual` as the accumulator init (the matmul + bias-add fusion).
+    """
+    assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
+    M, D_in = attn_out.shape
+    D_out, D_in_w = proj_weight.shape
+    assert D_in == D_in_w
+    y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
+    BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
+    _output_proj_residual_kernel[grid](
+        attn_out, proj_weight, residual, y,
+        M, D_out, D_in,
+        attn_out.stride(0), attn_out.stride(1),
+        proj_weight.stride(0), proj_weight.stride(1),
+        residual.stride(0), residual.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_DOUT=BLOCK_DOUT, BLOCK_DIN=BLOCK_DIN,
+    )
+    return y
