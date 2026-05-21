@@ -274,3 +274,14 @@ def patched_step_muon(self, group):
 
     # Copy updated params back to originals (same as original implementation)
     torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
+    # Free the function's GPU transients (mom_g, mom2_g, stacked_grads,
+    # stacked_params, ~10+ GiB combined) back to the driver. Without this,
+    # the allocator caches them as huge contiguous blocks that can't be
+    # split for the next iter's many small activation allocs → effective
+    # GPU usage stays high across the optim step boundary. With this,
+    # the next 256 fwd+bwd cycles get a clean allocator. Costs ~tens of
+    # ms per optim step (once per training iter, so ~0.05% on a ~130 s
+    # single-GPU iter).
+    del mom_g, mom2_g, stacked_grads, stacked_params
+    torch.cuda.empty_cache()
