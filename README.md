@@ -23,13 +23,19 @@ with two intertwined goals:
    LSE, and segmented-sum embedding backward actually look in code —
    not just on a whiteboard.
 
-2. **Optimize nanchat training throughput on consumer GPUs (e.g. RTX 3090).**
-   nanchat targets H100 with FA3; on 3090 the SDPA dispatcher falls back
-   to a slow path on sliding-window attention. nanoops's hand-written ops
-   sidestep this, and a Python-level `SlidingWindowSDPA` that chunks the
-   per-layer attention band cuts both compute and peak P-matrix memory by
-   ~4×. Stacking these lets the d20 base-train step fit at
-   `--device-batch-size=4` on 24 GiB cards instead of OOMing.
+2. **Optimize nanchat training on consumer GPUs along two axes: speed
+   AND model size.** nanchat targets H100 with FA3; on 3090 the SDPA
+   dispatcher falls back to a slow path on sliding-window attention.
+   nanoops's hand-written ops sidestep this (the *speed* axis — d20
+   base-train goes from 22.7k to ~30.5k tok/s, +34% throughput).
+   Separately, a Python-level `SlidingWindowSDPA` that chunks the per-
+   layer attention band cuts peak P-matrix memory by ~4× and MLP
+   activation checkpoint frees another ~3.7 GiB — together these unlock
+   the *size* axis: `--depth=24`, nanchat's reference ~1.5 B-param
+   configuration that normally OOMs at every batch size on a 24 GiB
+   card, now fits at `--device-batch-size=1`. So consumer hardware can
+   train both **faster** (smaller configs) and **larger models that
+   wouldn't fit at all** (bigger configs).
 
 ### What this means in practice
 

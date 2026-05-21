@@ -21,13 +21,16 @@
    chunked LSE 长什么样、embedding backward 怎么做分段求和——不是停留
    在白板上的推导。
 
-2. **在消费级 GPU（如 RTX 3090）上优化 nanchat 训练速度。**
+2. **在消费级 GPU 上同时优化 nanchat 训练的两个维度：速度 和 模型大小。**
    nanchat 的目标硬件是 H100 + FA3；在 3090 上 PyTorch SDPA 遇到
-   sliding window mask 时会退化到慢路径。nanoops 的手写算子绕开这条
-   退化路径，再加上 Python 层的 `SlidingWindowSDPA`（按 window 分块算
-   attention，计算量和 P 矩阵峰值都降到 ~1/4），叠加之后让 d20
-   base-train 步骤能在 24 GiB 显存上以 `--device-batch-size=4` 跑起来
-   （之前会 OOM）。
+   sliding window mask 时会退化到慢路径，nanoops 的手写算子绕开这条
+   退化路径（**速度**维度——d20 base-train 从 22.7k 涨到 ~30.5k tok/s，
+   +34% 吞吐）。另外 Python 层的 `SlidingWindowSDPA`（按 window 分块算
+   attention，P 矩阵峰值砍 ~4×）+ MLP activation checkpoint 再省 ~3.7 GiB
+   —— 这两个一起打开**模型大小**维度：`--depth=24`（nanchat 参考模型尺寸，
+   ~1.5 B 参数，原本在 24 GiB 卡上任何 batch size 都 OOM）现在能以
+   `--device-batch-size=1` 装下并跑起来。所以消费级硬件既能**训得更快**
+   （小配置吞吐拉满）又能**训原本根本装不下的更大模型**。
 
 ### 实际效果
 
