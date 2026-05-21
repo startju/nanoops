@@ -423,7 +423,10 @@ class Softmax(torch.autograd.Function):
         input_max = input.amax(dim=dim, keepdim=True)
         input_exp = (input - input_max).exp()
         sum_exp = input_exp.sum(dim=dim, keepdim=True)
-        output = input_exp / sum_exp
+        # In-place divide reuses input_exp's storage as the output. Safe because
+        # input_exp is a fresh tensor (just created by .exp()) with no other
+        # references — saves one input-sized allocation vs `input_exp / sum_exp`.
+        output = input_exp.div_(sum_exp)
         ctx.save_for_backward(output)
         ctx.dim = dim
         return output
@@ -434,9 +437,14 @@ class Softmax(torch.autograd.Function):
     ) -> tuple[torch.Tensor, None]:
         (output,) = ctx.saved_tensors
         dim = ctx.dim
-        inner_gy = (grad_output * output).sum(dim=dim, keepdim=True)  # <g, y>
-        grad_input = output * (grad_output - inner_gy)                # y * (g - <g, y>)
-        return grad_input, None  # None for dim (int, non-differentiable)
+        # Compact: y * (g - <g,y>) = g*y - y*<g,y>. Compute g*y once into gy,
+        # then in-place subtract y * <g,y> via addcmul_(... value=-1), which
+        # is a single fused kernel — no `output * inner` intermediate tensor.
+        # Saves one input-sized transient + one kernel launch vs the naive form.
+        gy = grad_output * output                                  # 1 alloc
+        inner = gy.sum(dim=dim, keepdim=True)                       # tiny <g,y>
+        gy.addcmul_(output, inner, value=-1)                        # in-place: gy -= y * inner
+        return gy, None  # None for dim (int, non-differentiable)
 
 
 @_allow_in_graph
@@ -1032,10 +1040,19 @@ class ScaledDotProductAttention(torch.autograd.Function):
         # Note: masked positions have P=0, so dS=0 there — masks naturally
         # don't propagate grad. Also: this is the same formula nanoops's
         # Softmax uses (the "save y, not x" trick).
-        grad_scores = probs * (grad_probs - (probs * grad_probs).sum(dim=-1, keepdim=True))
+        #
+        # Compact form: P*(dP - <P,dP>) = P*dP - P*<P,dP>. Compute pg = P*dP
+        # once, then subtract `P * <P,dP>` in-place via addcmul_(value=-1).
+        # That's a single fused kernel — no `P * <P,dP>` intermediate. Saves
+        # one P-sized transient per SDPA backward (the (B,H,L,S) attention
+        # matrix is the dominant memory term, so cutting one is meaningful).
+        grad_scores = probs * grad_probs                                    # 1 P-size alloc
+        inner = grad_scores.sum(dim=-1, keepdim=True)                       # tiny (B,H,L,1)
+        grad_scores.addcmul_(probs, inner, value=-1)                        # in-place: grad_scores -= probs * inner
 
-        # Fold scale into dS once, used by both dQ and dK.
-        grad_scores = grad_scores * scale
+        # Fold scale into dS once, used by both dQ and dK. In-place since
+        # grad_scores has no other references.
+        grad_scores.mul_(scale)
 
         # dL/dQ = dS @ K_e
         grad_query = grad_scores @ key_e
