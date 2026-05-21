@@ -120,7 +120,7 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
     # Sliding window during training (Tq == Tk, finite window) — chunked path.
     if Tq == Tk and window >= 0 and window < Tq:
         # window is "left tokens we include" (window+1 keys total per query).
-        return nF.sliding_window_sdpa(q, k, v, window + 1)
+        return nF.sliding_window_sdpa(q, k, v, window + 1, enable_gqa=enable_gqa)
 
     # Cached generation with chunk inference (Tq != Tk) — build explicit mask
     # and fall back to one big SDPA call (sliding_window_sdpa assumes Tq == Tk).

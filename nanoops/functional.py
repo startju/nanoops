@@ -1481,10 +1481,27 @@ class SlidingWindowSDPA(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, query, key, value, window_size):
-        B, H, L, D = query.shape
+    def forward(ctx, query, key, value, window_size, enable_gqa=False):
+        B, H_q, L, D = query.shape
+        H_kv = key.shape[-3]
         W = window_size
         scale_val = 1.0 / math.sqrt(D)
+
+        # GQA: repeat K/V heads to match Q's head count. Same trick as in
+        # ScaledDotProductAttention. Saved ctx keeps the ORIGINAL (un-
+        # expanded) K and V so we don't pay the G× memory tax twice; the
+        # expansion is recomputed cheaply in backward.
+        if enable_gqa and H_q != H_kv:
+            assert H_q % H_kv == 0, (
+                f"GQA needs H_q ({H_q}) divisible by H_kv ({H_kv})"
+            )
+            G = H_q // H_kv
+            key_e = key.repeat_interleave(G, dim=-3)
+            value_e = value.repeat_interleave(G, dim=-3)
+        else:
+            G = 1
+            key_e, value_e = key, value
+
         output = torch.empty_like(query)
         chunk_info = []
         probs_list = []
@@ -1495,8 +1512,8 @@ class SlidingWindowSDPA(torch.autograd.Function):
             k_end = q_end
 
             q_blk = query[..., q_start:q_end, :]
-            k_blk = key[..., k_start:k_end, :]
-            v_blk = value[..., k_start:k_end, :]
+            k_blk = key_e[..., k_start:k_end, :]
+            v_blk = value_e[..., k_start:k_end, :]
 
             scores = q_blk @ k_blk.transpose(-2, -1)
             scores.mul_(scale_val)
@@ -1519,6 +1536,7 @@ class SlidingWindowSDPA(torch.autograd.Function):
         ctx.chunk_info = chunk_info
         ctx.scale = scale_val
         ctx.n_chunks = len(chunk_info)
+        ctx.G = G
         return output
 
     @staticmethod
@@ -1528,15 +1546,24 @@ class SlidingWindowSDPA(torch.autograd.Function):
         probs_list = saved[3:]
         chunk_info = ctx.chunk_info
         scale_val = ctx.scale
+        G = ctx.G
+
+        # Re-expand K/V to match Q's head count for the chunked matmuls;
+        # collapse back at the end. Same pattern as in ScaledDotProductAttention.
+        if G > 1:
+            key_e = key.repeat_interleave(G, dim=-3)
+            value_e = value.repeat_interleave(G, dim=-3)
+        else:
+            key_e, value_e = key, value
 
         grad_query = torch.empty_like(query)
-        grad_key = torch.zeros_like(key)
-        grad_value = torch.zeros_like(value)
+        grad_key_e = torch.zeros_like(key_e)
+        grad_value_e = torch.zeros_like(value_e)
 
         for (q_start, q_end, k_start, k_end), probs in zip(chunk_info, probs_list):
             q_blk = query[..., q_start:q_end, :]
-            k_blk = key[..., k_start:k_end, :]
-            v_blk = value[..., k_start:k_end, :]
+            k_blk = key_e[..., k_start:k_end, :]
+            v_blk = value_e[..., k_start:k_end, :]
             g_out_blk = grad_output[..., q_start:q_end, :]
 
             grad_v_blk = probs.transpose(-2, -1) @ g_out_blk
@@ -1549,10 +1576,19 @@ class SlidingWindowSDPA(torch.autograd.Function):
             grad_k_blk = pg.transpose(-2, -1) @ q_blk
 
             grad_query[..., q_start:q_end, :] = grad_q_blk
-            grad_key[..., k_start:k_end, :] += grad_k_blk
-            grad_value[..., k_start:k_end, :] += grad_v_blk
+            grad_key_e[..., k_start:k_end, :] += grad_k_blk
+            grad_value_e[..., k_start:k_end, :] += grad_v_blk
 
-        return grad_query, grad_key, grad_value, None  # window_size not differentiable
+        # GQA: collapse the G replicas back to H_kv via unflatten + sum.
+        if G > 1:
+            grad_key = grad_key_e.unflatten(-3, (-1, G)).sum(dim=-3)
+            grad_value = grad_value_e.unflatten(-3, (-1, G)).sum(dim=-3)
+        else:
+            grad_key = grad_key_e
+            grad_value = grad_value_e
+
+        # window_size, enable_gqa are non-differentiable
+        return grad_query, grad_key, grad_value, None, None
 
 
 @_allow_in_graph
@@ -1561,10 +1597,12 @@ def sliding_window_sdpa(
     key: torch.Tensor,
     value: torch.Tensor,
     window_size: int,
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """Sliding-window causal SDPA. window_size = max number of past keys
     each query attends to (including itself), so window_size=L is full
-    causal attention.
+    causal attention. Set enable_gqa=True for Grouped-Query Attention
+    (H_q > H_kv); K/V get repeat_interleave'd to match H_q.
 
     Hooked into nanchat by `nanoops.integration.patch_nanchat()`: replaces
     nanchat.flash_attention._sdpa_attention so sliding training layers
@@ -1572,4 +1610,4 @@ def sliding_window_sdpa(
     NANOOPS_NO_SLIDING_WINDOW=1. See SlidingWindowSDPA docstring for the
     empirical end-to-end findings (+6.2% tok/sec, -10.4% peak memory).
     """
-    return SlidingWindowSDPA.apply(query, key, value, window_size)
+    return SlidingWindowSDPA.apply(query, key, value, window_size, enable_gqa)
