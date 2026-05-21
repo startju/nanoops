@@ -42,6 +42,11 @@ import torch.utils.checkpoint as _ckpt
 import nanoops.functional as nF
 
 
+# Captured at patch time so the checkpoint wrapper can call the un-patched
+# original CausalSelfAttention.forward.
+_orig_attn_forward = None
+
+
 _F_OVERRIDES = {
     "linear": nF.linear,
     "embedding": nF.embedding,
@@ -96,6 +101,30 @@ def _mlp_inner(self, x):
     return x
 
 
+def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
+    """Wraps CausalSelfAttention.forward with torch.utils.checkpoint ONLY
+    for the full-attention (L) layers — leave sliding (S) layers alone.
+
+    Rationale: full-attention layers store moderate activations (Q, K, V
+    + Flash backend internal buffers) without the savings SlidingWindowSDPA
+    already provides for S layers. Checkpointing just the L layers (6/24
+    for d24 SSSL) saves their activation footprint at the cost of
+    re-running their forward once during backward — much cheaper than
+    re-running 18 chunked sliding forwards.
+
+    Only triggers during training (kv_cache is None). Inference paths
+    bypass.
+    """
+    Tq = x.size(1)
+    is_full = window_size[0] < 0 or window_size[0] >= Tq
+    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and kv_cache is None and is_full:
+        return _ckpt.checkpoint(
+            _orig_attn_forward, self, x, ve, cos_sin, window_size, kv_cache,
+            use_reentrant=False,
+        )
+    return _orig_attn_forward(self, x, ve, cos_sin, window_size, kv_cache)
+
+
 def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
     """Replacement for nanchat.flash_attention._sdpa_attention that routes
     finite sliding-window cases to nanoops's SlidingWindowSDPA.
@@ -110,10 +139,17 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
     Tk = k.size(2)
     window = window_size[0]
 
-    # Full context, same length — same path as original.
+    # Full context, same length — route through nF.sliding_window_sdpa
+    # with window_size=Tq (covers all keys, so the sliding mask reduces
+    # to pure causal) and chunk_size=Tq//8. Note: this gives up Flash
+    # backend's tile-based O(L) memory; A/B on d24+B=1 didn't help with
+    # OOM, but we keep the unified chunked codepath so all training
+    # attention goes through the same nanoops Function (consistent
+    # autograd graph, easier to reason about).
     if (window < 0 or window >= Tq) and Tq == Tk:
-        return torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=enable_gqa
+        return nF.sliding_window_sdpa(
+            q, k, v, window_size=Tq, enable_gqa=enable_gqa,
+            chunk_size=max(1, Tq // 8),
         )
 
     # Single token generation — same path as original (left-trim k/v).
@@ -200,6 +236,13 @@ def _apply() -> dict[str, dict]:
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
+    # CausalSelfAttention.forward: wrap to allow activation checkpoint of the
+    # full-attention (L) layers via NANOOPS_L_ATTN_CHECKPOINT=1. Always
+    # installed; the env-var check inside picks the right path per layer.
+    global _orig_attn_forward
+    _orig_attn_forward = gpt_mod.CausalSelfAttention.forward
+    originals["method"][("nanochat.gpt", "CausalSelfAttention", "forward")] = _orig_attn_forward
+    gpt_mod.CausalSelfAttention.forward = _patched_l_attn_forward
     # Sliding window SDPA: always ON (measured +6.2% tok/sec and -10.4%
     # peak memory at B=2 on nanchat d20, RTX 3090). Patched
     # _sdpa_attention falls through to the original SDPA call for full
@@ -238,6 +281,9 @@ def patch_nanchat() -> list[str]:
     names.append("nanochat.flash_attention._sdpa_attention(sliding_window_sdpa)")
     if os.environ.get("NANOOPS_MLP_CHECKPOINT"):
         names.append("MLP.forward(activation checkpoint)")
+    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
+        names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
+    names.append("_sdpa_attention(full-attn → chunked sliding, default)")
     return names
 
 
