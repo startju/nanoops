@@ -21,6 +21,11 @@ source .venv/bin/activate
 export NANOOPS=1
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+# expandable_segments unfragments PyTorch's caching allocator. With this
+# off, the 1-2 GiB of "reserved but unallocated" memory at B=4 prevents
+# the last needed allocation and OOMs the run, even though SlidingWindowSDPA
+# saves ~2 GiB of P-matrix peak. Setting it lets B=4 fit at ~23.4/24 GiB.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
@@ -31,3 +36,12 @@ torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
     --device-batch-size=4 \
     --run=$WANDB_RUN \
     "$@"
+# device-batch-size=4 (matches speedrun) is now possible because:
+#   1. SlidingWindowSDPA (default ON) cuts ~2 GiB of P-matrix peak
+#      across the 15 sliding layers
+#   2. expandable_segments=True (set above) recovers the 1-2 GiB lost
+#      to allocator fragmentation
+# Together these let B=4 fit at ~23.4/24 GiB on 2× RTX 3090, giving
+# ~33,000 tok/s, MFU 67% (vs B=2's 30,600 tok/s and the original
+# 22,700 tok/s baseline — total ~45% improvement on the stack).
+# Drop to --device-batch-size=2 if you OOM on tighter memory.
