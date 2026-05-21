@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -205,16 +206,13 @@ class Lookup(torch.autograd.Function):
 
 
 class LookupSorted(torch.autograd.Function):
-    """Same forward as Lookup, but backward uses sorted-index segmented sum.
+    """Same forward as Lookup, backward uses sort + cumsum-based segmented sum.
 
-    Why a second implementation: `Lookup.backward` calls `index_add_` which
-    serializes writes to the same destination row via atomicAdd. In language
-    model training the indices are token ids — common tokens (`the`, `,`, ...)
-    can appear dozens of times in a single batch. Each duplicate triggers a
-    new atomic on the same `grad_weight` row, and the GPU has to serialize
-    those updates, leaving the SMs underutilized.
+    ⚠ NOT USED BY DEFAULT — kept as an instructive counter-example. The
+    textbook "atomic-add is slow on GPUs, sort first" rewrite turned out to
+    be a regression here on two axes; see "Why we don't use it" below.
 
-    This class replaces the atomic-add path with an atomic-FREE pipeline:
+    Algorithm (atomic-free segmented sum):
 
         1. sort indices to put identical row-targets next to each other
         2. permute grad_output the same way
@@ -222,15 +220,27 @@ class LookupSorted(torch.autograd.Function):
         4. cumsum + boundary-diff gives the per-group sum (purely parallel)
         5. one dense write to grad_weight at the unique row positions
 
-    Cost trade-off vs Lookup.backward:
-      + No atomic contention — wins big when duplicates are common.
-      + Each unique row is written exactly once.
-      − Allocates two extra (N, D) buffers (sorted_grads, cumsum) and a
-        sort permutation. Negligible vs the (V, D) zeros that both impls
-        allocate, since N << V in practice.
-      − Slightly more FLOPs (cumsum is O(N*D)), but parallel-friendly.
+    Why we don't use it (measured on RTX 3090, V=32768, D=1280, N=4096,
+    nanchat-like Zipf token distribution, max 15 duplicates per row):
 
-    Forward is byte-identical to Lookup.forward (no reason to differ).
+      ❌ Numerical accuracy: backward cumsum runs in input dtype. In bf16
+         (7-bit mantissa) the cumsum over 4096 rows accumulates ~10⁻¹
+         relative error vs Lookup — completely unusable for nanchat
+         training which is bf16. Lookup's pile-of-atomics path computes
+         each row sum independently with no long-range accumulation.
+
+      ❌ Speed: at the realistic duplicate rate (max 15, mean 1.79),
+         atomicAdd is fast on Ampere/Hopper and LookupSorted is ~4× SLOWER
+         (1.84 ms vs 0.45 ms / iter for Lookup). The sort + permute +
+         (N, D) cumsum overhead dwarfs the contention Lookup pays.
+
+    Where the textbook argument WOULD have held: very heavy duplicate
+    counts (one row hit hundreds of times) AND fp32. Neither applies here.
+
+    Lesson: GPU "atomic-add is slow" intuition was true ~Pascal era;
+    Ampere/Hopper atomic-add throughput improved enough that the
+    crossover point moved a lot. Benchmark before assuming the
+    "more parallel" rewrite wins.
     """
 
     @staticmethod
@@ -314,10 +324,12 @@ def embedding(
     #   typically a 10-100x gap, not a wash.
     indices_shape = indices.shape
     new_indices = indices.reshape(-1)
-    # Use the sorted-index variant by default — same forward, atomic-free
-    # backward. `Lookup` (above) is kept as a readable reference impl;
-    # swap LookupSorted → Lookup to compare.
-    out = LookupSorted.apply(new_indices, weight)
+    # Default to `Lookup` (naive index_add_); set `NANOOPS_LOOKUP_SORTED=1`
+    # to swap to `LookupSorted` for A/B comparison. See LookupSorted's
+    # docstring for why sorted is NOT the default (bf16 cumsum accumulation
+    # error + slower on Ampere atomicAdd at realistic duplicate rates).
+    impl = LookupSorted if os.environ.get("NANOOPS_LOOKUP_SORTED") else Lookup
+    out = impl.apply(new_indices, weight)
     return out.reshape(*indices_shape, -1)
 
 
