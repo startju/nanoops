@@ -79,11 +79,23 @@ adds optional fast-path variants.
 
 ### Tier 3 — fused Triton kernels (optional)
 
-- [ ] FlashAttention SDPA (O(L) ctx via LSE+max recompute) + optional FA-3 shim
-- [ ] `logit_softcap`: `softcap * tanh(x / softcap)` (`gpt.py:472`)
-- [ ] `mlp_relu_square`: `linear(relu²(linear(x)))` (`gpt.py:135–138`)
-- [ ] `sigmoid_gated_mul`: `sigmoid(a) * b` (smear / VE gate)
-- [ ] `rms_norm_linear`: `linear(rms_norm(x), W)`
+- [x] **`norm_mlp_relu_square`**: `relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T` —
+      the full MLP block. Forward fuses RMSNorm + c_fc + ReluSquare into
+      a single tiled Triton kernel (per-row rms cached in registers
+      across the matmul); c_proj uses cuBLAS. Backward chains the two
+      cuBLAS gradients with a small relu²-bwd Triton kernel and an
+      RMSNorm-bwd Triton kernel.
+- [x] **`norm_qkv_projection`**: `RMSNorm(x) @ W_qkv.T` where W_qkv is
+      `concat([c_q.weight, c_k.weight, c_v.weight])` — the first half of
+      CausalSelfAttention. Same fusion pattern as the MLP forward; caller
+      splits the output into q/k/v and runs the rest (rotary, Q/K norm,
+      SDPA, c_proj) eagerly. Backward reuses the same RMSNorm-bwd kernel
+      as the MLP fusion.
+
+These two cover the heaviest "norm + linear chain" entries of the
+transformer block. Further fusions (full Flash-style SDPA, logit
+softcap, etc.) are out of scope for nanoops's teaching focus — they
+need multi-kernel research-level engineering.
 
 ### Conventions for each new op
 

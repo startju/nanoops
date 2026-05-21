@@ -390,3 +390,185 @@ def norm_mlp_relu_square(
     isn't available — check `NORM_MLP_ENABLED` or `_HAS_TRITON`.
     """
     return NormMLPReluSquare.apply(x, norm_weight, fc_weight, proj_weight, eps)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fused RMSNorm + QKV projection (the first half of CausalSelfAttention).
+#
+# nanchat's attention forward looks like:
+#     x_norm = norm(x)                       (RMSNorm at Block level)
+#     q = c_q(x_norm); k = c_k(x_norm); v = c_v(x_norm)        ← FUSED HERE
+#     q, k = apply_rotary(q, k, cos_sin)
+#     q, k = norm(q), norm(k)
+#     q, k = q * 1.2, k * 1.2
+#     y = sliding_window_sdpa(q, k, v, window_size)
+#     y = c_proj(y)
+#
+# This kernel folds the OUTER RMSNorm + Q/K/V linear projections into
+# one tiled Triton pass — three matmuls share one read of x_norm and
+# one rms-inv computation per row, plus we co-locate the per-row writes
+# of q, k, v into a single (M, 3*N) output buffer. Backward chains the
+# three matmul gradients + a single RMSNorm-backward Triton kernel,
+# reusing the same _rms_norm_bwd_kernel as the MLP fusion.
+# ─────────────────────────────────────────────────────────────────────
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _norm_qkv_fwd_kernel(
+        x_ptr, norm_w_ptr, qkv_w_ptr,
+        out_ptr, rms_inv_ptr,
+        M, N_qkv, K,
+        eps,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        stride_om, stride_on,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """Computes one (BLOCK_M, BLOCK_N) tile of out = RMSNorm(x) @ W_qkv.T,
+        where W_qkv = concat([c_q.weight, c_k.weight, c_v.weight], dim=0)
+        and N_qkv = (H_q + 2*H_kv) * D_head. Caller splits the output
+        into q/k/v slices along dim=-1."""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = rows < M
+        col_mask = cols < N_qkv
+
+        # Pass 1: per-row mean(x²)
+        sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_mask = ks < K
+            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
+            x = tl.load(
+                x_ptrs,
+                mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            sum_sq += tl.sum(x * x, axis=1)
+        rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
+
+        if pid_n == 0:
+            tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
+
+        # Pass 2: matmul x_hat @ W_qkv.T into fp32 accumulator
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_mask = ks < K
+            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
+            x = tl.load(
+                x_ptrs,
+                mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+            x_hat = x * rms_inv[:, None] * nw[None, :]
+            w_ptrs = (
+                qkv_w_ptr
+                + cols[:, None] * stride_wn
+                + ks[None, :] * stride_wk
+            )
+            w = tl.load(
+                w_ptrs,
+                mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            acc += tl.dot(x_hat, tl.trans(w), input_precision="ieee")
+
+        out_ptrs = out_ptr + rows[:, None] * stride_om + cols[None, :] * stride_on
+        tl.store(
+            out_ptrs,
+            acc.to(out_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & col_mask[None, :],
+        )
+
+
+class NormQKVProjection(torch.autograd.Function):
+    """Fused RMSNorm + concatenated Q/K/V linear projection.
+
+    Forward: one Triton kernel folds the outer RMSNorm and all three
+    QKV matmuls together, writing the concatenated output (M, N_q+N_k+N_v).
+    Caller slices it into q, k, v.
+
+    Backward: three linear backwards via cuBLAS + one RMSNorm-backward
+    Triton kernel (reused from the MLP fusion's _rms_norm_bwd_kernel).
+    """
+
+    @staticmethod
+    def forward(ctx, x, norm_weight, qkv_weight, eps=1e-6):
+        assert x.is_cuda and x.is_contiguous()
+        assert norm_weight.is_cuda and qkv_weight.is_cuda
+        M, K = x.shape
+        N_qkv, K_w = qkv_weight.shape
+        assert K == K_w, f"x last dim {K} != qkv_weight in dim {K_w}"
+
+        BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
+        out = torch.empty((M, N_qkv), dtype=x.dtype, device=x.device)
+        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_qkv, BLOCK_N))
+        _norm_qkv_fwd_kernel[grid](
+            x, norm_weight, qkv_weight,
+            out, rms_inv,
+            M, N_qkv, K, eps,
+            x.stride(0), x.stride(1),
+            qkv_weight.stride(0), qkv_weight.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
+
+        ctx.save_for_backward(x, norm_weight, qkv_weight, rms_inv)
+        ctx.M, ctx.N_qkv, ctx.K = M, N_qkv, K
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        x, norm_w, qkv_w, rms_inv = ctx.saved_tensors
+        M, N_qkv, K = ctx.M, ctx.N_qkv, ctx.K
+        d_out = d_out.contiguous()
+
+        # Linear backward (cuBLAS): out = x_hat @ qkv_w.T
+        #   dx_hat = d_out @ qkv_w
+        #   d_qkv_w = d_out.T @ x_hat
+        x_hat = x * rms_inv.unsqueeze(1) * norm_w
+        dx_hat = d_out @ qkv_w        # (M, K)
+        d_qkv_w = d_out.t() @ x_hat   # (N_qkv, K)
+
+        # RMSNorm backward (Triton — reuses _rms_norm_bwd_kernel)
+        BLOCK_M_BWD, BLOCK_K_BWD = 32, 64
+        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+        dx = torch.empty_like(x)
+        dnw_partials = torch.empty(
+            (num_m_tiles, K), dtype=norm_w.dtype, device=x.device,
+        )
+        grid_bwd = (num_m_tiles, triton.cdiv(K, BLOCK_K_BWD))
+        _rms_norm_bwd_kernel[grid_bwd](
+            x, rms_inv, norm_w,
+            dx_hat,
+            dx, dnw_partials,
+            M, K,
+            x.stride(0), x.stride(1),
+            dx_hat.stride(0), dx_hat.stride(1),
+            dx.stride(0), dx.stride(1),
+            BLOCK_M=BLOCK_M_BWD, BLOCK_K=BLOCK_K_BWD,
+        )
+        dnw = dnw_partials.sum(dim=0)
+
+        # eps non-differentiable
+        return dx, dnw, d_qkv_w, None
+
+
+def norm_qkv_projection(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused RMSNorm + concatenated QKV linear projection.
+
+    Caller stacks `c_q.weight, c_k.weight, c_v.weight` along dim 0 into
+    `qkv_weight` and splits the output along dim -1. See
+    `causal_self_attention_triton` for the canonical orchestration.
+    """
+    return NormQKVProjection.apply(x, norm_weight, qkv_weight, eps)

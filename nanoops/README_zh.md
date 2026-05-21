@@ -71,11 +71,20 @@ Tier 2 加入注意力；Tier 3 是可选的性能优化版本。
 
 ### Tier 3 —— 用 Triton 写的融合 kernel（可选）
 
-- [ ] FlashAttention SDPA（用 LSE+max 重算 P，ctx 降到 O(L)）+ 可选 FA-3 shim
-- [ ] `logit_softcap`：`softcap * tanh(x / softcap)`（`gpt.py:472`）
-- [ ] `mlp_relu_square`：`linear(relu²(linear(x)))`（`gpt.py:135–138`）
-- [ ] `sigmoid_gated_mul`：`sigmoid(a) * b`（smear / VE gate）
-- [ ] `rms_norm_linear`：`linear(rms_norm(x), W)`
+- [x] **`norm_mlp_relu_square`**：`relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T` ——
+      整个 MLP 块。Forward 在一个 tiled Triton kernel 里同时做 RMSNorm +
+      c_fc + ReluSquare（per-row rms 在寄存器里跨 matmul 复用）；c_proj 走
+      cuBLAS。Backward 串联两次 cuBLAS 梯度 + 一个小的 relu²-bwd Triton
+      kernel + 一个 RMSNorm-bwd Triton kernel。
+- [x] **`norm_qkv_projection`**：`RMSNorm(x) @ W_qkv.T`，其中 W_qkv 是把
+      `c_q.weight, c_k.weight, c_v.weight` 在 dim 0 上拼接得到 —— CausalSelf-
+      Attention 的前半段。Forward 跟 MLP 是同一套 fusion；caller 把输出沿
+      dim -1 切成 q/k/v，剩下的（rotary、Q/K norm、SDPA、c_proj）走 eager。
+      Backward 复用 MLP 的 RMSNorm-bwd kernel。
+
+这两个覆盖了 transformer block 里最重的 "norm + linear 链" 入口。再往下
+（完整的 Flash-style SDPA、logit softcap 等）超出 nanoops 教学范围 ——
+需要多 kernel 的研究级工程量。
 
 ### 新增算子流程
 
