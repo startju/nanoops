@@ -204,6 +204,82 @@ class Lookup(torch.autograd.Function):
         return None, grad_weight
 
 
+class LookupSorted(torch.autograd.Function):
+    """Same forward as Lookup, but backward uses sorted-index segmented sum.
+
+    Why a second implementation: `Lookup.backward` calls `index_add_` which
+    serializes writes to the same destination row via atomicAdd. In language
+    model training the indices are token ids — common tokens (`the`, `,`, ...)
+    can appear dozens of times in a single batch. Each duplicate triggers a
+    new atomic on the same `grad_weight` row, and the GPU has to serialize
+    those updates, leaving the SMs underutilized.
+
+    This class replaces the atomic-add path with an atomic-FREE pipeline:
+
+        1. sort indices to put identical row-targets next to each other
+        2. permute grad_output the same way
+        3. unique_consecutive(counts) finds the group boundaries
+        4. cumsum + boundary-diff gives the per-group sum (purely parallel)
+        5. one dense write to grad_weight at the unique row positions
+
+    Cost trade-off vs Lookup.backward:
+      + No atomic contention — wins big when duplicates are common.
+      + Each unique row is written exactly once.
+      − Allocates two extra (N, D) buffers (sorted_grads, cumsum) and a
+        sort permutation. Negligible vs the (V, D) zeros that both impls
+        allocate, since N << V in practice.
+      − Slightly more FLOPs (cumsum is O(N*D)), but parallel-friendly.
+
+    Forward is byte-identical to Lookup.forward (no reason to differ).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        indices: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        assert indices.ndim == 1, f"indices must be 1D, got {indices.ndim}D"
+        assert weight.ndim == 2, f"weight must be 2D, got {weight.ndim}D"
+        ctx.save_for_backward(indices, weight)
+        return weight[indices]
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[None, torch.Tensor]:
+        indices, weight = ctx.saved_tensors
+        grad_weight = torch.zeros_like(weight)
+        N = indices.shape[0]
+        if N == 0:
+            return None, grad_weight
+
+        # 1. Sort indices to co-locate duplicates.
+        sorted_indices, perm = indices.sort()
+        # 2. Permute grad rows so each group of identical targets is contiguous.
+        sorted_grads = grad_output[perm]
+        # 3. Group structure: which row each group targets, and how many
+        #    sorted entries fall into each group.
+        unique_rows, counts = sorted_indices.unique_consecutive(return_counts=True)
+
+        # 4. Per-group sum via cumsum + boundary diff (no atomics):
+        #    cumsum[k] = sum of sorted_grads[:k+1]
+        #    group i ends at index group_ends[i] (last entry of group i in
+        #    sorted order). Then:
+        #      group_sum[i] = cumsum[group_ends[i]] - cumsum[group_ends[i-1]]
+        #    (group_sum[0] is just cumsum[group_ends[0]]; no prior group.)
+        cumsum = sorted_grads.cumsum(0)
+        group_ends = counts.cumsum(0).sub_(1)              # last index per group
+        group_sums = cumsum.index_select(0, group_ends)    # alloc (G, D)
+        if unique_rows.numel() > 1:
+            group_sums[1:].sub_(cumsum.index_select(0, group_ends[:-1]))
+
+        # 5. Dense write — each unique_rows[i] is unique, so this is a
+        #    contention-free scatter (one row touched at most once).
+        grad_weight[unique_rows] = group_sums
+        return None, grad_weight
+
+
 @_allow_in_graph
 def embedding(
     indices: torch.Tensor,
@@ -238,7 +314,10 @@ def embedding(
     #   typically a 10-100x gap, not a wash.
     indices_shape = indices.shape
     new_indices = indices.reshape(-1)
-    out = Lookup.apply(new_indices, weight)
+    # Use the sorted-index variant by default — same forward, atomic-free
+    # backward. `Lookup` (above) is kept as a readable reference impl;
+    # swap LookupSorted → Lookup to compare.
+    out = LookupSorted.apply(new_indices, weight)
     return out.reshape(*indices_shape, -1)
 
 
