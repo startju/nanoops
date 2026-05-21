@@ -249,11 +249,18 @@ def _apply() -> dict[str, dict]:
     if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
         from . import cpu_offload
         optim_mod = importlib.import_module("nanochat.optim")
-        cls = optim_mod.DistMuonAdamW
-        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_adamw")] = cls._compute_adamw
-        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_muon")] = cls._compute_muon
-        cls._compute_adamw = cpu_offload.patched_compute_adamw
-        cls._compute_muon = cpu_offload.patched_compute_muon
+        # Distributed path (>1 GPU)
+        dist_cls = optim_mod.DistMuonAdamW
+        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_adamw")] = dist_cls._compute_adamw
+        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_muon")] = dist_cls._compute_muon
+        dist_cls._compute_adamw = cpu_offload.patched_compute_adamw
+        dist_cls._compute_muon = cpu_offload.patched_compute_muon
+        # Single-GPU path
+        single_cls = optim_mod.MuonAdamW
+        originals["method"][("nanochat.optim", "MuonAdamW", "_step_adamw")] = single_cls._step_adamw
+        originals["method"][("nanochat.optim", "MuonAdamW", "_step_muon")] = single_cls._step_muon
+        single_cls._step_adamw = cpu_offload.patched_step_adamw
+        single_cls._step_muon = cpu_offload.patched_step_muon
     _PATCHED = True  # global declared at top of _apply()
     return originals
 
@@ -286,7 +293,7 @@ def patch_nanchat() -> list[str]:
         names.append("MLP.forward(activation checkpoint)")
     names.append("_sdpa_attention(full-attn → chunked sliding, default)")
     if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
-        names.append("DistMuonAdamW._compute_adamw/_compute_muon(CPU offload)")
+        names.append("MuonAdamW/DistMuonAdamW(CPU optim state offload)")
     return names
 
 

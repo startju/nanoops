@@ -7,13 +7,18 @@ async-copy H2D / D2H around the existing fused kernels.
 Wired in by `nanoops.integration._apply` when `NANOOPS_OFFLOAD_OPTIM=1`;
 reversed by `_restore` via the standard `originals` dict.
 
-Limitations:
-  - Only handles `DistMuonAdamW` (the distributed path used on >1 GPU).
-    Single-GPU `MuonAdamW` is left alone.
-  - State loaded from a checkpoint comes back on whichever device the
-    checkpoint stored. The first optim step after resume re-pays the
-    H2D + D2H cost from a non-pinned CPU buffer; subsequent steps
-    re-pin via the lazy alloc path.
+Both classes are handled:
+  - `DistMuonAdamW` (distributed, >1 GPU): patches `_compute_adamw` and
+    `_compute_muon` — state lives sharded across ranks via ZeRO-1, this
+    moves each rank's slice to CPU.
+  - `MuonAdamW` (single GPU): patches `_step_adamw` and `_step_muon` —
+    full-size state lives on CPU (no ZeRO sharding to begin with), the
+    only path to fit a model that otherwise overflows VRAM.
+
+Limitation: state loaded from a checkpoint comes back on whichever
+device the checkpoint stored. The first optim step after resume re-pays
+the H2D + D2H cost from a non-pinned CPU buffer; subsequent steps
+re-pin via the lazy alloc path.
 """
 
 from __future__ import annotations
@@ -152,3 +157,102 @@ def patched_compute_muon(self, group, info, gather_list, rank):
         stacked_params, updated_params, async_op=True
     ).get_future()
     gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+
+
+# -----------------------------------------------------------------------------
+# Single-GPU (MuonAdamW) versions: full-size state on CPU pinned memory.
+# Same H2D/D2H pattern but without the reduce_scatter / all_gather glue.
+
+def patched_step_adamw(self, group):
+    """CPU-offloaded version of MuonAdamW._step_adamw (single-GPU path)."""
+    from nanochat.optim import adamw_step_fused
+
+    for p in group['params']:
+        if p.grad is None:
+            continue
+        grad = p.grad
+        state = self.state[p]
+
+        if not state:
+            state['step'] = 0
+            state['exp_avg'] = torch.zeros(
+                p.shape, dtype=p.dtype, device="cpu", pin_memory=True,
+            )
+            state['exp_avg_sq'] = torch.zeros(
+                p.shape, dtype=p.dtype, device="cpu", pin_memory=True,
+            )
+        state['step'] += 1
+
+        exp_avg_g = state['exp_avg'].to(p.device, non_blocking=True)
+        exp_avg_sq_g = state['exp_avg_sq'].to(p.device, non_blocking=True)
+
+        self._adamw_step_t.fill_(state['step'])
+        self._adamw_lr_t.fill_(group['lr'])
+        self._adamw_beta1_t.fill_(group['betas'][0])
+        self._adamw_beta2_t.fill_(group['betas'][1])
+        self._adamw_eps_t.fill_(group['eps'])
+        self._adamw_wd_t.fill_(group['weight_decay'])
+
+        adamw_step_fused(
+            p, grad, exp_avg_g, exp_avg_sq_g,
+            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+        )
+
+        state['exp_avg'].copy_(exp_avg_g, non_blocking=True)
+        state['exp_avg_sq'].copy_(exp_avg_sq_g, non_blocking=True)
+
+
+def patched_step_muon(self, group):
+    """CPU-offloaded version of MuonAdamW._step_muon (single-GPU path)."""
+    from nanochat.optim import muon_step_fused
+
+    params = group['params']
+    if not params:
+        return
+
+    p = params[0]
+    state = self.state[p]
+    num_params = len(params)
+    shape, device, dtype = p.shape, p.device, p.dtype
+
+    if "momentum_buffer" not in state:
+        state["momentum_buffer"] = torch.zeros(
+            num_params, *shape, dtype=dtype, device="cpu", pin_memory=True,
+        )
+    if "second_momentum_buffer" not in state:
+        state_shape = (
+            (num_params, shape[-2], 1)
+            if shape[-2] >= shape[-1]
+            else (num_params, 1, shape[-1])
+        )
+        state["second_momentum_buffer"] = torch.zeros(
+            state_shape, dtype=dtype, device="cpu", pin_memory=True,
+        )
+    red_dim = -1 if shape[-2] >= shape[-1] else -2
+
+    # H2D copy full state to GPU buffers
+    mom_g = state["momentum_buffer"].to(device, non_blocking=True)
+    mom2_g = state["second_momentum_buffer"].to(device, non_blocking=True)
+
+    stacked_grads = torch.stack([p.grad for p in params])
+    stacked_params = torch.stack(params)
+
+    self._muon_momentum_t.fill_(group["momentum"])
+    self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+    self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+    self._muon_wd_t.fill_(group["weight_decay"])
+
+    muon_step_fused(
+        stacked_grads, stacked_params,
+        mom_g, mom2_g,
+        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+        group["ns_steps"], red_dim,
+    )
+
+    # D2H copy state back
+    state["momentum_buffer"].copy_(mom_g, non_blocking=True)
+    state["second_momentum_buffer"].copy_(mom2_g, non_blocking=True)
+
+    # Copy updated params back to originals (same as original implementation)
+    torch._foreach_copy_(params, list(stacked_params.unbind(0)))
