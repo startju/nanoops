@@ -1,4 +1,4 @@
-# nanoops: nanochat on 2× 3090 — a teaching fork
+# nanoops: nanochat on RTX 3090 — a teaching fork
 
 > 中文版：[README_zh.md](README_zh.md)
 
@@ -23,19 +23,22 @@ with two intertwined goals:
    LSE, and segmented-sum embedding backward actually look in code —
    not just on a whiteboard.
 
-2. **Optimize nanchat training on consumer GPUs along two axes: speed
-   AND model size.** nanchat targets H100 with FA3; on 3090 the SDPA
-   dispatcher falls back to a slow path on sliding-window attention.
-   nanoops's hand-written ops sidestep this (the *speed* axis — d20
-   base-train goes from 22.7k to ~30.5k tok/s, +34% throughput).
-   Separately, a Python-level `SlidingWindowSDPA` that chunks the per-
-   layer attention band cuts peak P-matrix memory by ~4× and MLP
-   activation checkpoint frees another ~3.7 GiB — together these unlock
-   the *size* axis: `--depth=24`, nanchat's reference ~1.5 B-param
-   configuration that normally OOMs at every batch size on a 24 GiB
-   card, now fits at `--device-batch-size=1`. So consumer hardware can
-   train both **faster** (smaller configs) and **larger models that
-   wouldn't fit at all** (bigger configs).
+2. **Optimize nanchat training on a 24 GiB GPU along two axes: speed
+   AND model size.** nanchat targets H100 with FA3; on the 3090 the
+   SDPA dispatcher falls back to a slow path on sliding-window
+   attention. nanoops's hand-written ops sidestep this (the *speed*
+   axis — d20 base-train goes from 22.7k to ~30.5k tok/s, +34%
+   throughput). A Python-level `SlidingWindowSDPA` that chunks the
+   per-layer attention band cuts peak P-matrix memory by ~4×, MLP
+   activation checkpoint frees another ~3.7 GiB, and an **optimizer-
+   state CPU offload** moves the Muon + AdamW state (~3 GiB on d24
+   under ZeRO-1, full size on single-GPU) into pinned host memory —
+   together these unlock the *size* axis: `--depth=24`, nanchat's
+   reference ~1.5 B-param configuration that normally OOMs at every
+   batch size on a 24 GiB card, now fits at `--device-batch-size=1`
+   on either one or two 3090s. So consumer hardware can train both
+   **faster** (smaller configs) and **larger models that wouldn't fit
+   at all** (bigger configs).
 
 ### What this means in practice
 
@@ -50,23 +53,29 @@ anyone learning at home or on a small budget.
 
 This fork's full optimization stack — SlidingWindowSDPA (chunked
 attention keeps the band only, no full P) + MLP activation checkpoint
-+ L-layer activation checkpoint + the `expandable_segments` allocator
++ optimizer state CPU offload + the `expandable_segments` allocator
 — frees enough peak GPU memory and tames allocator fragmentation
-enough that d24 actually fits at `--device-batch-size=1` on those
-same consumer cards. **The point is to put nanchat's default training
-within reach of a beginner's hardware budget.**
+enough that d24 actually fits at `--device-batch-size=1` on a 24 GiB
+consumer card, whether you have **one** or **two** of them. The
+2-GPU run finishes in about half the wall time of the 1-GPU run (DDP
+data-parallel, so it's just more tokens/sec at the same per-iter peak
+memory). **The point is to put nanchat's default training within
+reach of a beginner's hardware budget.**
 
-| Config            | nanchat default | nanoops stack on 2× RTX 3090       |
-| ----------------- | --------------- | ---------------------------------- |
-| `--depth=20`, B=4 | ~22.7k tok/s    | **~30.5k tok/s** (+34%, ~31 h ETA) |
-| `--depth=24`, B=1 | OOM             | **~16k tok/s** (~101 h ETA)        |
+| Config            | nanchat default | nanoops, 1× 24 GiB GPU | nanoops, 2× 24 GiB GPUs |
+| ----------------- | --------------- | ---------------------- | ----------------------- |
+| `--depth=20`, B=4 | OOM (no FA3)    | (recipe applies)       | **~30.5k tok/s**, ~31 h |
+| `--depth=24`, B=1 | OOM at all B    | **~8k tok/s**, ~200 h  | **~16k tok/s**, ~101 h  |
 
 **Concretely:** at typical spot-rental rates of ~$0.18/GPU/hr for an
-RTX 3090, a 2× 3090 rig runs at about **$0.36/hr ≈ $8.6/day ≈ $60/week**.
-A full `--depth=24` pretraining run finishes in ~4.2 days for roughly
-**$36** of GPU time, and a `--depth=20` run finishes in ~31 h for under
-**$12**. The same training is otherwise targeted at 8× H100 nodes;
-this fork makes it feasible on a single dual-3090 desktop.
+RTX 3090, a single 3090 costs ~$0.18/hr (~$30/week) and a 2× 3090 rig
+~$0.36/hr (~$60/week). A full `--depth=24` pretraining run costs
+roughly **$36 over ~4.2 days on dual-GPU** or **~$36 over ~8.3 days
+on single-GPU** (same GPU-hours either way — DDP just trades wall
+time for parallelism). `--depth=20` on dual-GPU finishes in ~31 h for
+under **$12**. The same training is otherwise targeted at 8× H100
+nodes; this fork makes it feasible on a desktop with one or two
+consumer GPUs.
 
 **Good fit for learners.** Even at the heavier d24 budget there's still
 ~$24 / ~2-3 days of GPU time left in a week to break the code on —
@@ -77,7 +86,7 @@ a debugger, and the bundled tests (`tests/test_nanoops_e2e.py`,
 `tests/test_sdpa_parity.py`, ...) cross-check every op against
 PyTorch's reference — so you always have ground truth to compare against.
 
-### Measured speedup journey (d20 base_train, 2× RTX 3090)
+### Measured speedup journey (d20 base_train on a 3090, dual-GPU numbers)
 
 | Config                                | tok/sec    | MFU       | Peak GPU mem | vs baseline |
 | ------------------------------------- | ---------- | --------- | ------------ | ----------- |
@@ -94,15 +103,16 @@ Full A/B autopsy lives in the
 ### Try it
 
 ```bash
-# Drop-in replacement for speedrun.sh's base_train step,
-# defaults to --depth=24 --device-batch-size=1 (the biggest nanchat
-# config that fits on 2× RTX 3090). Four optimizations active by
-# default: sliding-window SDPA + chunked full attention (for L layers) +
-# MLP activation checkpoint + L-layer activation checkpoint +
-# expandable_segments allocator.
-bash nanoops/train.sh
+# Drop-in replacement for speedrun.sh's base_train step. Defaults to
+# --depth=24 --device-batch-size=1 (the biggest nanchat config that
+# fits on a 24 GiB consumer card). Five optimizations active by default:
+# sliding-window SDPA + chunked full attention + MLP activation
+# checkpoint + optimizer state CPU offload + expandable_segments
+# allocator.
+bash nanoops/train.sh                       # uses both visible GPUs
+NPROC=1 bash nanoops/train.sh               # single GPU — same recipe still fits
 
-# Or override defaults — e.g. fastest throughput on 2× RTX 3090:
+# Or override defaults — e.g. fastest throughput on dual 3090:
 bash nanoops/train.sh --depth=20 --device-batch-size=4
 
 # Active env vars (set automatically by train.sh):
