@@ -595,10 +595,20 @@ class CrossEntropy(torch.autograd.Function):
         target_idx = safe_target.unsqueeze(dim)
         per_sample = (log_sum_exp - input.gather(dim, target_idx)).squeeze(dim)
         per_sample = per_sample * valid_mask  # 0 at ignored positions
-        # Cache valid_mask + target_idx so backward doesn't have to recompute
-        # them (both are cheap but it saves 2 dispatches per backward, and
-        # the extra ctx footprint is ~few KB — bool + int64 of shape (N,) /
-        # (N, 1) — vs the giant `input` we already keep alive).
+        # ─────────────────────────────────────────────────────────────────
+        # CTX TRADE-OFF: valid_mask + target_idx are CHEAP to recompute in
+        # backward (both derive from `target` + `ignore_index`):
+        #     valid_mask   = target != ignore_index             # 1 op
+        #     safe_target  = torch.where(valid_mask, target, 0) # 1 op
+        #     target_idx   = safe_target.unsqueeze(dim)         # 1 op (view)
+        # So an equally-valid implementation would save only `target` (+
+        # `ignore_index` on ctx) and rebuild these in backward — that's the
+        # canonical compute-over-memory choice.
+        # We pick the OTHER side: cache valid_mask + target_idx (bool (N,) +
+        # int64 (N, 1), few KB total) so backward skips 2 dispatches. Cheap
+        # vs the giant `input` (N×V floats) we're already keeping alive — the
+        # ctx-size delta is negligible, and the dispatch savings are free.
+        # ─────────────────────────────────────────────────────────────────
         ctx.save_for_backward(input, log_sum_exp, valid_mask, target_idx)
         ctx.dim = dim
         return per_sample
@@ -607,6 +617,9 @@ class CrossEntropy(torch.autograd.Function):
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> tuple[torch.Tensor, None, None, None]:
+        # valid_mask, target_idx are pulled from ctx (computed in forward).
+        # Could equivalently be rebuilt here from `target` + `ignore_index`;
+        # see the forward's CTX TRADE-OFF block for why we cache instead.
         input, log_sum_exp, valid_mask, target_idx = ctx.saved_tensors
         dim = ctx.dim
         # Recompute softmax = exp(input - LSE); stable since input - LSE <= 0.
