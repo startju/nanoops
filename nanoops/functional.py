@@ -210,7 +210,13 @@ class LookupSorted(torch.autograd.Function):
 
     ⚠ NOT USED BY DEFAULT — kept as an instructive counter-example. The
     textbook "atomic-add is slow on GPUs, sort first" rewrite turned out to
-    be a regression here on two axes; see "Why we don't use it" below.
+    be a regression on three separate axes (correctness in bf16, isolated
+    speed, end-to-end training speed). Opt in via `NANOOPS_LOOKUP_SORTED=1`
+    if you want to reproduce the comparison; the env-var-gated wrapper in
+    `embedding()` routes to a `torch.library.custom_op` variant below
+    (`_lookup_sorted_op`) which is the only form that survives
+    `torch.compile(model, dynamic=False)`. This bare autograd.Function is
+    kept for eager-mode parity tests and for reading the algorithm clearly.
 
     Algorithm (atomic-free segmented sum):
 
@@ -220,29 +226,72 @@ class LookupSorted(torch.autograd.Function):
         4. cumsum + boundary-diff gives the per-group sum (purely parallel)
         5. one dense write to grad_weight at the unique row positions
 
-    Why we don't use it (measured on RTX 3090, V=32768, D=1280, N=4096,
-    nanchat-like Zipf token distribution, max 15 duplicates per row):
+    ─────────────────────────────────────────────────────────────────────
+    Empirical findings (RTX 3090 ×2, nanchat d20, V=32768, D=1280):
+    ─────────────────────────────────────────────────────────────────────
 
-      ❌ Speed: at the realistic duplicate rate (max 15, mean 1.79),
-         atomicAdd is fast on Ampere/Hopper and LookupSorted is ~4× SLOWER
-         (1.84 ms vs 0.45 ms / iter for Lookup). The sort + permute +
-         (N, D) cumsum overhead dwarfs the contention Lookup pays.
+    Issue 1 — bf16 cumsum drift (fixed):
+      Cumsum over 4096 rows in bf16 (7-bit mantissa) accumulates >10%
+      relative error in `grad_weight`. cumsum[end] - cumsum[start] then
+      propagates the truncation into every group sum.
+      Fix: promote the accumulator to fp32 when input is bf16/fp16, cast
+      back at the end. Same trick PyTorch's internal embedding-backward
+      CUDA kernel uses. See the FP32 ACCUMULATOR comment in the impl.
 
-      ⚠ Numerical safety required a fix: cumsum in bf16 (input dtype) over
-         thousands of rows accumulates >10% relative error in 7-bit
-         mantissa. We promote the cumsum accumulator to fp32 (see code
-         comment in backward) and cast back at the end — same trick as
-         PyTorch's internal embedding-backward CUDA kernel. Without the
-         promotion this would silently train wrong grads in bf16.
+    Issue 2 — microbench slowdown:
+      At nanchat-realistic duplicate rates (Zipf, max 15 repeats, mean
+      1.79), LookupSorted is ~4× SLOWER than Lookup in isolation
+      (1.84 ms vs 0.45 ms / iter on 3090).
+      Root cause: sort + permute + (N, D) cumsum overhead exceeds the
+      atomicAdd contention Lookup pays. Ampere's hardware atomic-add is
+      cheap when collisions are few; "GPUs hate atomics" was Pascal-era
+      wisdom that no longer holds at low contention.
+
+    Issue 3 — torch.compile incompatibility (fixed via custom_op):
+      `unique_consecutive` returns a data-dependent output shape. nanchat
+      does `torch.compile(model, dynamic=False)`, so aot_autograd
+      fake-traces the backward and raises DynamicOutputShapeException at
+      compile time.
+      Workarounds that DIDN'T help:
+        - @torch._dynamo.disable on a helper: aot_autograd traces via fake
+          tensors, separate from Dynamo's symbolic tracing
+        - `capture_dynamic_output_shape_ops=True`: got past
+          unique_consecutive but immediately hit `if unique_rows.numel() > 1`
+          as a GuardOnDataDependentSymNode
+      The fix is `torch.library.custom_op` for BOTH forward AND backward
+      (see `_lookup_sorted_op` / `_lookup_sorted_bw_op` below). Registering
+      backward as its own custom_op + register_fake stub makes it a
+      dispatcher-level opaque node, so aot_autograd uses the shape stub and
+      never fake-traces into it. `register_autograd` alone is insufficient
+      because its callback is still a plain Python function aot_autograd
+      will wrap and trace.
+
+    Issue 4 — end-to-end slowdown survives the compile fix:
+      Once the compile-compat issue is fixed via custom_op, the slowdown
+      from Issue 2 still shows up in real training:
+        Case A (Lookup):              tok/s 28,790,  MFU 58.5%, dt 36.4s
+        Case B (LookupSorted custom): tok/s 27,694,  MFU 56.3%, dt 37.8s
+                                      → ~3.8% slower end-to-end
+      Microbench's 4× ratio is diluted because embedding backward is a
+      small fraction of total per-iter time, but the regression is
+      consistent and measurable.
 
     Where the textbook argument WOULD have held: very heavy duplicate
     counts (one row hit hundreds of times). Doesn't happen in LLM training
     where vocab is large and any single token has at most O(seq_len) hits.
 
-    Lesson: GPU "atomic-add is slow" intuition was true ~Pascal era;
-    Ampere/Hopper atomic-add throughput improved enough that the
-    crossover point moved a lot. Benchmark before assuming the
-    "more parallel" rewrite wins.
+    ─────────────────────────────────────────────────────────────────────
+    Lessons (educational, since this op exists for teaching, not speed):
+      1. GPU atomicAdd is fast on Ampere/Hopper at low collision rates;
+         Pascal-era "atomics are slow" intuition no longer applies broadly.
+         Benchmark before assuming the "more parallel" rewrite wins.
+      2. Mixed-precision reductions need fp32 accumulators or you silently
+         train wrong gradients. Always verify gradients in the target dtype.
+      3. Python autograd.Function backwards CAN be traced by aot_autograd
+         when the forward is inside `torch.compile`. `register_autograd` on
+         a custom_op is not enough on its own — wrap the backward as its
+         own custom_op + fake stub to make it truly opaque.
+    ─────────────────────────────────────────────────────────────────────
     """
 
     @staticmethod
@@ -322,6 +371,88 @@ def _lookup_sorted_backward_impl(
     return None, grad_weight
 
 
+# -----------------------------------------------------------------------------
+# torch.library.custom_op-registered version of LookupSorted.
+#
+# Why a second registration on top of LookupSorted (the autograd.Function):
+#   The autograd.Function path fails under nanchat's torch.compile(model,
+#   dynamic=False). aot_autograd fake-traces the user-defined backward and
+#   hits unique_consecutive / data-dependent guards (`u0 > 1`), crashing
+#   the compile. Even @torch._dynamo.disable on the helper didn't save it
+#   because aot_autograd's fake-tracing happens through a different code
+#   path than Dynamo's symbolic tracing.
+#
+#   torch.library.custom_op is the canonical escape: registers the forward
+#   into PyTorch's dispatcher as a first-class op (with register_fake giving
+#   aot_autograd the shape stub), and register_autograd installs the backward
+#   as an autograd-only Python callback. The compiled forward sees the op as
+#   opaque (looks up the fake stub for shapes), and the backward runs in
+#   eager outside the compiled graph — no fake-tracing into it.
+#
+# Only registered if torch.library.custom_op exists (PyTorch >= 2.4).
+try:
+    _HAS_CUSTOM_OP = hasattr(torch.library, "custom_op")
+except AttributeError:
+    _HAS_CUSTOM_OP = False
+
+if _HAS_CUSTOM_OP:
+
+    @torch.library.custom_op("nanoops::lookup_sorted", mutates_args=())
+    def _lookup_sorted_op(
+        indices: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward: identical to Lookup.forward (just weight[indices])."""
+        assert indices.ndim == 1
+        assert weight.ndim == 2
+        return weight[indices]
+
+    @_lookup_sorted_op.register_fake
+    def _lookup_sorted_op_meta(
+        indices: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Shape stub for aot_autograd: output is (N, D)."""
+        return weight.new_empty(indices.shape[0], weight.shape[-1])
+
+    # The BACKWARD is also registered as its own custom_op + fake stub.
+    # Without this, `register_autograd`'s backward callback is still a
+    # plain Python function — aot_autograd builds a wrapping
+    # `GeneratedBackwardFor_*` node and fake-traces it, hitting
+    # unique_consecutive's DynamicOutputShapeException all over again.
+    # Registering as a dispatcher op makes the backward a single opaque
+    # node (whose meta is `torch.empty_like(weight)`), so aot_autograd
+    # uses the fake stub and never looks inside.
+    @torch.library.custom_op("nanoops::lookup_sorted_bw", mutates_args=())
+    def _lookup_sorted_bw_op(
+        indices: torch.Tensor, weight: torch.Tensor, grad_output: torch.Tensor
+    ) -> torch.Tensor:
+        """Backward impl wrapped as a custom_op for aot_autograd opacity."""
+        _, grad_weight = _lookup_sorted_backward_impl(indices, weight, grad_output)
+        return grad_weight
+
+    @_lookup_sorted_bw_op.register_fake
+    def _lookup_sorted_bw_op_meta(
+        indices: torch.Tensor, weight: torch.Tensor, grad_output: torch.Tensor
+    ) -> torch.Tensor:
+        """Shape stub for the backward: grad_weight has weight's shape."""
+        return torch.empty_like(weight)
+
+    def _lookup_sorted_op_setup_context(ctx, inputs, output):
+        indices, weight = inputs
+        ctx.save_for_backward(indices, weight)
+
+    def _lookup_sorted_op_backward(ctx, grad_output):
+        indices, weight = ctx.saved_tensors
+        grad_weight = _lookup_sorted_bw_op(indices, weight, grad_output)
+        # custom_op autograd returns one grad per input (indices, weight).
+        # indices is int → non-differentiable → None.
+        return None, grad_weight
+
+    _lookup_sorted_op.register_autograd(
+        _lookup_sorted_op_backward,
+        setup_context=_lookup_sorted_op_setup_context,
+    )
+
+
 @_allow_in_graph
 def embedding(
     indices: torch.Tensor,
@@ -357,11 +488,25 @@ def embedding(
     indices_shape = indices.shape
     new_indices = indices.reshape(-1)
     # Default to `Lookup` (naive index_add_); set `NANOOPS_LOOKUP_SORTED=1`
-    # to swap to `LookupSorted` for A/B comparison. See LookupSorted's
-    # docstring for why sorted is NOT the default (bf16 cumsum accumulation
-    # error + slower on Ampere atomicAdd at realistic duplicate rates).
-    impl = LookupSorted if os.environ.get("NANOOPS_LOOKUP_SORTED") else Lookup
-    out = impl.apply(new_indices, weight)
+    # to swap to the sorted variant. See LookupSorted's docstring for why
+    # sorted is NOT the default (bf16 cumsum accumulation error + slower
+    # on Ampere atomicAdd at realistic duplicate rates).
+    #
+    # When opt-in, prefer the torch.library.custom_op registration
+    # (`_lookup_sorted_op`) over the bare autograd.Function (`LookupSorted`).
+    # The custom_op variant is compile-safe — its backward is opaque to
+    # aot_autograd via register_autograd, so nanchat's
+    # `torch.compile(model, dynamic=False)` no longer chokes on the
+    # data-dependent unique_consecutive / numel comparisons inside the
+    # backward. The autograd.Function variant is kept for the eager-mode
+    # parity tests (no torch.compile needed there).
+    if os.environ.get("NANOOPS_LOOKUP_SORTED"):
+        if _HAS_CUSTOM_OP:
+            out = _lookup_sorted_op(new_indices, weight)
+        else:
+            out = LookupSorted.apply(new_indices, weight)
+    else:
+        out = Lookup.apply(new_indices, weight)
     return out.reshape(*indices_shape, -1)
 
 
