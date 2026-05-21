@@ -501,14 +501,17 @@ def chunked_logsumexp(
     """
     chunks = input.split(chunk_size, dim)
     # Initialize running stats from the first chunk: no rebase needed yet.
+    # `.exp_()` (in-place) on the (chunks[0] - running_max) temporary saves
+    # one chunk-sized allocation — the temp has no other references, so
+    # writing exp directly into its storage is safe.
     running_max = chunks[0].amax(dim, keepdim=True)
-    running_sum = (chunks[0] - running_max).exp().sum(dim, keepdim=True)
+    running_sum = (chunks[0] - running_max).exp_().sum(dim, keepdim=True)
     # Fold in each remaining chunk: shift the basis to the new max, then add
     # the chunk's own exp-sum contribution computed in that same basis.
     for chunk in chunks[1:]:
         new_max = torch.maximum(running_max, chunk.amax(dim, keepdim=True))
-        rebase = (running_max - new_max).exp()                       # rescale old sum
-        chunk_sum = (chunk - new_max).exp().sum(dim, keepdim=True)   # this chunk's contribution
+        rebase = (running_max - new_max).exp()                        # rescale old sum
+        chunk_sum = (chunk - new_max).exp_().sum(dim, keepdim=True)   # same .exp_() trick
         running_sum = running_sum * rebase + chunk_sum
         running_max = new_max
     result = running_max + running_sum.log()
@@ -589,33 +592,32 @@ class CrossEntropy(torch.autograd.Function):
         # compute the per-sample loss as usual, then zero out those positions.
         valid_mask = target != ignore_index
         safe_target = torch.where(valid_mask, target, 0)
-        per_sample = (log_sum_exp - input.gather(dim, safe_target.unsqueeze(dim))).squeeze(dim)
+        target_idx = safe_target.unsqueeze(dim)
+        per_sample = (log_sum_exp - input.gather(dim, target_idx)).squeeze(dim)
         per_sample = per_sample * valid_mask  # 0 at ignored positions
-        # Save `input` (already alive — just a reference, no new allocation)
-        # and the tiny log_sum_exp; recompute softmax in backward.
-        ctx.save_for_backward(input, log_sum_exp, target)
+        # Cache valid_mask + target_idx so backward doesn't have to recompute
+        # them (both are cheap but it saves 2 dispatches per backward, and
+        # the extra ctx footprint is ~few KB — bool + int64 of shape (N,) /
+        # (N, 1) — vs the giant `input` we already keep alive).
+        ctx.save_for_backward(input, log_sum_exp, valid_mask, target_idx)
         ctx.dim = dim
-        ctx.ignore_index = ignore_index
         return per_sample
 
     @staticmethod
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> tuple[torch.Tensor, None, None, None]:
-        input, log_sum_exp, target = ctx.saved_tensors
+        input, log_sum_exp, valid_mask, target_idx = ctx.saved_tensors
         dim = ctx.dim
-        ignore_index = ctx.ignore_index
         # Recompute softmax = exp(input - LSE); stable since input - LSE <= 0.
         # `.exp_()` (in-place on the sub temp) keeps peak at 1x (..., V); using
         # `.exp()` would briefly hold sub_temp AND exp_result simultaneously
         # → 2x peak. Same one extra mul+exp we pay for the forward savings.
         grad_input = (input - log_sum_exp).exp_()  # = softmax(input)
         # softmax - one_hot(target): subtract 1 at the target column per row.
-        # For ignored positions we use safe_target=0 here (the row gets zeroed
-        # out by valid_mask below, so the spurious -1 at col 0 doesn't matter).
-        valid_mask = target != ignore_index
-        safe_target = torch.where(valid_mask, target, 0)
-        target_idx = safe_target.unsqueeze(dim)
+        # For ignored positions we used safe_target=0 in forward (the row
+        # gets zeroed out by valid_mask below, so the spurious -1 at col 0
+        # doesn't matter).
         grad_input.scatter_add_(
             dim,
             target_idx,
