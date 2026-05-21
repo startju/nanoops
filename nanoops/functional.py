@@ -262,7 +262,11 @@ class RMSNorm(torch.autograd.Function):
         # - rsqrt() is a single fused op (one CUDA instruction on NVIDIA HW)
         # - fp32 mul throughput is ~30x fp32 div on Ampere/Hopper
         # - more numerically stable in fp16/bf16
-        rsqrt = input.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+        #
+        # The `.add(eps).rsqrt()` tail uses in-place forms — once the (..., 1)
+        # mean tensor exists, the add and rsqrt steps have no other refs, so
+        # writing in-place skips two tiny allocations.
+        rsqrt = input.pow(2).mean(dim=-1, keepdim=True).add_(eps).rsqrt_()
         y = input * rsqrt
         ctx.save_for_backward(weight, rsqrt, y)
         output = y * weight if weight is not None else y
@@ -733,7 +737,13 @@ class Sigmoid(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> torch.Tensor:
         (y,) = ctx.saved_tensors
-        return grad_output * y * (1 - y)
+        # y * (1 - y) = y - y². Build it via two in-place ops on a fresh
+        # temp instead of `y * (1 - y)` (which is 2 allocs by itself: 1 for
+        # (1 - y), 1 for the product). One alloc + two in-place ops; then
+        # one final mul with grad_output.
+        buf = y * y                # alloc 1
+        buf.neg_().add_(y)          # in-place: buf = y - y² = y(1-y)
+        return grad_output * buf    # alloc 2
 
 
 @_allow_in_graph
@@ -764,7 +774,10 @@ class Tanh(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> torch.Tensor:
         (y,) = ctx.saved_tensors
-        return grad_output * (1 - y * y)
+        # 1 - y² built via in-place neg + add (saves 1 alloc vs `1 - y * y`).
+        buf = y * y                 # alloc 1
+        buf.neg_().add_(1)           # in-place: buf = 1 - y²
+        return grad_output * buf     # alloc 2
 
 
 @_allow_in_graph
