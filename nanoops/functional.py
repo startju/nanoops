@@ -56,12 +56,25 @@ class Mm(torch.autograd.Function):
 
 
 def unbroadcast(grad: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
-    # Sum out broadcasted dimensions to match target shape
-    while grad.ndim > len(target_shape):
-        grad = grad.sum(dim=0)
-    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, target_shape)):
-        if g_dim != t_dim:
-            grad = grad.sum(dim=i, keepdim=True)
+    # Sum out broadcasted dimensions to match target shape. Two phases:
+    #   (1) any extra leading dims (grad.ndim > len(target_shape)) get
+    #       summed away without keepdim.
+    #   (2) any size-1 target dim that got broadcast up gets summed with
+    #       keepdim=True.
+    # Both phases are batched into a SINGLE sum() call each (tuple of dims),
+    # so the total dispatch cost is at most 2 kernel launches regardless of
+    # how many dims need reducing. The original loop-form did one launch per
+    # dim — Add/Mul/Where backward called from every elementwise op in the
+    # graph, so the savings add up.
+    n_extra = grad.ndim - len(target_shape)
+    if n_extra > 0:
+        grad = grad.sum(dim=list(range(n_extra)))
+    # grad.ndim == len(target_shape) now.
+    keepdim_axes = [
+        i for i, (g, t) in enumerate(zip(grad.shape, target_shape)) if g != t
+    ]
+    if keepdim_axes:
+        grad = grad.sum(dim=keepdim_axes, keepdim=True)
     return grad
 
 
@@ -773,10 +786,17 @@ class ApplyRotaryEmb(torch.autograd.Function):
         assert x.ndim == 4, f"x must be 4D (B, T, n_head, head_dim), got {x.ndim}D"
         d = x.shape[-1] // 2
         x1, x2 = x[..., :d], x[..., d:]
-        y1 = x1 * cos + x2 * sin
-        y2 = -x1 * sin + x2 * cos
+        # Pre-allocate output and write each half via slice assignment.
+        # The original `torch.cat([y1, y2], dim=-1)` had to hold y1, y2, AND
+        # the cat output alive at the same time (peak ~2x input). Slicing
+        # into a pre-allocated buffer drops y1, y2 immediately after the
+        # copy, lowering peak to ~1.5x input. Called 40+ times per d20 iter
+        # (every Q and K of every layer), so the peak savings compound.
+        out = torch.empty_like(x)
+        out[..., :d] = x1 * cos + x2 * sin
+        out[..., d:] = -x1 * sin + x2 * cos
         ctx.save_for_backward(cos, sin)
-        return torch.cat([y1, y2], dim=-1)
+        return out
 
     @staticmethod
     def backward(
@@ -785,10 +805,11 @@ class ApplyRotaryEmb(torch.autograd.Function):
         cos, sin = ctx.saved_tensors
         d = grad_output.shape[-1] // 2
         g1, g2 = grad_output[..., :d], grad_output[..., d:]
-        # R(-θ): same forward formula with sin → -sin.
-        grad_x1 = g1 * cos - g2 * sin
-        grad_x2 = g1 * sin + g2 * cos
-        grad_x = torch.cat([grad_x1, grad_x2], dim=-1)
+        # Same pre-allocate + slice-assign trick as forward; R(-θ) means
+        # the formula is the forward with sin → -sin.
+        grad_x = torch.empty_like(grad_output)
+        grad_x[..., :d] = g1 * cos - g2 * sin
+        grad_x[..., d:] = g1 * sin + g2 * cos
         # cos and sin are precomputed constants, not differentiable.
         return grad_x, None, None
 
