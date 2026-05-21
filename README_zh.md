@@ -5,12 +5,15 @@
 本 fork 在 [karpathy/nanochat](https://github.com/karpathy/nanochat) 基础上，
 做两件相互关联的事：
 
-1. **`nanoops/` —— 通过手写算子学 PyTorch。**
-   nanchat 用到的每个 PyTorch 算子（`Mm` / `Linear` / `RMSNorm` /
-   `Softmax` / `CrossEntropy` / `ScaledDotProductAttention` /
-   `ApplyRotaryEmb` / 滑动窗口 attention …）都用自定义
-   `torch.autograd.Function` 重写过——显式 forward + backward、in-place
-   / 内存敏感实现，并在
+1. **`nanoops/` —— 补上 nanchat 教学链路里"PyTorch 算子内部"那一块缺失。**
+   nanchat 把整条 LLM 训练流水线（tokenizer → 训练循环 → eval → chat UI）
+   讲得很完整，但里面的 PyTorch 算子都是黑盒——`F.linear`、
+   `F.scaled_dot_product_attention`、`F.cross_entropy` 等等都是直接拿来用。
+   nanoops 把这些黑盒打开：nanchat 用到的每个 PyTorch 算子（`Mm` /
+   `Linear` / `RMSNorm` / `Softmax` / `CrossEntropy` /
+   `ScaledDotProductAttention` / `ApplyRotaryEmb` / 滑动窗口 attention …）
+   都用自定义 `torch.autograd.Function` 重写过——显式 forward + backward、
+   in-place / 内存敏感实现，并在
    [`nanoops/README_zh.md`](nanoops/README_zh.md) 的附录里附了完整
    数学推导（也有 [English 版](nanoops/README.md)）。从源码里能看到
    `softmax_backward` 怎么用 `addcmul_` 融合、ctx 取舍怎么算账、

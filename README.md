@@ -5,18 +5,23 @@
 This fork extends [karpathy/nanochat](https://github.com/karpathy/nanochat)
 with two intertwined goals:
 
-1. **`nanoops/` — teach PyTorch operators by reimplementing them from scratch.**
-   Every PyTorch op nanchat uses (`Mm`, `Linear`, `RMSNorm`, `Softmax`,
-   `CrossEntropy`, `ScaledDotProductAttention`, `ApplyRotaryEmb`, sliding-
-   window attention, ...) is rewritten as a custom `torch.autograd.Function`
+1. **`nanoops/` — fill in the part of nanchat's teaching story that
+   stops at PyTorch ops.** nanchat is excellent at showing the whole
+   LLM training pipeline (tokenizer → training loop → eval → chat UI)
+   end-to-end, but uses PyTorch's built-in ops as black boxes —
+   `F.linear`, `F.scaled_dot_product_attention`, `F.cross_entropy`, etc.
+   nanoops opens those boxes: every PyTorch op nanchat uses (`Mm`,
+   `Linear`, `RMSNorm`, `Softmax`, `CrossEntropy`,
+   `ScaledDotProductAttention`, `ApplyRotaryEmb`, sliding-window
+   attention, ...) is rewritten as a custom `torch.autograd.Function`
    with explicit forward + backward, an in-place / memory-aware
    implementation, and a math derivation in
    [`nanoops/README.md`](nanoops/README.md)'s appendix
    (also [bilingual 中文版](nanoops/README_zh.md)). Read the source to
-   see how `softmax_backward` via `addcmul_` fusion, ctx trade-offs, GQA
-   `repeat_interleave + unflatten/sum`, online softmax / chunked LSE, and
-   segmented-sum embedding backward actually look in code — not just on a
-   whiteboard.
+   see how `softmax_backward` via `addcmul_` fusion, ctx trade-offs,
+   GQA `repeat_interleave + unflatten/sum`, online softmax / chunked
+   LSE, and segmented-sum embedding backward actually look in code —
+   not just on a whiteboard.
 
 2. **Optimize nanchat training throughput on consumer GPUs (e.g. RTX 3090).**
    nanchat targets H100 with FA3; on 3090 the SDPA dispatcher falls back
