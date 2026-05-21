@@ -214,9 +214,24 @@ def _make_patched_F() -> object:
     return proxy
 
 
+_PATCHED = False  # set to True after _apply() runs; cleared by _restore()
+
+
 def _apply() -> dict[str, dict]:
     """Apply F-namespace + torch.X + module-func + method patches.
-    Returns originals dict for restore."""
+    Returns originals dict for restore.
+
+    Idempotence guard: refuses to re-patch if a previous _apply() hasn't
+    been _restore()'d. Without this guard, a second _apply() would
+    capture the ALREADY-patched class methods / module funcs as
+    "originals", and the restore path would put back patched versions
+    instead of the true originals.
+    """
+    global _PATCHED
+    if _PATCHED:
+        raise RuntimeError(
+            "nanoops.integration already patched; call _restore() before _apply() again"
+        )
     originals: dict[str, dict] = {"F": {}, "torch": {}, "module_func": {}, "method": {}}
     # F-namespace patch
     proxy = _make_patched_F()
@@ -242,7 +257,13 @@ def _apply() -> dict[str, dict]:
     # CausalSelfAttention.forward: wrap to allow activation checkpoint of the
     # full-attention (L) layers via NANOOPS_L_ATTN_CHECKPOINT=1. Always
     # installed; the env-var check inside picks the right path per layer.
+    # The _PATCHED guard above already ensures we're not double-patching;
+    # the `is None` check here is defense-in-depth in case someone bypasses
+    # _apply() to call lower-level methods.
     global _orig_attn_forward
+    assert _orig_attn_forward is None, (
+        "_orig_attn_forward already captured — call _restore() before _apply()"
+    )
     _orig_attn_forward = gpt_mod.CausalSelfAttention.forward
     originals["method"][("nanochat.gpt", "CausalSelfAttention", "forward")] = _orig_attn_forward
     gpt_mod.CausalSelfAttention.forward = _patched_l_attn_forward
@@ -257,6 +278,7 @@ def _apply() -> dict[str, dict]:
         fa_mod._sdpa_attention
     )
     fa_mod._sdpa_attention = _patched_sdpa_attention
+    _PATCHED = True  # global declared at top of _apply()
     return originals
 
 
@@ -270,6 +292,9 @@ def _restore(originals: dict[str, dict]) -> None:
     for (modname, cls_name, method_name), original in originals["method"].items():
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
+    global _PATCHED, _orig_attn_forward
+    _PATCHED = False
+    _orig_attn_forward = None
 
 
 def patch_nanchat() -> list[str]:

@@ -21,6 +21,15 @@ except AttributeError:  # PyTorch < 2.0
         return fn
 
 
+# Cache opt-in env vars at module load. The previous code did
+# `os.environ.get("NANOOPS_LOOKUP_SORTED")` inside `embedding()` on every
+# forward call — dict lookup is fast but it's still ~20 layers × 256
+# accum × N iter calls; doing it once at import is cleaner. The trade-off:
+# env-var changes AFTER `import nanoops.functional` no longer take effect.
+# nanchat sets env vars before any import, so this is fine in practice.
+_LOOKUP_SORTED = bool(os.environ.get("NANOOPS_LOOKUP_SORTED"))
+
+
 class Mm(torch.autograd.Function):
     """2D-only matrix multiply, mirroring `torch.mm` semantics.
 
@@ -513,7 +522,7 @@ def embedding(
     # data-dependent unique_consecutive / numel comparisons inside the
     # backward. The autograd.Function variant is kept for the eager-mode
     # parity tests (no torch.compile needed there).
-    if os.environ.get("NANOOPS_LOOKUP_SORTED"):
+    if _LOOKUP_SORTED:
         if _HAS_CUSTOM_OP:
             out = _lookup_sorted_op(new_indices, weight)
         else:
@@ -1621,7 +1630,12 @@ class SlidingWindowSDPA(torch.autograd.Function):
         ctx.chunk_info = chunk_info
         ctx.scale = scale_val
         ctx.G = G
-        ctx.window_size = W  # backward needs W to reconstruct the mask
+        # Explicit int() cast — W came from the (non-tensor) window_size arg
+        # which could be int / numpy int / 0-D tensor depending on caller.
+        # Backward's mask helper uses W in arithmetic on torch.arange tensors;
+        # forcing Python int avoids ambiguity (no implicit promotion to a
+        # 0-D CUDA tensor inside the arithmetic).
+        ctx.window_size = int(W)
         return output
 
     @staticmethod
