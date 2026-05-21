@@ -7,6 +7,19 @@ import math
 import torch
 
 
+# Mark every public wrapper as `allow_in_graph` so torch.compile (Dynamo)
+# treats each call as an opaque node instead of graph-breaking when it
+# can't trace through our Python autograd.Function. Doesn't enable fusion
+# into the surrounding compiled region (the node stays a black box), but
+# eliminates the cache-invalidation / recompile cost of a graph break and
+# lets PyTorch ops on either side keep compiling normally.
+try:
+    _allow_in_graph = torch.compiler.allow_in_graph
+except AttributeError:  # PyTorch < 2.0
+    def _allow_in_graph(fn):
+        return fn
+
+
 class Mm(torch.autograd.Function):
     """2D-only matrix multiply, mirroring `torch.mm` semantics.
 
@@ -110,11 +123,13 @@ class Mul(torch.autograd.Function):
         return grad_left, grad_right
 
 
+@_allow_in_graph
 def mul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Mirrors `torch.mul` / the `*` operator (elementwise with broadcasting)."""
     return Mul.apply(left, right)
 
 
+@_allow_in_graph
 def linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -176,6 +191,7 @@ class Lookup(torch.autograd.Function):
         return None, grad_weight
 
 
+@_allow_in_graph
 def embedding(
     indices: torch.Tensor,
     weight: torch.Tensor,
@@ -256,6 +272,7 @@ class RMSNorm(torch.autograd.Function):
         return grad_input, grad_weight, None
 
 
+@_allow_in_graph
 def rms_norm(
     input: torch.Tensor,
     normalized_shape: tuple[int, ...],
@@ -272,6 +289,7 @@ def rms_norm(
     out_flat = RMSNorm.apply(input_flat, weight, eps)
     return out_flat.reshape(input_shape)
 
+@_allow_in_graph
 def outer(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Mirrors `torch.outer`. Both inputs must be 1D.
 
@@ -320,6 +338,7 @@ class Cat(torch.autograd.Function):
         return (None, *grads)  # None for dim (int, non-differentiable)
 
 
+@_allow_in_graph
 def cat(
     tensors: list[torch.Tensor] | tuple[torch.Tensor, ...],
     dim: int = 0,
@@ -328,6 +347,7 @@ def cat(
     return Cat.apply(dim, *tensors)
 
 
+@_allow_in_graph
 def stack(
     tensors: list[torch.Tensor] | tuple[torch.Tensor, ...],
     dim: int = 0,
@@ -373,6 +393,7 @@ class ReluSquare(torch.autograd.Function):
         return grad_output * 2 * y  # = 2 * relu(x) * g; mask absorbed into y
 
 
+@_allow_in_graph
 def relu_square(input: torch.Tensor) -> torch.Tensor:
     """Fused relu(x)**2 — nanchat's MLP activation."""
     return ReluSquare.apply(input)
@@ -405,6 +426,7 @@ class Softmax(torch.autograd.Function):
         return grad_input, None  # None for dim (int, non-differentiable)
 
 
+@_allow_in_graph
 def softmax(
     input: torch.Tensor,
     dim: int = -1,
@@ -590,6 +612,7 @@ class CrossEntropy(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+@_allow_in_graph
 def cross_entropy(
     input: torch.Tensor,
     target: torch.Tensor,
@@ -677,6 +700,7 @@ class Sigmoid(torch.autograd.Function):
         return grad_output * y * (1 - y)
 
 
+@_allow_in_graph
 def sigmoid(input: torch.Tensor) -> torch.Tensor:
     """Mirrors `torch.sigmoid`."""
     return Sigmoid.apply(input)
@@ -707,6 +731,7 @@ class Tanh(torch.autograd.Function):
         return grad_output * (1 - y * y)
 
 
+@_allow_in_graph
 def tanh(input: torch.Tensor) -> torch.Tensor:
     """Mirrors `torch.tanh`."""
     return Tanh.apply(input)
@@ -768,6 +793,7 @@ class ApplyRotaryEmb(torch.autograd.Function):
         return grad_x, None, None
 
 
+@_allow_in_graph
 def apply_rotary_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
@@ -811,6 +837,7 @@ class Where(torch.autograd.Function):
         return None, grad_a, grad_b  # condition is bool, non-differentiable
 
 
+@_allow_in_graph
 def where(
     condition: torch.Tensor, a: torch.Tensor, b: torch.Tensor
 ) -> torch.Tensor:
@@ -852,6 +879,7 @@ class Roll(torch.autograd.Function):
         return torch.roll(grad_output, neg_shifts, ctx.dims), None, None
 
 
+@_allow_in_graph
 def roll(input: torch.Tensor, shifts, dims=None) -> torch.Tensor:
     """Mirrors `torch.roll`. shifts: int or tuple; dims: int, tuple, or None."""
     return Roll.apply(input, shifts, dims)
@@ -1009,6 +1037,7 @@ class ScaledDotProductAttention(torch.autograd.Function):
         return grad_query, grad_key, grad_value, None, None, None, None
 
 
+@_allow_in_graph
 def scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
