@@ -261,50 +261,65 @@ class LookupSorted(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> tuple[None, torch.Tensor]:
         indices, weight = ctx.saved_tensors
-        grad_weight = torch.zeros_like(weight)
-        N = indices.shape[0]
-        if N == 0:
-            return None, grad_weight
+        # Delegate to a Dynamo-disabled helper. unique_consecutive returns
+        # a data-dependent output shape, which torch.compile(dynamic=False)
+        # (the mode nanchat uses) refuses to trace — it raises
+        # DynamicOutputShapeException at compile time. Pulling the body out
+        # of LookupSorted.backward (which aot_autograd CAN see when the
+        # forward is inside a compiled region) into a @torch._dynamo.disable
+        # function makes the whole backward opaque to Dynamo, so it runs
+        # eagerly and unique_consecutive works as expected.
+        return _lookup_sorted_backward_impl(indices, weight, grad_output)
 
-        # 1. Sort indices to co-locate duplicates.
-        sorted_indices, perm = indices.sort()
-        # 2. Permute grad rows so each group of identical targets is contiguous.
-        sorted_grads = grad_output[perm]
-        # 3. Group structure: which row each group targets, and how many
-        #    sorted entries fall into each group.
-        unique_rows, counts = sorted_indices.unique_consecutive(return_counts=True)
 
-        # 4. Per-group sum via cumsum + boundary diff (no atomics):
-        #    cumsum[k] = sum of sorted_grads[:k+1]
-        #    group i ends at index group_ends[i] (last entry of group i in
-        #    sorted order). Then:
-        #      group_sum[i] = cumsum[group_ends[i]] - cumsum[group_ends[i-1]]
-        #    (group_sum[0] is just cumsum[group_ends[0]]; no prior group.)
-        #
-        # FP32 ACCUMULATOR (only for low-precision inputs): bf16/fp16 cumsum
-        # over thousands of rows accumulates >10% relative error because
-        # each partial sum gets truncated to 7/10 mantissa bits and the
-        # `cumsum[end] - cumsum[start]` subtraction propagates that error
-        # into every group sum. Promote to fp32 in those cases; for fp32/
-        # fp64 inputs, run in input dtype to avoid the opposite problem
-        # (downgrading fp64 → fp32 would introduce its own error). Same
-        # trick as PyTorch's internal embedding-backward kernel.
-        cumsum_dtype = (
-            torch.float32
-            if sorted_grads.dtype in (torch.bfloat16, torch.float16)
-            else sorted_grads.dtype
-        )
-        cumsum = sorted_grads.cumsum(0, dtype=cumsum_dtype)
-        group_ends = counts.cumsum(0).sub_(1)              # last index per group
-        group_sums = cumsum.index_select(0, group_ends)    # alloc (G, D)
-        if unique_rows.numel() > 1:
-            group_sums[1:].sub_(cumsum.index_select(0, group_ends[:-1]))
-
-        # 5. Dense write — each unique_rows[i] is unique, so this is a
-        #    contention-free scatter (one row touched at most once). Cast
-        #    only happens when we promoted above; otherwise it's a no-op.
-        grad_weight[unique_rows] = group_sums.to(grad_weight.dtype)
+@torch._dynamo.disable
+def _lookup_sorted_backward_impl(
+    indices: torch.Tensor, weight: torch.Tensor, grad_output: torch.Tensor
+) -> tuple[None, torch.Tensor]:
+    grad_weight = torch.zeros_like(weight)
+    N = indices.shape[0]
+    if N == 0:
         return None, grad_weight
+
+    # 1. Sort indices to co-locate duplicates.
+    sorted_indices, perm = indices.sort()
+    # 2. Permute grad rows so each group of identical targets is contiguous.
+    sorted_grads = grad_output[perm]
+    # 3. Group structure: which row each group targets, and how many
+    #    sorted entries fall into each group.
+    unique_rows, counts = sorted_indices.unique_consecutive(return_counts=True)
+
+    # 4. Per-group sum via cumsum + boundary diff (no atomics):
+    #    cumsum[k] = sum of sorted_grads[:k+1]
+    #    group i ends at index group_ends[i] (last entry of group i in
+    #    sorted order). Then:
+    #      group_sum[i] = cumsum[group_ends[i]] - cumsum[group_ends[i-1]]
+    #    (group_sum[0] is just cumsum[group_ends[0]]; no prior group.)
+    #
+    # FP32 ACCUMULATOR (only for low-precision inputs): bf16/fp16 cumsum
+    # over thousands of rows accumulates >10% relative error because
+    # each partial sum gets truncated to 7/10 mantissa bits and the
+    # `cumsum[end] - cumsum[start]` subtraction propagates that error
+    # into every group sum. Promote to fp32 in those cases; for fp32/
+    # fp64 inputs, run in input dtype to avoid the opposite problem
+    # (downgrading fp64 → fp32 would introduce its own error). Same
+    # trick as PyTorch's internal embedding-backward kernel.
+    cumsum_dtype = (
+        torch.float32
+        if sorted_grads.dtype in (torch.bfloat16, torch.float16)
+        else sorted_grads.dtype
+    )
+    cumsum = sorted_grads.cumsum(0, dtype=cumsum_dtype)
+    group_ends = counts.cumsum(0).sub_(1)              # last index per group
+    group_sums = cumsum.index_select(0, group_ends)    # alloc (G, D)
+    if unique_rows.numel() > 1:
+        group_sums[1:].sub_(cumsum.index_select(0, group_ends[:-1]))
+
+    # 5. Dense write — each unique_rows[i] is unique, so this is a
+    #    contention-free scatter (one row touched at most once). Cast
+    #    only happens when we promoted above; otherwise it's a no-op.
+    grad_weight[unique_rows] = group_sums.to(grad_weight.dtype)
+    return None, grad_weight
 
 
 @_allow_in_graph
