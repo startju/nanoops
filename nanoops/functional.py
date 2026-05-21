@@ -1449,23 +1449,36 @@ class SlidingWindowSDPA(torch.autograd.Function):
     matrix memory across 20 layers.
 
     End-to-end training A/B (20-iter d20 base_train, 2× RTX 3090):
-                                  default SDPA           SlidingWindowSDPA
-        Steady tok/sec            28,800                 30,594   (+6.2%)
-        Steady MFU                58.5%                  62.18%   (+3.7pp)
-        Steady dt/iter            36.4s                  34.27s   (-5.9%)
-        Peak memory               19,665 MiB             17,612 MiB (-10.4%)
-        Total time (20 iters)     5.46 min               5.14 min  (-5.9%)
-        Loss @ step 19            6.906019               6.905961 (6e-5, bf16 noise)
-        Warmup (step 0)           ~140s                  ~200s    (heavier compile)
 
-    Why the end-to-end win is so much bigger than isolated:
+      Config                              tok/sec  MFU    dt    Peak     Total
+      ──────────────────────────────────  ──────── ─────  ────  ──────── ──────
+      PyTorch SDPA, B=2 (baseline)         22,725  46.2%  46.1s 16,464   n/a
+      nanoops Lookup default, B=2          28,800  58.5%  36.4s 19,665   5.46m
+      + SlidingWindowSDPA, B=2             30,594  62.2%  34.3s 17,612   5.14m
+      + SlidingWindowSDPA + B=4 + exp_seg  32,678  66.4%  32.1s 22,722   4.81m
+                                          ──────── ─────                ──────
+                                          +43.8% vs baseline       -30% dt
+
+    The B=4 row needs both SlidingWindowSDPA (cuts the P-matrix peak so
+    B=4 doesn't immediately OOM) AND `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+    (recovers 1-2 GiB of allocator fragmentation that otherwise pushes
+    the run past the 24 GiB ceiling). Either one alone leaves the run
+    OOM at the first training iter. With both, peak settles at
+    ~22.7/24 GiB — tight but stable. nanoops/train.sh sets both by default.
+
+    Loss curves match across all rows to within ~6e-5 bf16 rounding noise.
+
+    Why the end-to-end win is so much bigger than the 1.09× isolated
+    microbench would predict:
       1. P matrix shrinks (L, L) → (L, 2W) per sliding layer. 15 sliding
          layers × ~167 MB saved per layer ≈ 2.5 GB peak savings (2 GB
          observed after subtracting chunked ctx overhead).
       2. Less HBM bandwidth pressure (smaller P → fewer attention reads).
-      3. Allocator no longer hugging the 24 GB ceiling — less
+      3. Headroom freed up by the P-matrix cut UNLOCKS B=4 entirely — and
+         B=4 alone is +6.8% tok/sec on top of the sliding savings because
+         GEMMs hit better utilization at the larger batch.
+      4. Allocator no longer hugging the 24 GB ceiling — less
          fragmentation, fewer cache-miss alloc paths.
-      4. Better L2 cache behavior with smaller per-layer P working sets.
 
     Warmup is ~60s longer because torch.compile must compile the chunked
     forward+backward path (one autograd.Function with 4 chunks unrolled
