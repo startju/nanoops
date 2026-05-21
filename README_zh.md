@@ -28,12 +28,18 @@
 
 ### 实际效果
 
-**nanchat 的更大配置现在能在 2× RTX 3090 上跑起来。** 全套优化叠加
-（SlidingWindowSDPA + MLP activation checkpoint + expandable_segments
-allocator）总共比 PyTorch baseline 路径省下 ~9 GiB 的 peak 显存。多出来
-的余量正好让 `--depth=24`——nanchat leaderboard 级别的配置，~1.5 B 参数，
-auto-config 加宽到 `n_embd=1536`——能在 24 GiB 卡上**真的装下**。同一个
-配置没有这套优化时**每个 batch size 都会 OOM**。
+**`--depth=24` 是 nanchat 的参考模型尺寸——3090 这种消费级显卡（RTX
+3090 / 4090 等 24 GiB 级别的卡）原本根本跑不起来。** 用 nanchat 原生代码
+在 24 GiB 卡上训 d24，**任何 batch size 都 OOM**：1.5 B 参数 auto-config
+加宽到 `n_embd=1536` × 24 层 + AdamW state + bf16 gradients + 每个 sliding
+layer 的完整 `(L, L)` attention 概率矩阵——加起来就是装不下。nanchat 的
+参考硬件是 8× H100 节点——**对在家学习或预算有限的人来说远超能力**。
+
+本 fork 的全套优化（SlidingWindowSDPA 把 chunked attention 砍到带状、
+不存完整 P + MLP activation checkpoint + `expandable_segments` allocator）
+总共比 PyTorch baseline 路径省下 **~9 GiB 的 peak 显存**，让 d24 终于能
+在同一张消费级显卡上以 `--device-batch-size=1` **真的装下并跑起来**。
+**这个项目的意义就是把 nanchat 的默认训练拉进初学者硬件预算的范围**。
 
 | 配置             | nanchat 原生 | nanoops 整套在 2× RTX 3090 上    |
 | ---------------- | ------------ | -------------------------------- |

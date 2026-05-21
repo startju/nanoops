@@ -28,13 +28,21 @@ with two intertwined goals:
 
 ### What this means in practice
 
-**Nanchat's bigger configurations now fit on 2× RTX 3090.** The full
-optimization stack (SlidingWindowSDPA + MLP activation checkpoint +
-expandable_segments allocator) frees ~9 GiB of peak GPU memory vs the
-PyTorch baseline path. That headroom is what lets `--depth=24` — a
-nanchat leaderboard-grade configuration with ~1.5 B parameters, auto-
-widened to `n_embd=1536` — actually fit on 24 GiB cards. Without these
-optimizations the same config OOMs at every batch size.
+**`--depth=24` is nanchat's reference model size — and consumer-grade
+GPUs (RTX 3090 / 4090 / etc., 24 GiB class) cannot normally run it.**
+With nanchat's stock code, attempting to train d24 on a 24 GiB card
+OOMs at every batch size: 1.5 B parameters auto-widened to
+`n_embd=1536` × 24 layers + AdamW state + bf16 gradients + the full
+`(L, L)` attention probability matrix per sliding layer simply doesn't
+fit. The reference hardware is an 8× H100 node — well out of reach for
+anyone learning at home or on a small budget.
+
+This fork's full optimization stack — SlidingWindowSDPA (chunked
+attention keeps the band only, no full P) + MLP activation checkpoint
++ the `expandable_segments` allocator — frees ~9 GiB of peak GPU
+memory and lets d24 actually fit at `--device-batch-size=1` on those
+same consumer cards. **The point is to put nanchat's default training
+within reach of a beginner's hardware budget.**
 
 | Config            | nanchat default | nanoops stack on 2× RTX 3090     |
 | ----------------- | --------------- | -------------------------------- |
