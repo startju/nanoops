@@ -666,21 +666,27 @@ triangular) and `attn_mask` (bool → $\{0, -\infty\}$, or float → as-is)
 collapse into this same additive form before softmax. Wherever $M_{ij} = -\infty$,
 the corresponding $P_{ij} = e^{-\infty} / Z = 0$ exactly.
 
-**Why additive and not multiplicative?** The natural multiplicative analog
-of "absorb to zero after softmax" is $M \in \{-\infty, 1\}$ on $S$ — but
-that breaks because $S_{ij}$ is signed:
+**Why additive and not multiplicative?** The cleanest multiplicative form
+that actually gets the right numerics is **sign-conditional**: at masked
+positions, pick $M_{ij} = -\text{sign}(S_{ij}) \cdot \infty$ so $S_{ij} \cdot
+M_{ij} = -\infty$ regardless of which side of zero $S_{ij}$ lands on. (A
+naive uniform $M \in \{-\infty, 1\}$ fails immediately: $S_{ij} \cdot
+(-\infty)$ is $-\infty$ only when $S_{ij} > 0$, becomes $+\infty$ when
+$S_{ij} < 0$, and NaN when $S_{ij} = 0$. Since attention scores are
+unrestricted reals, this blows up most rows.)
 
-| Variant | Formula | masked $P_{ij}$ |
-|---|---|---|
-| Additive (used) | $\text{softmax}(S + M),\; M \in \{0, -\infty\}$ | $e^{-\infty}/Z = 0$ ✓ for any $S_{ij} \in \mathbb{R}$ |
-| Multiplicative on $S$ | $\text{softmax}(S \odot M),\; M \in \{-\infty, 1\}$ | $S_{ij} \cdot (-\infty)$ = $-\infty$ if $S_{ij} > 0$, $+\infty$ if $S_{ij} < 0$, **NaN** if $S_{ij} = 0$ |
+The sign-conditional version *does* recover the same masked $P_{ij} = 0$.
+But it's strictly worse than additive on every axis:
 
-Attention scores $S = QK^T / \sqrt{d_k}$ are unrestricted reals — they're
-routinely negative and pass through zero. So the multiplicative-on-$S$
-variant blows up the row whenever $S_{ij} \le 0$ at a masked position
-(either +∞ wins the softmax and steals all probability, or NaN poisons
-the entire batch). The additive form has no such sign dependency: $-\infty$
-is the absorbing element for $\max$ / softmax for **any** $S_{ij}$.
+- **$S_{ij} = 0$ has no valid $M$**: $0 \times \infty = \text{NaN}$ regardless of sign. Needs a separate special case (or an epsilon hack); the additive form doesn't.
+- **$M$ loses input independence**: the mask now has to read $S$ to be built, so it's no longer a pre-computed input tensor — extra dependency in the forward pipeline.
+- **More FLOPs per element**: additive is one `+`; sign-conditional is `sign` + `where` + `*`. On $L \times L$ attention scores that's not free.
+- **Backward gets a phantom $M(S, \text{mask})$ path** unless you wrap $M$ in `stop_grad`, at which point you're hiding what's really an additive mask under a multiplicative façade.
+- **No algebraic story**: doesn't connect to log-sum-exp / cross-entropy fusion / FlashAttention LSE.
+
+**Additive is canonical because it's the operation softmax was built to
+compose with.** $-\infty$ is the absorbing element for $\max$ / softmax for
+*any* $S_{ij}$ — no sign branch, no $S=0$ corner case.
 
 Three properties fall out of the additive choice:
 
