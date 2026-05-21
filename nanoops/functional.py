@@ -189,7 +189,15 @@ class Lookup(torch.autograd.Function):
         assert indices.ndim == 1, f"indices must be 1D, got {indices.ndim}D"
         # (E,D)
         assert weight.ndim == 2, f"weight must be 2D, got {weight.ndim}D"
-        ctx.save_for_backward(indices, weight)
+        # Backward only needs weight's shape + dtype + device, not its data.
+        # Saving a fresh empty-shape buffer instead of the (V, D) weight
+        # decouples ctx lifetime from the embedding parameter. In practice
+        # the weight is alive anyway (it's a model param), so peak memory is
+        # unchanged — this is just hygiene.
+        ctx.save_for_backward(indices)
+        ctx.weight_shape = weight.shape
+        ctx.weight_dtype = weight.dtype
+        ctx.weight_device = weight.device
         # (N, D)
         return weight[indices]
 
@@ -197,8 +205,13 @@ class Lookup(torch.autograd.Function):
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> tuple[None, torch.Tensor]:
-        indices, weight = ctx.saved_tensors
-        grad_weight = torch.zeros_like(weight)
+        (indices,) = ctx.saved_tensors
+        N = indices.shape[0]
+        grad_weight = torch.zeros(
+            ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device,
+        )
+        if N == 0:
+            return None, grad_weight  # nothing to scatter, mirror LookupSorted
         #  for i in range(N):
         #      grad_weight[indices[i]] += grad_output[i]
         grad_weight.index_add_(0, indices, grad_output)
@@ -526,14 +539,19 @@ class RMSNorm(torch.autograd.Function):
             assert input.shape[-1] == weight.shape[0], (
                 f"last dim of input ({input.shape[-1]}) must match weight shape ({weight.shape[0]})"
             )
-        # Use rsqrt + multiply instead of sqrt + divide:
-        # - rsqrt() is a single fused op (one CUDA instruction on NVIDIA HW)
+        # Use rsqrt + multiply instead of sqrt + divide — throughput, not
+        # precision: rsqrt + mul and sqrt + div are numerically equivalent
+        # for finite positive inputs (rsqrt is exp(-0.5*log(x)) internally
+        # vs sqrt's exp(0.5*log(x))). The win:
+        # - rsqrt() is one CUDA instruction (SFU-issued, ~throughput parity
+        #   with mul)
         # - fp32 mul throughput is ~30x fp32 div on Ampere/Hopper
-        # - more numerically stable in fp16/bf16
+        # So `mean.add_(eps).rsqrt_()` + `input * rsqrt` is ~2 fast ops
+        # vs `sqrt(mean + eps)` + `input / sqrt_val` = 1 fast + 1 slow.
         #
-        # The `.add(eps).rsqrt()` tail uses in-place forms — once the (..., 1)
-        # mean tensor exists, the add and rsqrt steps have no other refs, so
-        # writing in-place skips two tiny allocations.
+        # The `.add_(eps).rsqrt_()` tail uses in-place forms — once the
+        # (..., 1) mean tensor exists, the add and rsqrt steps have no
+        # other refs, so writing in-place skips two tiny allocations.
         rsqrt = input.pow(2).mean(dim=-1, keepdim=True).add_(eps).rsqrt_()
         y = input * rsqrt
         ctx.save_for_backward(weight, rsqrt, y)
@@ -901,7 +919,12 @@ class CrossEntropy(torch.autograd.Function):
         # vs the giant `input` (N×V floats) we're already keeping alive — the
         # ctx-size delta is negligible, and the dispatch savings are free.
         # ─────────────────────────────────────────────────────────────────
-        ctx.save_for_backward(input, log_sum_exp, valid_mask, target_idx)
+        # Cache the -1 column vector once at forward — backward's scatter_add
+        # always needs `full_like(target_idx, -1.0)`, and rebuilding it every
+        # call is a fresh (N, 1) alloc per CE.backward. Tiny in absolute
+        # terms (~N int64) but at zero extra ctx cost.
+        neg_one_col = torch.full_like(target_idx, -1.0, dtype=input.dtype)
+        ctx.save_for_backward(input, log_sum_exp, valid_mask, target_idx, neg_one_col)
         ctx.dim = dim
         return per_sample
 
@@ -912,7 +935,7 @@ class CrossEntropy(torch.autograd.Function):
         # valid_mask, target_idx are pulled from ctx (computed in forward).
         # Could equivalently be rebuilt here from `target` + `ignore_index`;
         # see the forward's CTX TRADE-OFF block for why we cache instead.
-        input, log_sum_exp, valid_mask, target_idx = ctx.saved_tensors
+        input, log_sum_exp, valid_mask, target_idx, neg_one_col = ctx.saved_tensors
         dim = ctx.dim
         # Recompute softmax = exp(input - LSE); stable since input - LSE <= 0.
         # `.exp_()` (in-place on the sub temp) keeps peak at 1x (..., V); using
@@ -922,12 +945,8 @@ class CrossEntropy(torch.autograd.Function):
         # softmax - one_hot(target): subtract 1 at the target column per row.
         # For ignored positions we used safe_target=0 in forward (the row
         # gets zeroed out by valid_mask below, so the spurious -1 at col 0
-        # doesn't matter).
-        grad_input.scatter_add_(
-            dim,
-            target_idx,
-            torch.full_like(target_idx, -1.0, dtype=grad_input.dtype),
-        )
+        # doesn't matter). neg_one_col was pre-built in forward.
+        grad_input.scatter_add_(dim, target_idx, neg_one_col)
         # Scale by upstream grad_output AND zero out ignored rows in one step.
         # Use `*=` (in-place) — `a * b` would create a *new* (B*T, V) tensor,
         # briefly doubling backward peak to 2x the softmax size before the old
@@ -1587,6 +1606,14 @@ class SlidingWindowSDPA(torch.autograd.Function):
             key_e, value_e = key, value
 
         grad_query = torch.empty_like(query)
+        # K and V gradient buffers are zero-init because consecutive chunks
+        # have OVERLAPPING key ranges — their dK/dV contributions get
+        # accumulated via `+=` below. NOTE: in bf16 this accumulation is
+        # NOT bitwise-reproducible across runs: each chunk's contribution
+        # is added in chunk order, and bf16 add is non-associative. parity
+        # tests on this op observed ~1e-2 max diff in k.grad/v.grad vs the
+        # one-big-matmul reference — that's within bf16 rounding noise but
+        # don't bit-compare across implementations.
         grad_key_e = torch.zeros_like(key_e)
         grad_value_e = torch.zeros_like(value_e)
 

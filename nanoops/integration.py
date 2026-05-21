@@ -164,7 +164,12 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
 
     # Sliding window during training (Tq == Tk, finite window) — chunked path.
     if Tq == Tk and window >= 0 and window < Tq:
-        # window is "left tokens we include" (window+1 keys total per query).
+        # Convention translation between nanchat and nanoops sliding window:
+        #   nanchat: window = max distance back (FA3-style "left" arg, 0..window
+        #            inclusive → window+1 distinct allowed key offsets incl. self)
+        #   nanoops: W      = TOTAL number of keys each query attends to
+        # So nanoops_W = nanchat_window + 1. See nanchat/flash_attention.py:85
+        # ("window is 'left' tokens we need to include (window + 1) keys total").
         return nF.sliding_window_sdpa(q, k, v, window + 1, enable_gqa=enable_gqa)
 
     # Cached generation with chunk inference (Tq != Tk) — build explicit mask
