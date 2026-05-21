@@ -1,4 +1,71 @@
-# nanochat
+# nanoops — a teaching fork of nanochat
+
+> 中文版：[README_zh.md](README_zh.md)
+
+This fork extends [karpathy/nanochat](https://github.com/karpathy/nanochat)
+with two intertwined goals:
+
+1. **`nanoops/` — teach PyTorch operators by reimplementing them from scratch.**
+   Every PyTorch op nanchat uses (`Mm`, `Linear`, `RMSNorm`, `Softmax`,
+   `CrossEntropy`, `ScaledDotProductAttention`, `ApplyRotaryEmb`, sliding-
+   window attention, ...) is rewritten as a custom `torch.autograd.Function`
+   with explicit forward + backward, an in-place / memory-aware
+   implementation, and a math derivation in
+   [`nanoops/README.md`](nanoops/README.md)'s appendix
+   (also [bilingual 中文版](nanoops/README_zh.md)). Read the source to
+   see how `softmax_backward` via `addcmul_` fusion, ctx trade-offs, GQA
+   `repeat_interleave + unflatten/sum`, online softmax / chunked LSE, and
+   segmented-sum embedding backward actually look in code — not just on a
+   whiteboard.
+
+2. **Optimize nanchat training throughput on consumer GPUs (e.g. RTX 3090).**
+   nanchat targets H100 with FA3; on 3090 the SDPA dispatcher falls back
+   to a slow path on sliding-window attention. nanoops's hand-written ops
+   sidestep this, and a Python-level `SlidingWindowSDPA` that chunks the
+   per-layer attention band cuts both compute and peak P-matrix memory by
+   ~4×. Stacking these lets the d20 base-train step fit at
+   `--device-batch-size=4` on 24 GiB cards instead of OOMing.
+
+### Measured speedup on 2× RTX 3090, d20 base_train
+
+| Config                                | tok/sec    | MFU       | Peak GPU mem | vs baseline |
+| ------------------------------------- | ---------- | --------- | ------------ | ----------- |
+| PyTorch SDPA, B=2 (baseline)          | 22,725     | 46.2%     | 16.5 GiB     | —           |
+| nanoops Lookup default, B=2           | 28,800     | 58.5%     | 19.7 GiB     | +27%        |
+| + SlidingWindowSDPA, B=2              | 30,594     | 62.2%     | 17.6 GiB     | +35%        |
+| **+ B=4 + expandable_segments**       | **32,678** | **66.4%** | **22.7 GiB** | **+44%**    |
+
+Loss curves match across all four rows to within bf16 rounding noise.
+Full A/B autopsy lives in the
+[`SlidingWindowSDPA` docstring](nanoops/functional.py).
+
+### Try it
+
+```bash
+# Drop-in replacement for speedrun.sh's base_train step,
+# with the nanoops integration + sliding-window SDPA + expandable_segments
+# allocator turned on by default.
+bash nanoops/train.sh
+
+# Active env vars (set automatically by train.sh):
+#   NANOOPS=1                                       activates the integration
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   recovers fragmentation
+#
+# A/B opt-outs:
+#   NANOOPS_NO_SLIDING_WINDOW=1   revert sliding layers to the naive SDPA path
+#   NANOOPS_LOOKUP_SORTED=1       try the segmented-sum embedding backward
+```
+
+See [`nanoops/README.md`](nanoops/README.md) for the op-by-op TODO list +
+math derivations, and [`nanoops/integration.py`](nanoops/integration.py)
+for how the swap-in monkey-patches plug into nanchat without touching
+the upstream model code.
+
+The rest of this README is the unchanged upstream nanchat documentation.
+
+---
+
+# nanochat (upstream)
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
