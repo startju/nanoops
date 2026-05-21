@@ -738,18 +738,32 @@ the zero forward, then re-emits it as a zero gradient. No re-masking, no
 softmax + mask pairing is so clean: $P$ acts as both the forward output *and*
 the backward gate.
 
-*Step 3: through $S = (QK^T / \sqrt{d_k}) + M$.* $M$ is constant w.r.t.
-$Q, K$, so $\partial S / \partial (QK^T / \sqrt{d_k}) = I$ — the mask drops
-out and the chain rule is exactly the two scaled matmul backwards:
+*Step 3: through $S = (QK^T / \sqrt{d_k}) + M$.* **$M$ is independent of
+$Q$ and $K$** (it's an input tensor, not a function of them), so
+$\partial M / \partial Q = \partial M / \partial K = 0$. That means the
+chain rule through `+M` contributes nothing — the mask drops out and what
+remains is exactly the two scaled matmul backwards:
 
 $$
 \frac{\partial L}{\partial Q} = \frac{1}{\sqrt{d_k}} \frac{\partial L}{\partial S} \cdot K, \qquad \frac{\partial L}{\partial K} = \frac{1}{\sqrt{d_k}} \left(\frac{\partial L}{\partial S}\right)^T \! Q
 $$
 
-Because $\partial L / \partial S$ already has zeros at the masked positions
-(from Step 2), the matmul above naturally **doesn't pull gradient from**
-$K_j$ (for $\partial L / \partial Q_i$) or $Q_i$ (for $\partial L / \partial K_j$)
-whenever $(i, j)$ is masked — the contribution is $0 \cdot \text{something} = 0$.
+This is a *different* property than the Step 2 cancellation. To keep them
+straight:
+
+- **Step 2** ($\partial L / \partial S_{ij} = 0$ at masked $(i, j)$): because $P_{ij} = 0$. Stops the masked positions of $S$ from contributing to the matmul backward in Step 3.
+- **Step 3** (the `+M` chain has no extra term): because $M$ doesn't depend on $Q, K$. Stops the mask from creating a *second* gradient path back into $Q, K$.
+
+(If $M$ were a learned function of $Q, K$, Step 3's cancellation would
+fail and an extra term would appear in $\partial L / \partial Q$ — but
+Step 2's cancellation would still hold, so that extra term would only
+flow at unmasked positions. They're independent guarantees.)
+
+Combining the two: $\partial L / \partial S$ has zeros at masked positions
+(Step 2), and the matmul backward in Step 3 is the only path to $Q, K$
+(no `+M` side channel), so masked positions contribute nothing to
+$\partial L / \partial Q$ or $\partial L / \partial K$ — the contribution
+is $0 \cdot \text{something} = 0$.
 
 Boxing the final closed-form:
 
