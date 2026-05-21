@@ -1,40 +1,19 @@
 """CPU offload of optimizer state for nanchat's DistMuonAdamW.
 
-Why this exists: d24+B=1 on 2× RTX 3090 hits a reproducible 1.35 GiB
-allocator-fragmentation OOM at iter 3 (with naive SDPA) / iter 22
-(with L-attn checkpoint). All Python-level activation tricks (chunked
-SDPA, MLP/attn checkpoint, LSE-only ctx) failed to escape — the peak
-transient during SDPA backward is fundamentally bounded below.
+Drop-in replacements for `DistMuonAdamW._compute_adamw` and
+`._compute_muon` that allocate optim state in pinned CPU memory and
+async-copy H2D / D2H around the existing fused kernels.
 
-The remaining lever is the persistent optim state pool. nanchat already
-ZeRO-1 shards state across ranks (each rank holds 1/world_size of large-
-param state), so the GPU footprint per rank is ~half of the total. CPU
-offload moves that remaining slice to host pinned memory; per optimizer
-step we async-copy state to GPU buffers, run the existing fused kernel,
-and async-copy results back.
-
-Cost: ~PCIe round-trip of the per-rank state slice. For nanchat d24
-(~2.5 GB Muon state + ~300 MB AdamW state per rank under ZeRO-1) on
-PCIe 4.0 x16 (~25 GB/s peak, ~12 GB/s sustained over both copies and
-allocator overhead), one optimizer step adds roughly 200-400 ms — once
-per training iter (after 256 accum), so ~+0.5% wall time on a 65 s/iter
-d24 schedule.
-
-Benefit: ~2.8 GB of GPU memory freed per rank, well above the ~1.5 GB
-margin we need to clear the d24 OOM cliff.
-
-Wiring: when NANOOPS_OFFLOAD_OPTIM=1 is set, `nanoops.integration._apply`
-monkey-patches DistMuonAdamW._compute_adamw and ._compute_muon with the
-functions defined here. The patch is reversed by _restore via the
-normal originals dict.
+Wired in by `nanoops.integration._apply` when `NANOOPS_OFFLOAD_OPTIM=1`;
+reversed by `_restore` via the standard `originals` dict.
 
 Limitations:
-  - Only handles DistMuonAdamW (the distributed path nanchat uses on >1 GPU).
-    Single-GPU MuonAdamW is left alone — single-GPU training doesn't have
-    the ZeRO halving and OOM behavior is different there anyway.
-  - State loaded from checkpoint comes back on whichever device the
-    checkpoint stored. We don't try to re-pin it; first optim step after
-    resume re-pays the H2D + D2H cost from a non-pinned CPU buffer.
+  - Only handles `DistMuonAdamW` (the distributed path used on >1 GPU).
+    Single-GPU `MuonAdamW` is left alone.
+  - State loaded from a checkpoint comes back on whichever device the
+    checkpoint stored. The first optim step after resume re-pays the
+    H2D + D2H cost from a non-pinned CPU buffer; subsequent steps
+    re-pin via the lazy alloc path.
 """
 
 from __future__ import annotations
