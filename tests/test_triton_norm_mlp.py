@@ -13,7 +13,7 @@ if not torch.cuda.is_available():
 from nanoops.triton_kernels import norm_mlp_relu_square
 
 
-def _reference(x, norm_w, W_fc, W_proj, eps=1e-6):
+def _reference(x, norm_w, W_fc, W_proj, residual, eps=1e-6):
     """Eager PyTorch reference — same math via torch ops."""
     # RMSNorm
     rms_inv = torch.rsqrt((x.float() ** 2).mean(dim=-1, keepdim=True) + eps)
@@ -22,8 +22,8 @@ def _reference(x, norm_w, W_fc, W_proj, eps=1e-6):
     z = x_hat @ W_fc.t()
     # ReluSquare
     r = z.clamp(min=0).square()
-    # c_proj
-    return r @ W_proj.t()
+    # c_proj + residual
+    return residual + r @ W_proj.t()
 
 
 @pytest.mark.parametrize("dtype,atol", [
@@ -42,9 +42,10 @@ def test_forward_parity(dtype, atol):
     norm_w = torch.randn(K, dtype=dtype, device="cuda")
     W_fc = torch.randn(N_fc, K, dtype=dtype, device="cuda") * 0.1
     W_proj = torch.randn(K, N_fc, dtype=dtype, device="cuda") * 0.1
+    residual = torch.randn(M, K, dtype=dtype, device="cuda")
 
-    y_ref = _reference(x, norm_w, W_fc, W_proj)
-    y_triton = norm_mlp_relu_square(x, norm_w, W_fc, W_proj)
+    y_ref = _reference(x, norm_w, W_fc, W_proj, residual)
+    y_triton = norm_mlp_relu_square(x, norm_w, W_fc, W_proj, residual)
     assert torch.allclose(y_ref, y_triton, atol=atol), \
         f"forward mismatch (max {(y_ref - y_triton).abs().max().item():.4f}, dtype={dtype})"
 
@@ -58,6 +59,7 @@ def test_backward_parity():
     norm_w0 = torch.randn(K, dtype=dtype, device="cuda")
     W_fc0 = torch.randn(N_fc, K, dtype=dtype, device="cuda") * 0.1
     W_proj0 = torch.randn(K, N_fc, dtype=dtype, device="cuda") * 0.1
+    res0 = torch.randn(M, K, dtype=dtype, device="cuda")
     g = torch.randn(M, K, dtype=dtype, device="cuda")
 
     # Reference: PyTorch chain with autograd
@@ -65,7 +67,8 @@ def test_backward_parity():
     nw1 = norm_w0.clone().requires_grad_(True)
     Wfc1 = W_fc0.clone().requires_grad_(True)
     Wproj1 = W_proj0.clone().requires_grad_(True)
-    y_ref = _reference(x1, nw1, Wfc1, Wproj1)
+    res1 = res0.clone().requires_grad_(True)
+    y_ref = _reference(x1, nw1, Wfc1, Wproj1, res1)
     y_ref.backward(g)
 
     # Triton fused
@@ -73,7 +76,8 @@ def test_backward_parity():
     nw2 = norm_w0.clone().requires_grad_(True)
     Wfc2 = W_fc0.clone().requires_grad_(True)
     Wproj2 = W_proj0.clone().requires_grad_(True)
-    y_triton = norm_mlp_relu_square(x2, nw2, Wfc2, Wproj2)
+    res2 = res0.clone().requires_grad_(True)
+    y_triton = norm_mlp_relu_square(x2, nw2, Wfc2, Wproj2, res2)
     y_triton.backward(g)
 
     # Backward goes through 4 matmuls + RMSNorm bwd reduction; the
@@ -85,6 +89,7 @@ def test_backward_parity():
         ("norm_w.grad", nw1.grad, nw2.grad),
         ("W_fc.grad", Wfc1.grad, Wfc2.grad),
         ("W_proj.grad", Wproj1.grad, Wproj2.grad),
+        ("residual.grad", res1.grad, res2.grad),
     ]:
         max_diff = (ref - got).abs().max().item()
         assert torch.allclose(ref, got, atol=atol), \
