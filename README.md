@@ -50,32 +50,32 @@ anyone learning at home or on a small budget.
 
 This fork's full optimization stack — SlidingWindowSDPA (chunked
 attention keeps the band only, no full P) + MLP activation checkpoint
-+ the `expandable_segments` allocator — frees ~9 GiB of peak GPU
-memory and lets d24 actually fit at `--device-batch-size=1` on those
++ L-layer activation checkpoint + the `expandable_segments` allocator
+— frees enough peak GPU memory and tames allocator fragmentation
+enough that d24 actually fits at `--device-batch-size=1` on those
 same consumer cards. **The point is to put nanchat's default training
 within reach of a beginner's hardware budget.**
 
-| Config            | nanchat default | nanoops stack on 2× RTX 3090     |
-| ----------------- | --------------- | -------------------------------- |
-| `--depth=20`, B=4 | ~22.7k tok/s    | **~30.5k tok/s** (+34%, ~31 h ETA)|
-| `--depth=24`, B=1 | OOM             | **~15.8k tok/s** (~61 h ETA)     |
+| Config            | nanchat default | nanoops stack on 2× RTX 3090       |
+| ----------------- | --------------- | ---------------------------------- |
+| `--depth=20`, B=4 | ~22.7k tok/s    | **~30.5k tok/s** (+34%, ~31 h ETA) |
+| `--depth=24`, B=1 | OOM             | **~16k tok/s** (~101 h ETA)        |
 
 **Concretely:** at typical spot-rental rates of ~$0.18/GPU/hr for an
 RTX 3090, a 2× 3090 rig runs at about **$0.36/hr ≈ $8.6/day ≈ $60/week**.
-A full `--depth=24` pretraining run finishes in ~2.5 days for roughly
-$22 of GPU time, and a `--depth=20` run finishes in ~31 h for under $12.
-The same training is otherwise targeted at 8× H100 nodes; this fork
-makes it feasible on a single dual-3090 desktop.
+A full `--depth=24` pretraining run finishes in ~4.2 days for roughly
+**$36** of GPU time, and a `--depth=20` run finishes in ~31 h for under
+**$12**. The same training is otherwise targeted at 8× H100 nodes;
+this fork makes it feasible on a single dual-3090 desktop.
 
-**Good fit for learners.** Since one full d24 training only spends a
-fraction of a week's GPU budget, the remaining ~$40 / ~4-5 days of GPU
-time is yours to break the code on — read an op in `nanoops/functional.py`,
-swap an in-place trick out, add a print to a `.backward()`, kick off
-a 20-iter run, and watch the loss curve / MFU drift. The whole stack
-is small enough to step through in a debugger, and the bundled tests
-(`tests/test_nanoops_e2e.py`, `tests/test_sdpa_parity.py`, ...) cross-
-check every op against PyTorch's reference — so you always have ground
-truth to compare against.
+**Good fit for learners.** Even at the heavier d24 budget there's still
+~$24 / ~2-3 days of GPU time left in a week to break the code on —
+read an op in `nanoops/functional.py`, swap an in-place trick out, add
+a print to a `.backward()`, kick off a 20-iter run, and watch the loss
+curve / MFU drift. The whole stack is small enough to step through in
+a debugger, and the bundled tests (`tests/test_nanoops_e2e.py`,
+`tests/test_sdpa_parity.py`, ...) cross-check every op against
+PyTorch's reference — so you always have ground truth to compare against.
 
 ### Measured speedup journey (d20 base_train, 2× RTX 3090)
 
@@ -96,9 +96,10 @@ Full A/B autopsy lives in the
 ```bash
 # Drop-in replacement for speedrun.sh's base_train step,
 # defaults to --depth=24 --device-batch-size=1 (the biggest nanchat
-# config that fits on 2× RTX 3090). All three optimizations active by
-# default: sliding-window SDPA + MLP activation checkpoint + expandable
-# segments allocator.
+# config that fits on 2× RTX 3090). Four optimizations active by
+# default: sliding-window SDPA + chunked full attention (for L layers) +
+# MLP activation checkpoint + L-layer activation checkpoint +
+# expandable_segments allocator.
 bash nanoops/train.sh
 
 # Or override defaults — e.g. fastest throughput on 2× RTX 3090:
@@ -108,6 +109,8 @@ bash nanoops/train.sh --depth=20 --device-batch-size=4
 #   NANOOPS=1                                       activates the integration
 #   PYTORCH_ALLOC_CONF=expandable_segments:True     recovers fragmentation
 #   NANOOPS_MLP_CHECKPOINT=1                        ~3.7 GiB peak savings
+#   NANOOPS_L_ATTN_CHECKPOINT=1                     full-attn layer checkpoint;
+#                                                    needed to fit d24+B=1
 #
 # Opt-in experimental knobs:
 #   NANOOPS_LOOKUP_SORTED=1       try the segmented-sum embedding backward

@@ -42,28 +42,29 @@ layer 的完整 `(L, L)` attention 概率矩阵——加起来就是装不下。
 参考硬件是 8× H100 节点——**对在家学习或预算有限的人来说远超能力**。
 
 本 fork 的全套优化（SlidingWindowSDPA 把 chunked attention 砍到带状、
-不存完整 P + MLP activation checkpoint + `expandable_segments` allocator）
-总共比 PyTorch baseline 路径省下 **~9 GiB 的 peak 显存**，让 d24 终于能
-在同一张消费级显卡上以 `--device-batch-size=1` **真的装下并跑起来**。
-**这个项目的意义就是把 nanchat 的默认训练拉进初学者硬件预算的范围**。
+不存完整 P + MLP activation checkpoint + L 层 activation checkpoint +
+`expandable_segments` allocator）省够内存 + 抑制 allocator 碎片，让
+d24 终于能在同一张消费级显卡上以 `--device-batch-size=1` **真的装下
+并跑起来**。**这个项目的意义就是把 nanchat 的默认训练拉进初学者硬件
+预算的范围**。
 
-| 配置             | nanchat 原生 | nanoops 整套在 2× RTX 3090 上    |
-| ---------------- | ------------ | -------------------------------- |
-| `--depth=20`, B=4 | ~22.7k tok/s | **~30.5k tok/s** (+34%, ~31h)  |
-| `--depth=24`, B=1 | OOM          | **~15.8k tok/s** (~61h)        |
+| 配置             | nanchat 原生 | nanoops 整套在 2× RTX 3090 上     |
+| ---------------- | ------------ | --------------------------------- |
+| `--depth=20`, B=4 | ~22.7k tok/s | **~30.5k tok/s** (+34%, ~31h)   |
+| `--depth=24`, B=1 | OOM          | **~16k tok/s** (~101h)          |
 
 **算成钱**：3090 spot 租赁价格大约 $0.18/卡/小时，2× 3090 一台机 ~$0.36/h
-≈ $8.6/天 ≈ **$60/周**。一次完整的 `--depth=24` 训练 ~2.5 天，**算力成本
-约 $22**；`--depth=20` 训练 ~31 h，**不到 $12**。原本目标硬件是 8× H100
+≈ $8.6/天 ≈ **$60/周**。一次完整的 `--depth=24` 训练 ~4.2 天，**算力成本
+约 $36**；`--depth=20` 训练 ~31 h，**不到 $12**。原本目标硬件是 8× H100
 节点，本 fork 让这个训练在一台双 3090 桌面机上可行。
 
-**很适合初学者上手**。一次 d24 训练只花掉一周 GPU 预算的一小部分，
-剩下的 ~$40 / ~4-5 天 GPU 时间正好用来"折腾"——读一下
-`nanoops/functional.py` 里某个算子的实现、把某个 in-place trick 改掉、
-往 `.backward()` 加个 print、跑个 20-iter 看 loss 曲线和 MFU 怎么变。
-整套代码量小到可以拿调试器一步步走完，配套测试
-（`tests/test_nanoops_e2e.py`, `tests/test_sdpa_parity.py` 等）会把每个
-算子跟 PyTorch reference 对拍——**永远有 ground truth 可以参照**。
+**很适合初学者上手**。即便跑较重的 d24 训练，一周预算里还剩 ~$24 /
+~2-3 天 GPU 时间正好用来"折腾"——读一下 `nanoops/functional.py` 里
+某个算子的实现、把某个 in-place trick 改掉、往 `.backward()` 加个
+print、跑个 20-iter 看 loss 曲线和 MFU 怎么变。整套代码量小到可以
+拿调试器一步步走完，配套测试（`tests/test_nanoops_e2e.py`,
+`tests/test_sdpa_parity.py` 等）会把每个算子跟 PyTorch reference
+对拍——**永远有 ground truth 可以参照**。
 
 ### 实测加速过程（d20 base_train, 2× RTX 3090）
 
@@ -83,7 +84,8 @@ layer 的完整 `(L, L)` attention 概率矩阵——加起来就是装不下。
 ```bash
 # speedrun.sh 中 base_train 步骤的 drop-in 替代版——
 # 默认 --depth=24 --device-batch-size=1（2× RTX 3090 上装得下的最大 nanchat 配置）。
-# 三个优化默认全开：sliding-window SDPA + MLP activation checkpoint + expandable_segments allocator。
+# 全套优化默认开启：sliding-window SDPA + 全 attention chunked (L 层) +
+# MLP activation checkpoint + L 层 activation checkpoint + expandable_segments allocator。
 bash nanoops/train.sh
 
 # 也可以覆盖默认值——比如 2× RTX 3090 上吞吐最大的 setup：
@@ -93,6 +95,8 @@ bash nanoops/train.sh --depth=20 --device-batch-size=4
 #   NANOOPS=1                                       启用 nanoops 集成
 #   PYTORCH_ALLOC_CONF=expandable_segments:True     回收碎片化内存
 #   NANOOPS_MLP_CHECKPOINT=1                        省 ~3.7 GiB peak
+#   NANOOPS_L_ATTN_CHECKPOINT=1                     全 attention 层 checkpoint;
+#                                                    d24+B=1 装下的必要条件
 #
 # Opt-in 实验开关：
 #   NANOOPS_LOOKUP_SORTED=1       试一下"排序+分段求和"的 embedding backward
