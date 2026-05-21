@@ -666,15 +666,21 @@ triangular) and `attn_mask` (bool → $\{0, -\infty\}$, or float → as-is)
 collapse into this same additive form before softmax. Wherever $M_{ij} = -\infty$,
 the corresponding $P_{ij} = e^{-\infty} / Z = 0$ exactly.
 
-**Why additive and not multiplicative?** Softmax composes cleanly with
-addition (via $-\infty$ identity), not with multiplication (via $0$ identity).
-Compare three candidate formulations:
+**Why additive and not multiplicative?** The natural multiplicative analog
+of "absorb to zero after softmax" is $M \in \{-\infty, 1\}$ on $S$ — but
+that breaks because $S_{ij}$ is signed:
 
-| Variant | Formula | $P_{ij}$ at masked | Row sums to 1? |
-|---|---|---|---|
-| Additive (used) | $\text{softmax}(S + M),\; M \in \{0, -\infty\}$ | $e^{-\infty}/Z = 0$ ✓ | Yes ✓ |
-| Multiplicative on $S$ | $\text{softmax}(S \odot m),\; m \in \{0, 1\}$ | $e^0/Z = 1/Z \ne 0$ ✗ | Yes, but blocked positions still get probability |
-| Multiplicative on $P$ | $\text{softmax}(S) \odot m$ | $0$ ✓ | No — row sum < 1 |
+| Variant | Formula | masked $P_{ij}$ |
+|---|---|---|
+| Additive (used) | $\text{softmax}(S + M),\; M \in \{0, -\infty\}$ | $e^{-\infty}/Z = 0$ ✓ for any $S_{ij} \in \mathbb{R}$ |
+| Multiplicative on $S$ | $\text{softmax}(S \odot M),\; M \in \{-\infty, 1\}$ | $S_{ij} \cdot (-\infty)$ = $-\infty$ if $S_{ij} > 0$, $+\infty$ if $S_{ij} < 0$, **NaN** if $S_{ij} = 0$ |
+
+Attention scores $S = QK^T / \sqrt{d_k}$ are unrestricted reals — they're
+routinely negative and pass through zero. So the multiplicative-on-$S$
+variant blows up the row whenever $S_{ij} \le 0$ at a masked position
+(either +∞ wins the softmax and steals all probability, or NaN poisons
+the entire batch). The additive form has no such sign dependency: $-\infty$
+is the absorbing element for $\max$ / softmax for **any** $S_{ij}$.
 
 Three properties fall out of the additive choice:
 
@@ -686,16 +692,17 @@ Three properties fall out of the additive choice:
    needed.
 3. **Gradient cancellation is automatic** (the point of the backward
    derivation below): $P_{ij} = 0$ propagates as $\partial L/\partial S_{ij} = 0$
-   through the softmax-backward formula itself. The multiplicative-on-$P$
-   variant has $P_{ij} = 0$ too but its normalization is already broken, and
-   backward needs an explicit re-mask.
+   through the softmax-backward formula itself — no explicit re-mask.
 
 There's a deeper algebraic reason: in log-space,
 $\log\text{softmax}(S + M) = (S + M) - \log\sum e^{S + M}$ — adding the mask
-to logits is the same operation as the log-sum-exp normalization. It's the
-same trick that makes log-sum-exp stable, that makes cross-entropy fusable
-with logsoftmax, and that makes the FlashAttention $L = \log\sum e^S$ stat
-sufficient for backward. Multiplicative masking doesn't fit that algebra.
+to logits is the same operation as the log-sum-exp normalization. (Equivalently:
+multiplicative masking *does* work, but only in the exp domain — softmax(S) ⊙ m
+with $m \in \{0, 1\}$, which equals softmax($S + \log m$) since $\log 0 = -\infty$
+and $\log 1 = 0$. So "multiplicative mask done right" reduces to additive
+masking.) Same trick makes log-sum-exp stable, makes cross-entropy fusable
+with logsoftmax, and makes the FlashAttention $L = \log\sum e^S$ stat
+sufficient for backward.
 
 **Backward.** Given upstream $g = \partial L / \partial O$, we chain through
 three operations. None of the steps require materializing the Jacobians — every
