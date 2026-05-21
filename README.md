@@ -1,4 +1,4 @@
-# nanochat on 2× 3090 — 教学 fork
+# nanochat on 2× 3090 — a teaching fork
 
 > 中文版：[README_zh.md](README_zh.md)
 
