@@ -278,6 +278,19 @@ def _apply() -> dict[str, dict]:
         fa_mod._sdpa_attention
     )
     fa_mod._sdpa_attention = _patched_sdpa_attention
+    # Optimizer CPU offload (opt-in via NANOOPS_OFFLOAD_OPTIM=1). Moves
+    # DistMuonAdamW's per-rank optim state to CPU pinned memory; H2D/D2H
+    # per optimizer step. Freed GPU memory: ~2.5 GB Muon state + ~300 MB
+    # AdamW state per rank, enough to clear d24+B=1's fragmentation OOM
+    # cliff. See nanoops/cpu_offload.py for the patch bodies.
+    if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
+        from . import cpu_offload
+        optim_mod = importlib.import_module("nanochat.optim")
+        cls = optim_mod.DistMuonAdamW
+        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_adamw")] = cls._compute_adamw
+        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_muon")] = cls._compute_muon
+        cls._compute_adamw = cpu_offload.patched_compute_adamw
+        cls._compute_muon = cpu_offload.patched_compute_muon
     _PATCHED = True  # global declared at top of _apply()
     return originals
 
@@ -312,6 +325,8 @@ def patch_nanchat() -> list[str]:
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
         names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
     names.append("_sdpa_attention(full-attn → chunked sliding, default)")
+    if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
+        names.append("DistMuonAdamW._compute_adamw/_compute_muon(CPU offload)")
     return names
 
 
