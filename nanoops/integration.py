@@ -37,8 +37,14 @@ from typing import Iterator
 
 import torch
 import torch.nn.functional as F_orig
+import torch.utils.checkpoint as _ckpt
 
 import nanoops.functional as nF
+
+
+# Captured at patch time so the checkpoint wrappers can call the un-patched
+# original implementations.
+_orig_attn_forward = None
 
 
 _F_OVERRIDES = {
@@ -81,10 +87,32 @@ def _patched_mlp_forward(self, x):
     one such site (`gpt.py:137` MLP.forward), so a targeted class-method
     swap is the minimal fix.
     """
+    if os.environ.get("NANOOPS_MLP_CHECKPOINT"):
+        return _ckpt.checkpoint(_mlp_inner, self, x, use_reentrant=False)
+    return _mlp_inner(self, x)
+
+
+def _mlp_inner(self, x):
+    """The actual MLP forward — same as the patched body, separated out so
+    activation checkpointing can wrap it cleanly."""
     x = self.c_fc(x)
     x = nF.relu_square(x)
     x = self.c_proj(x)
     return x
+
+
+def _patched_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
+    """Wraps the original CausalSelfAttention.forward with
+    torch.utils.checkpoint when NANOOPS_ATTN_CHECKPOINT=1 — but only during
+    training (kv_cache is None). Inference paths bypass the wrap so the
+    KV-cache update isn't re-run.
+    """
+    if os.environ.get("NANOOPS_ATTN_CHECKPOINT") and kv_cache is None:
+        return _ckpt.checkpoint(
+            _orig_attn_forward, self, x, ve, cos_sin, window_size, kv_cache,
+            use_reentrant=False,
+        )
+    return _orig_attn_forward(self, x, ve, cos_sin, window_size, kv_cache)
 
 
 def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
@@ -187,9 +215,18 @@ def _apply() -> dict[str, dict]:
         originals["module_func"][(modname, attr_name)] = getattr(mod, attr_name)
         setattr(mod, attr_name, replacement)
     # MLP.forward: route the `F.relu(x).square()` chain to fused relu_square
+    # (and optionally activation-checkpoint via NANOOPS_MLP_CHECKPOINT=1).
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
+    # CausalSelfAttention.forward: wrap with optional activation checkpoint
+    # via NANOOPS_ATTN_CHECKPOINT=1. The wrapper is always installed; the
+    # env-var check inside _patched_attn_forward decides whether to actually
+    # checkpoint. This keeps the patch flat (no late wiring).
+    global _orig_attn_forward
+    _orig_attn_forward = gpt_mod.CausalSelfAttention.forward
+    originals["method"][("nanochat.gpt", "CausalSelfAttention", "forward")] = _orig_attn_forward
+    gpt_mod.CausalSelfAttention.forward = _patched_attn_forward
     # Sliding window SDPA: default ON (real end-to-end win — +6.2% tok/sec,
     # -10.4% peak memory on nanchat d20). Opt out with NANOOPS_NO_SLIDING_WINDOW=1
     # for debugging or to test the regression.
@@ -225,6 +262,10 @@ def patch_nanchat() -> list[str]:
     )
     if not os.environ.get("NANOOPS_NO_SLIDING_WINDOW"):
         names.append("nanochat.flash_attention._sdpa_attention(sliding_window_sdpa)")
+    if os.environ.get("NANOOPS_MLP_CHECKPOINT"):
+        names.append("MLP.forward(activation checkpoint)")
+    if os.environ.get("NANOOPS_ATTN_CHECKPOINT"):
+        names.append("CausalSelfAttention.forward(activation checkpoint)")
     return names
 
 
