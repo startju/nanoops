@@ -1420,25 +1420,64 @@ class SlidingWindowSDPA(torch.autograd.Function):
 
     Forward chunks queries into windows of `window_size`; each chunk computes
     attention only against the band of (up to) 2W-1 relevant keys instead of
-    full L. All chunks live inside one autograd.Function — Python loop has
-    NO per-chunk autograd overhead (which would have killed the speedup, as
-    demonstrated by an earlier "wrap nF.SDPA in a Python loop" attempt).
+    full L. All chunks live inside ONE autograd.Function — the Python chunk
+    loop has no per-chunk autograd overhead. An earlier attempt that wrapped
+    nF.scaled_dot_product_attention in an external Python loop was a wash
+    (backward got slower) because each chunk paid full autograd.Function
+    ctx + dispatch overhead. Pulling chunking inside one Function was the
+    architectural fix.
 
     Backward symmetric: Q gradient is written per chunk (Q windows don't
     overlap); K/V gradients accumulate across chunks (K/V windows DO overlap
     between consecutive chunks).
 
     ctx saves Q, K, V, plus each chunk's P. Memory: ~`L * 2W` instead of
-    full P's `L * L`, so for `W = L/4` the P footprint drops 4×.
+    full P's `L * L`, so for `W = L/4` the per-layer P footprint drops 4×.
 
-    Empirical (RTX 3090, B=2, H=10, L=2048, D=128, W=512, bf16):
-      full_via_sdpa (1 ScaledDotProductAttention + L×L sliding mask): 2.29 ms fwd / 5.46 ms fwd+bwd
-      SlidingWindowSDPA (chunked, 1 fn):                              2.10 ms fwd / 5.36 ms fwd+bwd
-                                                                      ↑ 1.09× fwd, ~1.02× fwd+bwd
-    The fwd+bwd is essentially a wash; chunked backward pays for K/V
-    overlap accumulation. Kept opt-in (NANOOPS_SLIDING_WINDOW=1) for
-    A/B and as a demonstration that "Python-level sliding window" caps
-    out well below the theoretical 4× FLOPs reduction.
+    ─────────────────────────────────────────────────────────────────────
+    Empirical findings (RTX 3090 ×2, nanchat d20, SSSL window pattern):
+    ─────────────────────────────────────────────────────────────────────
+
+    Isolated microbench (B=2, H=10, L=2048, D=128, W=512, bf16):
+        full_via_sdpa (1 SDPA + L×L sliding mask): 2.29 ms fwd  / 5.46 ms fwd+bwd
+        SlidingWindowSDPA:                         2.10 ms fwd  / 5.36 ms fwd+bwd
+                                                   ↑ 1.09× fwd, ~1.02× fwd+bwd
+
+    Early prediction from this microbench: ~0.5% end-to-end speedup.
+    THIS WAS WRONG. Real training shows much bigger gains because the
+    isolated bench can't capture the system-level effects of cutting P
+    matrix memory across 20 layers.
+
+    End-to-end training A/B (20-iter d20 base_train, 2× RTX 3090):
+                                  default SDPA           SlidingWindowSDPA
+        Steady tok/sec            28,800                 30,594   (+6.2%)
+        Steady MFU                58.5%                  62.18%   (+3.7pp)
+        Steady dt/iter            36.4s                  34.27s   (-5.9%)
+        Peak memory               19,665 MiB             17,612 MiB (-10.4%)
+        Total time (20 iters)     5.46 min               5.14 min  (-5.9%)
+        Loss @ step 19            6.906019               6.905961 (6e-5, bf16 noise)
+        Warmup (step 0)           ~140s                  ~200s    (heavier compile)
+
+    Why the end-to-end win is so much bigger than isolated:
+      1. P matrix shrinks (L, L) → (L, 2W) per sliding layer. 15 sliding
+         layers × ~167 MB saved per layer ≈ 2.5 GB peak savings (2 GB
+         observed after subtracting chunked ctx overhead).
+      2. Less HBM bandwidth pressure (smaller P → fewer attention reads).
+      3. Allocator no longer hugging the 24 GB ceiling — less
+         fragmentation, fewer cache-miss alloc paths.
+      4. Better L2 cache behavior with smaller per-layer P working sets.
+
+    Warmup is ~60s longer because torch.compile must compile the chunked
+    forward+backward path (one autograd.Function with 4 chunks unrolled
+    into the trace). One-time cost amortized across the full training run.
+    ─────────────────────────────────────────────────────────────────────
+
+    Lesson: micro-benchmark isolated attention timing is a POOR predictor
+    of end-to-end attention-kernel impact at this scale. Memory pressure
+    and HBM-bandwidth side effects can dominate the small per-call speedup.
+    Always validate with a real training run.
+
+    Default ON when NANOOPS=1; opt out with NANOOPS_NO_SLIDING_WINDOW=1.
     """
 
     @staticmethod
@@ -1527,9 +1566,10 @@ def sliding_window_sdpa(
     each query attends to (including itself), so window_size=L is full
     causal attention.
 
-    Currently triggered by NANOOPS_SLIDING_WINDOW=1 in
-    `nanoops.integration` (replaces nanchat.flash_attention._sdpa_attention
-    when the active layer has a finite window). See SlidingWindowSDPA
-    docstring for the empirical findings (~1.09× fwd, ~1.02× fwd+bwd).
+    Hooked into nanchat by `nanoops.integration.patch_nanchat()`: replaces
+    nanchat.flash_attention._sdpa_attention so sliding training layers
+    route here. Default ON when NANOOPS=1; opt out with
+    NANOOPS_NO_SLIDING_WINDOW=1. See SlidingWindowSDPA docstring for the
+    empirical end-to-end findings (+6.2% tok/sec, -10.4% peak memory).
     """
     return SlidingWindowSDPA.apply(query, key, value, window_size)

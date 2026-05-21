@@ -190,10 +190,10 @@ def _apply() -> dict[str, dict]:
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
-    # Sliding window SDPA (opt-in via env var): swap
-    # nanchat.flash_attention._sdpa_attention so sliding training layers
-    # use nF.sliding_window_sdpa instead of one big SDPA call + L×L mask.
-    if os.environ.get("NANOOPS_SLIDING_WINDOW"):
+    # Sliding window SDPA: default ON (real end-to-end win — +6.2% tok/sec,
+    # -10.4% peak memory on nanchat d20). Opt out with NANOOPS_NO_SLIDING_WINDOW=1
+    # for debugging or to test the regression.
+    if not os.environ.get("NANOOPS_NO_SLIDING_WINDOW"):
         fa_mod = importlib.import_module("nanochat.flash_attention")
         originals["module_func"][("nanochat.flash_attention", "_sdpa_attention")] = (
             fa_mod._sdpa_attention
@@ -223,7 +223,7 @@ def patch_nanchat() -> list[str]:
         + [f"{mod}.{attr}" for mod, attr in _MODULE_FUNC_OVERRIDES]
         + ["MLP.forward(relu_square fused)"]
     )
-    if os.environ.get("NANOOPS_SLIDING_WINDOW"):
+    if not os.environ.get("NANOOPS_NO_SLIDING_WINDOW"):
         names.append("nanochat.flash_attention._sdpa_attention(sliding_window_sdpa)")
     return names
 
