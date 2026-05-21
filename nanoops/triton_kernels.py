@@ -1155,72 +1155,41 @@ if _HAS_TRITON:
         """
         pid_m = tl.program_id(0)
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        cols = tl.arange(0, BLOCK_D)
         row_mask = rows < M
         half = BLOCK_D // 2
-
-        # Load qk (BLOCK_M, BLOCK_D)
-        ptrs = qk_ptr + rows[:, None] * stride_qm + cols[None, :] * stride_qd
-        x = tl.load(ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        # Split into halves
-        is_low = cols < half
-        # Roll the second half forward (gather): build y using cos/sin that
-        # depend on position. cos and sin have shape (M, D//2) — same first
-        # half indices for both halves.
         cs_cols = tl.arange(0, BLOCK_D // 2)
-        cos = tl.load(cos_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
-                      mask=row_mask[:, None], other=0.0).to(tl.float32)
-        sin = tl.load(sin_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
-                      mask=row_mask[:, None], other=0.0).to(tl.float32)
-        # x_lo, x_hi
-        x_lo = tl.where(is_low[None, :], x, 0.0)
-        x_hi = tl.where(~is_low[None, :], x, 0.0)
-        # Roll x_hi to align with x_lo's index → we need x_lo[i] and x_hi[i+half]
-        # paired. The triton-natural way: just compute two halves separately,
-        # then concatenate via tl.where.
-        # y_lo = x_lo * cos + x_hi_paired * sin
-        # y_hi = -x_lo_paired * sin + x_hi * cos
-        # Easier: load x_low_half and x_high_half separately
+
+        # Load lo + hi halves of qk and cos/sin (which are half-D wide)
         ptrs_lo = qk_ptr + rows[:, None] * stride_qm + cs_cols[None, :] * stride_qd
         ptrs_hi = qk_ptr + rows[:, None] * stride_qm + (cs_cols[None, :] + half) * stride_qd
         x1 = tl.load(ptrs_lo, mask=row_mask[:, None], other=0.0).to(tl.float32)
         x2 = tl.load(ptrs_hi, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        cos = tl.load(
+            cos_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
+            mask=row_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        sin = tl.load(
+            sin_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
+            mask=row_mask[:, None], other=0.0,
+        ).to(tl.float32)
+
+        # Rotary: y1 = x1·cos + x2·sin ;  y2 = -x1·sin + x2·cos
         y1 = x1 * cos + x2 * sin
         y2 = -x1 * sin + x2 * cos
-        # Combine y1, y2 into full BLOCK_D via tl.where
-        y = tl.where(is_low[None, :],
-                     tl.where(is_low[None, :], y1, 0.0)[:, :half],  # type juggling
-                     y2)
-        # Simpler approach: write y1 and y2 to separate halves
-        # — but tl.where with full-row layout needs concat-style logic.
-        # Build y by interleaving:
-        # We'll just store y1 to [:half] cols and y2 to [half:] cols.
-        # Then read back y for RMSNorm.
-        # → Two stores + one load adds HBM cost; instead use a vector trick:
-        # construct y in two register-vectors and pack via tl.where.
-        # Use a per-col selector:
-        cols_low_idx = cols
-        y_full = tl.where(
-            is_low[None, :],
-            # y1 at low cols — broadcast across BLOCK_D via gather from y1 (size BLOCK_D//2)
-            # Triton doesn't support dynamic indexing easily; emit y1, y2 sized properly.
-            x1 * 0.0,  # placeholder, see fallback below
-            x2 * 0.0,
-        )
-        # Fall back: write halves explicitly. (Use the simpler 2-store path.)
-        out_ptrs_lo = out_ptr + rows[:, None] * stride_om + cs_cols[None, :] * stride_od
-        out_ptrs_hi = out_ptr + rows[:, None] * stride_om + (cs_cols[None, :] + half) * stride_od
 
-        # RMSNorm + scale: compute mean(y²) over full D using y1, y2 directly.
+        # RMSNorm + scale: compute mean(y²) over full D using y1, y2 in registers
         sum_sq = tl.sum(y1 * y1, axis=1) + tl.sum(y2 * y2, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
         norm_scale = rms_inv * scale
 
+        # Apply norm·scale, write halves back
         y1_out = y1 * norm_scale[:, None]
         y2_out = y2 * norm_scale[:, None]
+        out_ptrs_lo = out_ptr + rows[:, None] * stride_om + cs_cols[None, :] * stride_od
+        out_ptrs_hi = out_ptr + rows[:, None] * stride_om + (cs_cols[None, :] + half) * stride_od
         tl.store(out_ptrs_lo, y1_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None])
         tl.store(out_ptrs_hi, y2_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None])
-        # Save rms_inv for backward (in fp32)
+        # rms_inv saved for backward
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
 
@@ -1280,31 +1249,213 @@ if _HAS_TRITON:
         )
 
 
-def output_proj_residual_fwd(
+class OutputProjResidual(torch.autograd.Function):
+    """y = residual + attn_out @ proj_weight.T
+
+    Forward: one Triton kernel — matmul with residual loaded as the
+    accumulator init (same pattern as cuBLAS addmm). Backward uses
+    cuBLAS for the two matmul gradients; residual gradient is identity.
+    """
+
+    @staticmethod
+    def forward(ctx, attn_out, proj_weight, residual):
+        assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
+        M, D_in = attn_out.shape
+        D_out, D_in_w = proj_weight.shape
+        assert D_in == D_in_w
+        y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
+        BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
+        _output_proj_residual_kernel[grid](
+            attn_out, proj_weight, residual, y,
+            M, D_out, D_in,
+            attn_out.stride(0), attn_out.stride(1),
+            proj_weight.stride(0), proj_weight.stride(1),
+            residual.stride(0), residual.stride(1),
+            y.stride(0), y.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_DOUT=BLOCK_DOUT, BLOCK_DIN=BLOCK_DIN,
+        )
+        ctx.save_for_backward(attn_out, proj_weight)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        attn_out, proj_weight = ctx.saved_tensors
+        dy = dy.contiguous()
+        # y = residual + attn_out @ proj_weight.T
+        # d_residual = dy (identity)
+        # d_attn_out = dy @ proj_weight
+        # d_proj_weight = dy.T @ attn_out
+        d_attn_out = dy @ proj_weight
+        d_proj_weight = dy.t() @ attn_out
+        d_residual = dy
+        return d_attn_out, d_proj_weight, d_residual
+
+
+def output_proj_residual(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
-    """Forward-only: y = residual + attn_out @ proj_weight.T (Triton).
+    """Fused `y = residual + attn_out @ proj_weight.T` (Triton forward + cuBLAS backward)."""
+    return OutputProjResidual.apply(attn_out, proj_weight, residual)
 
-    Equivalent to `torch.addmm(residual, attn_out, proj_weight.t())`
-    but in our Triton stack — kernel below tiles the output and uses
-    `residual` as the accumulator init (the matmul + bias-add fusion).
-    """
-    assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
-    M, D_in = attn_out.shape
-    D_out, D_in_w = proj_weight.shape
-    assert D_in == D_in_w
-    y = torch.empty((M, D_out), dtype=attn_out.dtype, device=attn_out.device)
-    BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
-    _output_proj_residual_kernel[grid](
-        attn_out, proj_weight, residual, y,
-        M, D_out, D_in,
-        attn_out.stride(0), attn_out.stride(1),
-        proj_weight.stride(0), proj_weight.stride(1),
-        residual.stride(0), residual.stride(1),
-        y.stride(0), y.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_DOUT=BLOCK_DOUT, BLOCK_DIN=BLOCK_DIN,
-    )
-    return y
+
+# ─────────────────────────────────────────────────────────────────────
+# ValueGate autograd.Function: out = v + 3·sigmoid(x[:, :ch] @ gate_w.T) · ve
+# Forward: _value_gate_kernel.
+# Backward: cuBLAS for matmul-grads; small Triton-able elementwise but
+# we just use torch ops for simplicity (it's only 3-4 elementwise ops).
+# ─────────────────────────────────────────────────────────────────────
+
+class ValueGate(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, v, ve, x, gate_w):
+        """Args:
+            v:      (M, D_v) — base value
+            ve:     (M, D_v) — value embedding to mix in
+            x:      (M, D_x) — gate input (only first ve_gate_ch cols used)
+            gate_w: (D_v, ve_gate_ch) — gate projection
+        Returns:
+            out: (M, D_v)
+        """
+        assert v.is_cuda and ve.is_cuda and x.is_cuda and gate_w.is_cuda
+        M, D_v = v.shape
+        ve_gate_ch = gate_w.shape[1]
+        x_in = x[:, :ve_gate_ch].contiguous()
+        out = torch.empty_like(v)
+
+        BLOCK_M, BLOCK_D, BLOCK_K = 32, 64, 32
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_v, BLOCK_D))
+        _value_gate_kernel[grid](
+            v, ve, x_in, gate_w,
+            out,
+            M, x.shape[1], D_v, ve_gate_ch,
+            v.stride(0), v.stride(1),
+            ve.stride(0), ve.stride(1),
+            x_in.stride(0), x_in.stride(1),
+            gate_w.stride(0), gate_w.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_K=BLOCK_K,
+        )
+        ctx.save_for_backward(v, ve, x_in, gate_w)
+        ctx.ve_gate_ch = ve_gate_ch
+        ctx.x_full_shape = x.shape
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        v, ve, x_in, gate_w = ctx.saved_tensors
+        ve_gate_ch = ctx.ve_gate_ch
+        x_full_shape = ctx.x_full_shape
+
+        # Recompute gate = 3·sigmoid(x_in @ gate_w.T) in fp32.
+        # (Could save in fwd; recomputing is cheap and saves ctx memory.)
+        s = torch.sigmoid((x_in.float() @ gate_w.float().t()))  # (M, D_v)
+        gate = 3.0 * s
+
+        # out = v + gate * ve
+        # d_v = d_out
+        # d_gate = d_out * ve   → d_s = 3 * d_gate → d_logits = d_s * s*(1-s)
+        # d_ve = d_out * gate
+        d_v = d_out
+        d_ve = d_out * gate.to(d_out.dtype)
+        d_gate = d_out.float() * ve.float()
+        d_s = 3.0 * d_gate
+        d_logits = d_s * s * (1.0 - s)  # (M, D_v)
+        # logits = x_in @ gate_w.T → d_x_in = d_logits @ gate_w; d_gate_w = d_logits.T @ x_in
+        d_x_in = (d_logits @ gate_w.float()).to(x_in.dtype)
+        d_gate_w = (d_logits.t() @ x_in.float()).to(gate_w.dtype)
+        # Reconstruct d_x with zeros for the unused tail columns.
+        d_x = torch.zeros(x_full_shape, dtype=x_in.dtype, device=x_in.device)
+        d_x[:, :ve_gate_ch] = d_x_in
+        return d_v, d_ve, d_x, d_gate_w
+
+
+def value_gate(
+    v: torch.Tensor, ve: torch.Tensor, x: torch.Tensor, gate_w: torch.Tensor,
+) -> torch.Tensor:
+    """Fused ResFormer value gate: out = v + 3·sigmoid(x[:, :ch] @ gate_w.T) · ve."""
+    return ValueGate.apply(v, ve, x, gate_w)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Rotary + RMSNorm + scale autograd.Function (for Q or K)
+#
+# Forward uses _rotary_qk_norm_scale_kernel (Triton).
+# Backward chain: scale → RMSNorm bwd → rotary inverse (use sin → -sin
+# rotation; rotary's Jacobian is orthogonal so the inverse is the same
+# shape with sin negated). Uses eager PyTorch ops in backward for
+# clarity (each op is small elementwise).
+# ─────────────────────────────────────────────────────────────────────
+
+class RotaryQKNormScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qk, cos, sin, scale, eps=1e-6):
+        """qk: (M, D); cos, sin: (M, D/2). Returns: (M, D) rotated, normed, scaled."""
+        assert qk.is_cuda and qk.is_contiguous()
+        assert cos.is_contiguous() and sin.is_contiguous()
+        M, D = qk.shape
+        assert D % 2 == 0
+        out = torch.empty_like(qk)
+        rms_inv = torch.empty(M, dtype=torch.float32, device=qk.device)
+        BLOCK_M = 32
+        grid = (triton.cdiv(M, BLOCK_M),)
+        _rotary_qk_norm_scale_kernel[grid](
+            qk, cos, sin,
+            out, rms_inv,
+            M, D, scale, eps,
+            qk.stride(0), qk.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_D=D,
+        )
+        ctx.save_for_backward(qk, cos, sin, rms_inv)
+        ctx.scale = scale
+        ctx.D = D
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        qk, cos, sin, rms_inv = ctx.saved_tensors
+        scale = ctx.scale
+        D = ctx.D
+        half = D // 2
+
+        # Recompute y_rotated (post-rotary, pre-norm) in fp32:
+        x1 = qk[:, :half].float()
+        x2 = qk[:, half:].float()
+        y1 = x1 * cos.float() + x2 * sin.float()
+        y2 = -x1 * sin.float() + x2 * cos.float()
+        y_rot = torch.cat([y1, y2], dim=-1)  # (M, D), fp32
+
+        # y_normed = y_rot * rms_inv * scale → out  (no per-dim weight)
+        # Backward through scale + RMSNorm (no weight version):
+        #   g_eff = d_out * scale
+        #   inner = mean(g_eff * y_normed_unscaled, dim=-1, keepdim=True)
+        #   d_y_rot = rms_inv * (g_eff - y_normed_unscaled * inner)
+        # where y_normed_unscaled = y_rot * rms_inv (without scale).
+        g_eff = d_out.float() * scale
+        y_unscaled = y_rot * rms_inv[:, None]
+        inner = (g_eff * y_unscaled).mean(dim=-1, keepdim=True)
+        d_y_rot = rms_inv[:, None] * (g_eff - y_unscaled * inner)
+
+        # Backward through rotary: same formula with sin → -sin (orthogonal Jacobian).
+        d_y1 = d_y_rot[:, :half]
+        d_y2 = d_y_rot[:, half:]
+        d_x1 = d_y1 * cos.float() - d_y2 * sin.float()
+        d_x2 = d_y1 * sin.float() + d_y2 * cos.float()
+        d_qk = torch.cat([d_x1, d_x2], dim=-1).to(qk.dtype)
+
+        # cos, sin, scale, eps non-differentiable
+        return d_qk, None, None, None, None
+
+
+def rotary_qk_norm_scale(
+    qk: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    scale: float = 1.2,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused rotary embedding + RMSNorm + multiplicative scale for Q or K."""
+    return RotaryQKNormScale.apply(qk, cos, sin, scale, eps)
