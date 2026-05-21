@@ -682,7 +682,13 @@ class ReluSquare(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> torch.Tensor:
         (y,) = ctx.saved_tensors
-        return grad_output * 2 * y  # = 2 * relu(x) * g; mask absorbed into y
+        # `grad_output * 2 * y` would alloc twice (2*grad_output, then *y).
+        # Compute (2*y) into a fresh buf, then in-place multiply by grad_output.
+        # Saves one input-sized alloc per call. y is `relu(x)` so the mask
+        # is already absorbed (zero where x ≤ 0).
+        buf = y * 2
+        buf.mul_(grad_output)
+        return buf
 
 
 @_allow_in_graph
@@ -1162,10 +1168,13 @@ class Where(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
     ) -> tuple[None, torch.Tensor, torch.Tensor]:
         (condition,) = ctx.saved_tensors
-        # Bool * float promotes False->0, True->1 — gradient routing without
-        # allocating intermediate zero tensors.
-        grad_a = unbroadcast(grad_output * condition, ctx.a_shape)
-        grad_b = unbroadcast(grad_output * (~condition), ctx.b_shape)
+        # `torch.where(condition, grad_output, 0)` routes the grad to whichever
+        # operand was selected, in one kernel. The naive
+        # `grad_output * condition` / `grad_output * (~condition)` form needs
+        # to allocate the bool `~condition` tensor and rely on bool*float
+        # promotion. Using torch.where with a scalar fall-through skips both.
+        grad_a = unbroadcast(torch.where(condition, grad_output, 0), ctx.a_shape)
+        grad_b = unbroadcast(torch.where(condition, 0, grad_output), ctx.b_shape)
         return None, grad_a, grad_b  # condition is bool, non-differentiable
 
 
