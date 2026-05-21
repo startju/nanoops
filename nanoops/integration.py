@@ -42,12 +42,6 @@ import torch.utils.checkpoint as _ckpt
 import nanoops.functional as nF
 
 
-# Captured at patch time so the L-attn checkpoint wrapper can call the
-# un-patched original CausalSelfAttention.forward. Stays None when the
-# env var isn't set (no patching applied at all).
-_orig_attn_forward = None
-
-
 _F_OVERRIDES = {
     "linear": nF.linear,
     "embedding": nF.embedding,
@@ -100,29 +94,6 @@ def _mlp_inner(self, x):
     x = nF.relu_square(x)
     x = self.c_proj(x)
     return x
-
-
-def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
-    """Activation-checkpoint the full-attention (L) layers when
-    NANOOPS_L_ATTN_CHECKPOINT=1. Only checkpoints the L layers (the
-    finite-window S layers already use chunked SDPA with LSE-only ctx
-    so they're cheap to keep). For d24+B=1 single-GPU, this is the last
-    headroom needed before hitting the 24 GiB ceiling — CPU offload
-    handles optim state, MLP_CHECKPOINT handles MLP activations, and
-    this checkpoints the remaining L-attn activations.
-
-    Inference paths (kv_cache present) bypass the checkpoint.
-    """
-    if (
-        os.environ.get("NANOOPS_L_ATTN_CHECKPOINT")
-        and kv_cache is None
-        and (window_size[0] < 0 or window_size[0] >= x.size(1))
-    ):
-        return _ckpt.checkpoint(
-            _orig_attn_forward, self, x, ve, cos_sin, window_size, kv_cache,
-            use_reentrant=False,
-        )
-    return _orig_attn_forward(self, x, ve, cos_sin, window_size, kv_cache)
 
 
 def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
@@ -259,17 +230,6 @@ def _apply() -> dict[str, dict]:
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
-    # L-layer activation checkpoint (opt-in via NANOOPS_L_ATTN_CHECKPOINT=1).
-    # The patch is always installed; the env-var check inside the wrapper
-    # decides whether to actually checkpoint. Single-GPU d24 needs this
-    # on top of CPU offload + MLP checkpoint to clear the OOM cliff.
-    global _orig_attn_forward
-    assert _orig_attn_forward is None, (
-        "_orig_attn_forward already captured — call _restore() before _apply()"
-    )
-    _orig_attn_forward = gpt_mod.CausalSelfAttention.forward
-    originals["method"][("nanochat.gpt", "CausalSelfAttention", "forward")] = _orig_attn_forward
-    gpt_mod.CausalSelfAttention.forward = _patched_l_attn_forward
     # Sliding window SDPA: always ON (measured +6.2% tok/sec and -10.4%
     # peak memory at B=2 on nanchat d20, RTX 3090). Patched
     # _sdpa_attention falls through to the original SDPA call for full
@@ -315,9 +275,8 @@ def _restore(originals: dict[str, dict]) -> None:
     for (modname, cls_name, method_name), original in originals["method"].items():
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
-    global _PATCHED, _orig_attn_forward
+    global _PATCHED
     _PATCHED = False
-    _orig_attn_forward = None
 
 
 def patch_nanchat() -> list[str]:
@@ -335,8 +294,6 @@ def patch_nanchat() -> list[str]:
     names.append("_sdpa_attention(full-attn → chunked sliding, default)")
     if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
         names.append("MuonAdamW/DistMuonAdamW(CPU optim state offload)")
-    if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
-        names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
     return names
 
 
