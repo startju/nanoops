@@ -654,13 +654,17 @@ applied to attention.
 **Forward** (PyTorch row-vector convention, features on the last dim):
 
 $$
-S = \frac{Q K^T}{\sqrt{d_k}}, \qquad P = \text{softmax}(S, \text{dim}=-1), \qquad O = P V
+S = \frac{Q K^T}{\sqrt{d_k}} + M, \qquad P = \text{softmax}(S, \text{dim}=-1), \qquad O = P V
 $$
 
 Shapes: $Q \in \mathbb{R}^{... \times L \times d_k}$, $K \in \mathbb{R}^{... \times S \times d_k}$,
 $V \in \mathbb{R}^{... \times S \times d_v}$, $O \in \mathbb{R}^{... \times L \times d_v}$.
-Optional causal/attn_mask sets entries of $S$ to $-\infty$ before softmax;
-masked entries become exactly $0$ in $P$.
+
+$M \in \{0, -\infty\}^{L \times S}$ is the **additive mask** — $0$ at kept
+positions, $-\infty$ at blocked positions. Both `is_causal=True` (lower
+triangular) and `attn_mask` (bool → $\{0, -\infty\}$, or float → as-is)
+collapse into this same additive form before softmax. Wherever $M_{ij} = -\infty$,
+the corresponding $P_{ij} = e^{-\infty} / Z = 0$ exactly.
 
 **Backward.** Given upstream $g = \partial L / \partial O$, we chain through
 three operations. None of the steps require materializing the Jacobians — every
@@ -687,15 +691,32 @@ The sum-correction is the part that makes softmax-backward dense — every outpu
 probability depends on every input score (they all share the same denominator),
 so the gradient must subtract a row-shared scalar.
 
-**Why masks don't need special-case handling.** At masked positions $P_{ij} = 0$,
-so $\partial L / \partial S_{ij} = P_{ij} \cdot (\dots) = 0$. The gradient is
-naturally zero there — no extra masking needed in backward.
+**Mask cancellation is built into this line.** Look at the factor $P$ on the
+outside: it multiplies *every* entry of $\partial L / \partial S$. At masked
+positions $P_{ij} = 0$ (from forward), so
 
-*Step 3: through $S = QK^T / \sqrt{d_k}$.* Two matmul backwards, scaled:
+$$
+\left(\frac{\partial L}{\partial S}\right)_{ij} = \underbrace{P_{ij}}_{= 0} \cdot \bigl(\dots\bigr) = 0 \qquad \text{whenever } M_{ij} = -\infty
+$$
+
+The mask's effect propagates through backward **automatically** — `P` carries
+the zero forward, then re-emits it as a zero gradient. No re-masking, no
+`masked_fill` on the gradient side, no conditional code. This is why the
+softmax + mask pairing is so clean: $P$ acts as both the forward output *and*
+the backward gate.
+
+*Step 3: through $S = (QK^T / \sqrt{d_k}) + M$.* $M$ is constant w.r.t.
+$Q, K$, so $\partial S / \partial (QK^T / \sqrt{d_k}) = I$ — the mask drops
+out and the chain rule is exactly the two scaled matmul backwards:
 
 $$
 \frac{\partial L}{\partial Q} = \frac{1}{\sqrt{d_k}} \frac{\partial L}{\partial S} \cdot K, \qquad \frac{\partial L}{\partial K} = \frac{1}{\sqrt{d_k}} \left(\frac{\partial L}{\partial S}\right)^T \! Q
 $$
+
+Because $\partial L / \partial S$ already has zeros at the masked positions
+(from Step 2), the matmul above naturally **doesn't pull gradient from**
+$K_j$ (for $\partial L / \partial Q_i$) or $Q_i$ (for $\partial L / \partial K_j$)
+whenever $(i, j)$ is masked — the contribution is $0 \cdot \text{something} = 0$.
 
 Boxing the final closed-form:
 

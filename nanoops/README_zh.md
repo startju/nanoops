@@ -600,13 +600,16 @@ autograd.Function，反向是穿过三层的闭式 chain rule。和 `CrossEntrop
 **Forward**（PyTorch 行向量约定，feature 在最后一维）：
 
 $$
-S = \frac{Q K^T}{\sqrt{d_k}}, \qquad P = \text{softmax}(S, \text{dim}=-1), \qquad O = P V
+S = \frac{Q K^T}{\sqrt{d_k}} + M, \qquad P = \text{softmax}(S, \text{dim}=-1), \qquad O = P V
 $$
 
 Shape：$Q \in \mathbb{R}^{... \times L \times d_k}$，$K \in \mathbb{R}^{... \times S \times d_k}$，
 $V \in \mathbb{R}^{... \times S \times d_v}$，$O \in \mathbb{R}^{... \times L \times d_v}$。
-可选 causal/attn_mask 在 softmax 前把 $S$ 的相应位置设为 $-\infty$，softmax 后
-$P$ 在这些位置就是 $0$。
+
+$M \in \{0, -\infty\}^{L \times S}$ 是**加性 mask**——保留位置为 $0$，屏蔽
+位置为 $-\infty$。`is_causal=True`（下三角）和 `attn_mask`（bool $\to \{0, -\infty\}$，
+或 float 直接用）在 softmax 前都统一成这种加性形式。凡是 $M_{ij} = -\infty$
+的位置，对应的 $P_{ij} = e^{-\infty} / Z = 0$。
 
 **Backward.** 给定上游 $g = \partial L / \partial O$，分三步穿过三个算子。
 每一步要么是单次 matmul，要么是闭式 softmax-pullback，**不需要物化任何 Jacobian**。
@@ -632,15 +635,30 @@ $$
 sum-correction 那一项是 softmax-backward「稠密」的原因——每个输出概率都
 依赖所有输入分数（分母共享），所以梯度必须减掉一个按行共享的标量。
 
-**为什么 mask 不需要在 backward 里做特别处理。** 被掩位置 $P_{ij} = 0$，
-所以 $\partial L / \partial S_{ij} = P_{ij} \cdot (\dots) = 0$。梯度天然就是 0
-——backward 里不需要再做一次 mask。
+**mask 抵消就藏在这一行里。** 注意外面那个 $P$ 因子——它乘到
+$\partial L / \partial S$ 的**每一个**位置上。在被掩位置（forward 时
+$P_{ij} = 0$）：
 
-*第三步：穿过 $S = QK^T / \sqrt{d_k}$。* 两次 matmul-backward，带 scale：
+$$
+\left(\frac{\partial L}{\partial S}\right)_{ij} = \underbrace{P_{ij}}_{= 0} \cdot \bigl(\dots\bigr) = 0 \qquad \text{当 } M_{ij} = -\infty
+$$
+
+mask 的效果**自动**穿过 backward —— `P` 把零从前向带过来，再以零梯度发出去。
+**不需要在反向再做一次 mask、不需要 `masked_fill`、不需要 if 分支**。这就是
+softmax + mask 这一对儿干净的原因：$P$ 同时充当了前向输出**和**反向门控。
+
+*第三步：穿过 $S = (QK^T / \sqrt{d_k}) + M$。* $M$ 对 $Q, K$ 是常数，所以
+$\partial S / \partial (QK^T / \sqrt{d_k}) = I$ —— mask 自动消失，链式法则
+就是两次带 scale 的 matmul-backward：
 
 $$
 \frac{\partial L}{\partial Q} = \frac{1}{\sqrt{d_k}} \frac{\partial L}{\partial S} \cdot K, \qquad \frac{\partial L}{\partial K} = \frac{1}{\sqrt{d_k}} \left(\frac{\partial L}{\partial S}\right)^T \! Q
 $$
+
+因为 $\partial L / \partial S$ 在被掩位置已经是 0（从第二步带过来），所以
+上面这两个 matmul **自然不会**从 $K_j$（对 $\partial L / \partial Q_i$）或
+$Q_i$（对 $\partial L / \partial K_j$）拉梯度，只要 $(i, j)$ 被 mask——贡献是
+$0 \cdot \text{something} = 0$。
 
 把闭式最终结果框起来：
 
