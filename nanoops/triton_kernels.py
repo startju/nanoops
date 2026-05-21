@@ -120,7 +120,11 @@ if _HAS_TRITON:
                 w_ptrs,
                 mask=col_mask[:, None] & k_mask[None, :], other=0.0,
             ).to(tl.float32)
-            acc += tl.dot(x_hat, tl.trans(w))
+            # input_precision="ieee" disables Triton's default TF32 downcast
+            # on Ampere. TF32 has only 10-bit mantissa, while PyTorch's `@`
+            # keeps full fp32 (under default torch.set_float32_matmul_precision
+            # = "highest") — without this flag, fp32 parity drifts by ~1%.
+            acc += tl.dot(x_hat, tl.trans(w), input_precision="ieee")
 
         # Save z (pre-relu²) for backward — backward reads it to compute
         # 2 * relu(z) * dy. Storing in fp32 keeps the sign info exact.
@@ -285,7 +289,11 @@ class NormMLPReluSquare(torch.autograd.Function):
             f"fc out dim {N_fc} != proj in dim {N_proj_in}"
         )
 
-        BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 64
+        # Block sizes chosen to fit 3090's 100 KB shared memory per SM.
+        # Larger tiles = better arithmetic intensity but need room for
+        # x_hat (BLOCK_M×BLOCK_K) + w slab (BLOCK_N×BLOCK_K) + acc
+        # (BLOCK_M×BLOCK_N), all in fp32. 32×64×32 → ~16 KB total.
+        BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
         # r will hold relu(z)² (the c_fc output post-activation). We
         # materialize it because c_proj is done by torch.matmul.
         r = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
