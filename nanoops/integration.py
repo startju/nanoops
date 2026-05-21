@@ -86,6 +86,55 @@ def _patched_mlp_forward(self, x):
     x = self.c_proj(x)
     return x
 
+
+def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
+    """Replacement for nanchat.flash_attention._sdpa_attention that routes
+    finite sliding-window cases to nanoops's SlidingWindowSDPA.
+
+    For full-attention paths (window < 0 or window >= Tq) and single-token
+    inference (Tq == 1), falls through to the original explicit-mask SDPA
+    via the patched F namespace. Only the sliding case (where the original
+    builds an explicit L×L mask and hands it to one big SDPA call) is
+    redirected — that's where chunked attention can save FLOPs.
+    """
+    Tq = q.size(2)
+    Tk = k.size(2)
+    window = window_size[0]
+
+    # Full context, same length — same path as original.
+    if (window < 0 or window >= Tq) and Tq == Tk:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa
+        )
+
+    # Single token generation — same path as original (left-trim k/v).
+    if Tq == 1:
+        if window >= 0 and window < Tk:
+            start = max(0, Tk - (window + 1))
+            k = k[:, :, start:, :]
+            v = v[:, :, start:, :]
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=False, enable_gqa=enable_gqa
+        )
+
+    # Sliding window during training (Tq == Tk, finite window) — chunked path.
+    if Tq == Tk and window >= 0 and window < Tq:
+        # window is "left tokens we include" (window+1 keys total per query).
+        return nF.sliding_window_sdpa(q, k, v, window + 1)
+
+    # Cached generation with chunk inference (Tq != Tk) — build explicit mask
+    # and fall back to one big SDPA call (sliding_window_sdpa assumes Tq == Tk).
+    device = q.device
+    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    mask = col_idx <= row_idx
+    if window >= 0 and window < Tk:
+        mask = mask & ((row_idx - col_idx) <= window)
+    return torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, enable_gqa=enable_gqa
+    )
+
+
 _TARGET_MODULES = [
     # nanchat modules — call F.* directly
     "nanochat.gpt",
@@ -141,6 +190,15 @@ def _apply() -> dict[str, dict]:
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
+    # Sliding window SDPA (opt-in via env var): swap
+    # nanchat.flash_attention._sdpa_attention so sliding training layers
+    # use nF.sliding_window_sdpa instead of one big SDPA call + L×L mask.
+    if os.environ.get("NANOOPS_SLIDING_WINDOW"):
+        fa_mod = importlib.import_module("nanochat.flash_attention")
+        originals["module_func"][("nanochat.flash_attention", "_sdpa_attention")] = (
+            fa_mod._sdpa_attention
+        )
+        fa_mod._sdpa_attention = _patched_sdpa_attention
     return originals
 
 
@@ -159,12 +217,15 @@ def _restore(originals: dict[str, dict]) -> None:
 def patch_nanchat() -> list[str]:
     """Permanently swap nanoops into nanchat. Returns the list of patched op names."""
     _apply()
-    return (
+    names = (
         [f"F.{n}" for n in _F_OVERRIDES]
         + [f"torch.{n}" for n in _TORCH_OVERRIDES]
         + [f"{mod}.{attr}" for mod, attr in _MODULE_FUNC_OVERRIDES]
         + ["MLP.forward(relu_square fused)"]
     )
+    if os.environ.get("NANOOPS_SLIDING_WINDOW"):
+        names.append("nanochat.flash_attention._sdpa_attention(sliding_window_sdpa)")
+    return names
 
 
 def maybe_patch_nanchat(env_var: str = "NANOOPS") -> bool:
