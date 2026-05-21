@@ -21,11 +21,18 @@ source .venv/bin/activate
 export NANOOPS=1
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
-# expandable_segments unfragments PyTorch's caching allocator. With this
-# off, the 1-2 GiB of "reserved but unallocated" memory at B=4 prevents
+# expandable_segments unfragments PyTorch's caching allocator. Without
+# it, the 1-2 GiB of "reserved but unallocated" memory at B=4 prevents
 # the last needed allocation and OOMs the run, even though SlidingWindowSDPA
 # saves ~2 GiB of P-matrix peak. Setting it lets B=4 fit at ~23.4/24 GiB.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Newer PyTorch (≥ 2.5) renamed PYTORCH_CUDA_ALLOC_CONF → PYTORCH_ALLOC_CONF
+# and warns if you only set the old name (which is what bit our first d24
+# full run — the var was silently ignored and fragmentation OOM'd at iter 3).
+# Set BOTH so we work on either side of the rename. max_split_size_mb=128
+# caps any single allocator block at 128 MiB so a few big allocs can't
+# starve smaller ones via fragmentation.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$PYTORCH_ALLOC_CONF}"
 # MLP activation checkpoint ON by default — at B=4 it saves ~3.7 GiB of
 # MLP intermediate activations (relu output + relu² output + the
 # c_fc/c_proj Mm input ctxs) for a +7% wall-time cost (one extra MLP
