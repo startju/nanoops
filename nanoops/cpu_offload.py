@@ -167,12 +167,8 @@ def patched_step_adamw(self, group):
     """CPU-offloaded version of MuonAdamW._step_adamw (single-GPU path)."""
     from nanochat.optim import adamw_step_fused
 
-    # Same fragmentation argument as patched_step_muon below: 256 fwd+bwd
-    # cycles leave the allocator's cache scattered into small/medium
-    # blocks; the AdamW H2D needs contiguous space per param. AdamW
-    # alloc per param is smaller than Muon's full-buffer H2D, so OOM
-    # risk is lower — but empty_cache here is cheap (a few ms) and
-    # ensures _step_muon (which usually runs next) also starts clean.
+    # empty_cache at start: returns the 256-fwd+bwd allocator cache to
+    # the driver so the per-param H2D copies can find contiguous space.
     torch.cuda.empty_cache()
 
     for p in group['params']:
@@ -209,6 +205,14 @@ def patched_step_adamw(self, group):
 
         state['exp_avg'].copy_(exp_avg_g, non_blocking=True)
         state['exp_avg_sq'].copy_(exp_avg_sq_g, non_blocking=True)
+        # Drop the per-param GPU transient so the allocator can return
+        # its block to the driver in the empty_cache() at function exit.
+        del exp_avg_g, exp_avg_sq_g
+
+    # empty_cache at end: same rationale as patched_step_muon — release
+    # the AdamW transient blocks back to the driver so the next 256
+    # fwd+bwd cycles get a clean allocator.
+    torch.cuda.empty_cache()
 
 
 def patched_step_muon(self, group):

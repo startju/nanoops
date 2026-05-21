@@ -58,6 +58,134 @@ NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"
 if _HAS_TRITON:
 
     @triton.jit
+    def _norm_mlp_block_fwd_kernel(
+        x_ptr, norm_w_ptr, fc_w_ptr, proj_w_ptr, residual_ptr,
+        y_ptr, z_ptr, rms_inv_ptr,
+        M, N_fc, K, K_out,
+        eps,
+        stride_xm, stride_xk,
+        stride_fc_n, stride_fc_k,
+        stride_proj_p, stride_proj_n,
+        stride_res_m, stride_res_p,
+        stride_ym, stride_yp,
+        stride_zm, stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K_OUT: tl.constexpr,    # tile size along the output (= K_out) dim of c_proj
+        BLOCK_N: tl.constexpr,        # tile size along the c_fc output / c_proj input dim
+        BLOCK_K: tl.constexpr,        # tile size along input K dim (for RMSNorm + c_fc matmul)
+    ):
+        """Fully fused MLP block + residual:
+            y = residual + relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T
+
+        Each program computes one (BLOCK_M, BLOCK_K_OUT) tile of y.
+        Streams the N_fc dim (c_fc output / c_proj input) in BLOCK_N
+        chunks: per chunk we recompute the (BLOCK_M, BLOCK_N) slab of
+        r = relu(x_hat @ W_fc[N_chunk].T)², then accumulate
+        r @ W_proj[K_out_tile, N_chunk].T into the output. The r slab
+        lives only in registers — never written to HBM.
+
+        This is the "two-matmul fused" pattern (analogous to attention's
+        Q@K^T → softmax → @V). Saves the M*N_fc HBM round-trip the
+        non-fused version paid for materializing r.
+        """
+        pid_m = tl.program_id(0)
+        pid_p = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        out_cols = pid_p * BLOCK_K_OUT + tl.arange(0, BLOCK_K_OUT)
+        row_mask = rows < M
+        out_col_mask = out_cols < K_out
+
+        # Pass 1: per-row mean(x²) for the rows in this tile.
+        sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_mask = ks < K
+            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
+            x = tl.load(
+                x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            sum_sq += tl.sum(x * x, axis=1)
+        rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
+
+        # Only the p=0 tile writes rms_inv (it doesn't depend on p)
+        if pid_p == 0:
+            tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
+
+        # Output accumulator (BLOCK_M, BLOCK_K_OUT)
+        out_acc = tl.zeros((BLOCK_M, BLOCK_K_OUT), dtype=tl.float32)
+
+        # Outer loop over N_fc: compute r slab (BLOCK_M, BLOCK_N), then
+        # accumulate r_slab @ W_proj[out_cols, N_slab].T into out_acc.
+        for n_start in range(0, N_fc, BLOCK_N):
+            ns = n_start + tl.arange(0, BLOCK_N)
+            n_mask = ns < N_fc
+
+            # Inner: compute z_slab[BLOCK_M, BLOCK_N] = x_hat @ W_fc[ns, :].T
+            z_slab = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_start in range(0, K, BLOCK_K):
+                ks = k_start + tl.arange(0, BLOCK_K)
+                k_mask = ks < K
+                x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
+                x = tl.load(
+                    x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                ).to(tl.float32)
+                nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+                x_hat = x * rms_inv[:, None] * nw[None, :]
+                # W_fc shape (N_fc, K): row ns, col ks
+                fc_ptrs = (
+                    fc_w_ptr
+                    + ns[:, None] * stride_fc_n
+                    + ks[None, :] * stride_fc_k
+                )
+                fc_w = tl.load(
+                    fc_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                ).to(tl.float32)
+                z_slab += tl.dot(x_hat, tl.trans(fc_w), input_precision="ieee")
+
+            # relu² elementwise in registers
+            relu_z = tl.where(z_slab > 0.0, z_slab, 0.0)
+            r_slab = relu_z * relu_z  # (BLOCK_M, BLOCK_N) — never to HBM
+
+            # Optionally store z_slab to HBM for backward (we need z, not r,
+            # because z gives us the relu mask + sign info for relu²-bwd).
+            z_ptrs = z_ptr + rows[:, None] * stride_zm + ns[None, :] * stride_zn
+            tl.store(
+                z_ptrs,
+                z_slab.to(z_ptr.dtype.element_ty),
+                mask=row_mask[:, None] & n_mask[None, :],
+            )
+
+            # out_acc += r_slab @ W_proj[out_cols, ns].T
+            # W_proj shape (K_out, N_fc): row out_cols, col ns
+            proj_ptrs = (
+                proj_w_ptr
+                + out_cols[:, None] * stride_proj_p
+                + ns[None, :] * stride_proj_n
+            )
+            proj_w = tl.load(
+                proj_ptrs,
+                mask=out_col_mask[:, None] & n_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            out_acc += tl.dot(r_slab, tl.trans(proj_w), input_precision="ieee")
+
+        # Add residual and write y
+        res_ptrs = residual_ptr + rows[:, None] * stride_res_m + out_cols[None, :] * stride_res_p
+        residual = tl.load(
+            res_ptrs,
+            mask=row_mask[:, None] & out_col_mask[None, :], other=0.0,
+        ).to(tl.float32)
+        y_final = residual + out_acc
+
+        y_ptrs = y_ptr + rows[:, None] * stride_ym + out_cols[None, :] * stride_yp
+        tl.store(
+            y_ptrs,
+            y_final.to(y_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & out_col_mask[None, :],
+        )
+
+
+    @triton.jit
     def _norm_linear_relu_square_fwd_kernel(
         x_ptr, norm_w_ptr, lin_w_ptr,
         y_ptr, z_ptr, rms_inv_ptr,
