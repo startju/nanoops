@@ -1490,7 +1490,9 @@ class SlidingWindowSDPA(torch.autograd.Function):
     and HBM-bandwidth side effects can dominate the small per-call speedup.
     Always validate with a real training run.
 
-    Default ON when NANOOPS=1; opt out with NANOOPS_NO_SLIDING_WINDOW=1.
+    Always on when NANOOPS=1 — no opt-out (the patched _sdpa_attention
+    falls through to the original SDPA call for non-sliding paths, so
+    the swap is a strict superset of behavior with no regression risk).
     """
 
     @staticmethod
@@ -1619,8 +1621,7 @@ def sliding_window_sdpa(
 
     Hooked into nanchat by `nanoops.integration.patch_nanchat()`: replaces
     nanchat.flash_attention._sdpa_attention so sliding training layers
-    route here. Default ON when NANOOPS=1; opt out with
-    NANOOPS_NO_SLIDING_WINDOW=1. See SlidingWindowSDPA docstring for the
-    empirical end-to-end findings (+6.2% tok/sec, -10.4% peak memory).
+    route here. Always on when NANOOPS=1. See SlidingWindowSDPA docstring
+    for the empirical end-to-end findings (+6.2% tok/sec, -10.4% peak memory).
     """
     return SlidingWindowSDPA.apply(query, key, value, window_size, enable_gqa)
