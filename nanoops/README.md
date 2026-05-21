@@ -666,16 +666,10 @@ triangular) and `attn_mask` (bool → $\{0, -\infty\}$, or float → as-is)
 collapse into this same additive form before softmax. Wherever $M_{ij} = -\infty$,
 the corresponding $P_{ij} = e^{-\infty} / Z = 0$ exactly.
 
-**Why additive and not multiplicative?** The cleanest multiplicative form
-that actually gets the right numerics is **sign-conditional**: at masked
-positions, pick $M_{ij} = -\text{sign}(S_{ij}) \cdot \infty$ so $S_{ij} \cdot
-M_{ij} = -\infty$ regardless of which side of zero $S_{ij}$ lands on. (A
-naive uniform $M \in \{-\infty, 1\}$ fails immediately: $S_{ij} \cdot
-(-\infty)$ is $-\infty$ only when $S_{ij} > 0$, becomes $+\infty$ when
-$S_{ij} < 0$, and NaN when $S_{ij} = 0$. Since attention scores are
-unrestricted reals, this blows up most rows.)
-
-The sign-conditional version *does* recover the same masked $P_{ij} = 0$.
+**Why not a sign-conditional multiplicative mask?** A reader might propose:
+since attention scores are signed reals, pick $M_{ij} = -\text{sign}(S_{ij}) \cdot
+\infty$ at masked positions so $S_{ij} \cdot M_{ij} = -\infty$ regardless of
+which side of zero $S_{ij}$ lands on. That recovers the same $P_{ij} = 0$.
 But it's strictly worse than additive on every axis:
 
 - **$S_{ij} = 0$ has no valid $M$**: $0 \times \infty = \text{NaN}$ regardless of sign. Needs a separate special case (or an epsilon hack); the additive form doesn't.
@@ -684,9 +678,8 @@ But it's strictly worse than additive on every axis:
 - **Backward gets a phantom $M(S, \text{mask})$ path** unless you wrap $M$ in `stop_grad`, at which point you're hiding what's really an additive mask under a multiplicative façade.
 - **No algebraic story**: doesn't connect to log-sum-exp / cross-entropy fusion / FlashAttention LSE.
 
-**Additive is canonical because it's the operation softmax was built to
-compose with.** $-\infty$ is the absorbing element for $\max$ / softmax for
-*any* $S_{ij}$ — no sign branch, no $S=0$ corner case.
+$-\infty$ is the absorbing element for $\max$ / softmax for *any* $S_{ij}$ —
+no sign branch, no $S = 0$ corner case. Stick with additive.
 
 Three properties fall out of the additive choice:
 
@@ -702,13 +695,9 @@ Three properties fall out of the additive choice:
 
 There's a deeper algebraic reason: in log-space,
 $\log\text{softmax}(S + M) = (S + M) - \log\sum e^{S + M}$ — adding the mask
-to logits is the same operation as the log-sum-exp normalization. (Equivalently:
-multiplicative masking *does* work, but only in the exp domain — softmax(S) ⊙ m
-with $m \in \{0, 1\}$, which equals softmax($S + \log m$) since $\log 0 = -\infty$
-and $\log 1 = 0$. So "multiplicative mask done right" reduces to additive
-masking.) Same trick makes log-sum-exp stable, makes cross-entropy fusable
-with logsoftmax, and makes the FlashAttention $L = \log\sum e^S$ stat
-sufficient for backward.
+to logits is the same operation as the log-sum-exp normalization. Same trick
+makes log-sum-exp stable, makes cross-entropy fusable with logsoftmax, and
+makes the FlashAttention $L = \log\sum e^S$ stat sufficient for backward.
 
 **Backward.** Given upstream $g = \partial L / \partial O$, we chain through
 three operations. None of the steps require materializing the Jacobians — every
