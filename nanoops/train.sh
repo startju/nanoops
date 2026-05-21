@@ -3,7 +3,7 @@
 #
 # What this does: sets NANOOPS=1 (the env var that scripts/base_train.py
 # reads to call nanoops.integration.patch_nanchat() at startup), then
-# launches the same d20 base-training command speedrun.sh uses.
+# launches a d24 base-training run sized for 2× RTX 3090.
 #
 # Usage:
 #   bash nanoops/train.sh                       # defaults below
@@ -38,28 +38,23 @@ NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
 
 torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
-    --depth=20 \
+    --depth=24 \
     --target-param-data-ratio=8 \
-    --device-batch-size=4 \
+    --device-batch-size=1 \
     --run=$WANDB_RUN \
     "$@"
-# device-batch-size=4 (matches speedrun) is possible on 24 GiB cards
-# because three optimizations stack:
-#   1. SlidingWindowSDPA (default ON): cuts ~2 GiB of P-matrix peak
-#      across the 15 sliding layers
-#   2. expandable_segments=True (set above): recovers ~1-2 GiB lost to
-#      allocator fragmentation
-#   3. NANOOPS_MLP_CHECKPOINT=1 (set above): cuts ~3.7 GiB of MLP
-#      activations for +7% wall time (0.62 s/GiB freed)
-# Measured on 2× RTX 3090, d20:
-#   tok/sec ~30,500, MFU ~62%, peak ~19 GiB, dt ~34s, ETA ~31h.
-# (Without MLP_CHECKPOINT it'd be ~32,700 tok/s + 22.7 GiB peak / 29h ETA,
-# but the freed memory is what lets deeper runs / larger seq-len fit.)
+# --depth=24 / device-batch-size=1 on 2× RTX 3090 (24 GiB each):
+# d24 auto-widens to D=1536, n_layer=24, ~1.5B params, ~1.67× heavier than
+# d20. Even with all three optimizations active (sliding window +
+# expandable_segments + MLP_CHECKPOINT) only B=1 fits — B=2 OOMs by ~20 MiB,
+# B=4 OOMs by ~1 GiB.
 #
-# Depth scaling notes (on 2× RTX 3090, 24 GiB each):
-#   --depth=20: B=4 fits comfortably (this default)
-#   --depth=22: untested, likely B=2
-#   --depth=24: only B=1 fits (~22.3 GiB peak, MFU drops to ~53%, 2× slower)
-#               — auto-config widens to D=1536 and 1.67× params, too much
-#               for 24 GiB cards even with all the optimizations on.
-# Drop --device-batch-size for tighter memory.
+# Measured numbers at d24 + B=1:
+#   tok/sec  ~15,800
+#   MFU       ~53% (B=1 micro-batches don't saturate GEMMs)
+#   dt        ~66.5 s/iter (256 grad-accum steps × 270 ms)
+#   peak mem  ~22.3 GiB (1.7 GiB headroom)
+#   ETA       ~61 h for full 3320-iter run
+#
+# Drop to --depth=20 --device-batch-size=4 for the throughput sweet spot
+# (~30.5k tok/s, ~31h ETA, much better MFU).
