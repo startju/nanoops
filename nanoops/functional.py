@@ -1551,7 +1551,12 @@ class SlidingWindowSDPA(torch.autograd.Function):
 
         output = torch.empty_like(query)
         chunk_info = []
-        probs_list = []
+        # Flash-style: save only LSE per chunk, not the full P matrix.
+        # Each LSE is (..., q_sz, 1) — 1 / k_sz the size of P. We re-derive
+        # P in backward from `(scores - lse).exp()`. The cost: 1 extra
+        # Q @ K^T matmul per chunk in backward; the saving: ~k_sz× less
+        # ctx memory per chunk (~700-900 MB total at nanchat d24 scale).
+        lse_list = []
 
         for q_start in range(0, L, C):
             q_end = min(q_start + C, L)
@@ -1575,27 +1580,33 @@ class SlidingWindowSDPA(torch.autograd.Function):
             mask = (j_idx <= i_idx) & (j_idx >= i_idx - W + 1)
             scores.masked_fill_(~mask, float("-inf"))
 
-            probs = torch.softmax(scores, dim=-1)
+            # logsumexp ignores -inf entries (exp(-inf) = 0). Save LSE for
+            # the backward pass; derive P = exp(scores - lse) right here as
+            # a transient to form `output = P @ V`, but don't save P.
+            lse = scores.logsumexp(dim=-1, keepdim=True)        # (..., q_sz, 1)
+            probs = (scores - lse).exp()                         # transient
             output[..., q_start:q_end, :] = probs @ v_blk
 
             chunk_info.append((q_start, q_end, k_start, k_end))
-            probs_list.append(probs)
+            lse_list.append(lse)
 
-        ctx.save_for_backward(query, key, value, *probs_list)
+        ctx.save_for_backward(query, key, value, *lse_list)
         ctx.chunk_info = chunk_info
         ctx.scale = scale_val
         ctx.n_chunks = len(chunk_info)
         ctx.G = G
+        ctx.window_size = W  # backward needs W to reconstruct the mask
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         saved = ctx.saved_tensors
         query, key, value = saved[0], saved[1], saved[2]
-        probs_list = saved[3:]
+        lse_list = saved[3:]
         chunk_info = ctx.chunk_info
         scale_val = ctx.scale
         G = ctx.G
+        W = ctx.window_size
 
         # Re-expand K/V to match Q's head count for the chunked matmuls;
         # collapse back at the end. Same pattern as in ScaledDotProductAttention.
@@ -1617,11 +1628,29 @@ class SlidingWindowSDPA(torch.autograd.Function):
         grad_key_e = torch.zeros_like(key_e)
         grad_value_e = torch.zeros_like(value_e)
 
-        for (q_start, q_end, k_start, k_end), probs in zip(chunk_info, probs_list):
+        for (q_start, q_end, k_start, k_end), lse in zip(chunk_info, lse_list):
             q_blk = query[..., q_start:q_end, :]
             k_blk = key_e[..., k_start:k_end, :]
             v_blk = value_e[..., k_start:k_end, :]
             g_out_blk = grad_output[..., q_start:q_end, :]
+
+            # Flash-style: re-materialize P from the saved LSE and a fresh
+            # Q@K^T matmul. This is the price of not having P in ctx — one
+            # extra (q_sz, k_sz) matmul per chunk. P lives only for the
+            # duration of this chunk's backward block, then is freed.
+            scores = q_blk @ k_blk.transpose(-2, -1)
+            scores.mul_(scale_val)
+            # Reconstruct the SAME sliding+causal mask the forward used.
+            q_sz = q_end - q_start
+            k_sz = k_end - k_start
+            i_idx = torch.arange(q_sz, device=query.device).unsqueeze(1) + q_start
+            j_idx = torch.arange(k_sz, device=query.device).unsqueeze(0) + k_start
+            mask = (j_idx <= i_idx) & (j_idx >= i_idx - W + 1)
+            scores.masked_fill_(~mask, float("-inf"))
+            # P = exp(scores - LSE) — numerically stable because scores ≤ LSE
+            # row-wise by construction; equivalent to softmax(scores) but
+            # uses the LSE we already paid for in forward.
+            probs = (scores - lse).exp()
 
             grad_v_blk = probs.transpose(-2, -1) @ g_out_blk
             grad_probs = g_out_blk @ v_blk.transpose(-2, -1)

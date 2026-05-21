@@ -40,14 +40,13 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$PYTORCH_ALLOC_CONF}"
 # ATTN checkpoint's 0.96 s/GiB. The freed headroom is what lets larger
 # --depth runs fit on a 24 GiB card. Opt out by unsetting before bash.
 export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
-# L (full-attention) layer activation checkpoint ON by default — without
-# it, d24+B=1 reliably OOMs at iter 3-6 from allocator fragmentation
-# (the 1.35 GiB reserved-but-unallocated pool blocks the 192 MiB alloc
-# training needs). With it, training reaches iter 11+ healthy on the same
-# hardware. Only the ~6 full-attention layers per d24 SSSL run get
-# checkpointed; the 18 sliding-window layers already use the memory-
-# friendly chunked SDPA and are left alone. Opt out with empty value.
-export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
+# Attention activation checkpoint — was needed when SlidingWindowSDPA
+# saved per-chunk P matrices (~900 MB ctx on d24). SlidingWindowSDPA
+# now uses the Flash-style LSE-only ctx (saves just one (..., q_sz, 1)
+# log-sum-exp per chunk, re-derives P in backward from Q@K^T + LSE), so
+# this checkpoint is largely redundant. Left OFF by default — set to 1
+# if a deeper config still hits OOM.
+# export NANOOPS_L_ATTN_CHECKPOINT=1
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}

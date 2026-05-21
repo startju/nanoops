@@ -102,20 +102,15 @@ def _mlp_inner(self, x):
 
 
 def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
-    """Wraps CausalSelfAttention.forward with torch.utils.checkpoint for
-    ALL attention layers (both sliding S and full L). Earlier this only
-    wrapped L layers — that's what the L_ prefix on the env var still
-    refers to — but the S layers' chunked SDPA P-matrix ctx (~38 MB/layer
-    × 18 layers = ~700 MB) is also significant on tight d24+B=1 budgets,
-    and recomputing it isn't dramatically more expensive than the L
-    layers'. Checkpointing both gives ~1 GiB more permanent headroom
-    that pushed d24+B=1 OOM past iter 22 (vs L-only's iter 22-ish OOM
-    cliff at exactly the 1.35 GiB fragmentation pool).
+    """Wraps CausalSelfAttention.forward with torch.utils.checkpoint when
+    NANOOPS_L_ATTN_CHECKPOINT=1. With SlidingWindowSDPA now using the
+    Flash-style LSE-only ctx (no P matrix saved), this checkpoint is
+    largely redundant — the ~900 MB of P-ctx it used to free is already
+    gone. Left in as a knob: future deeper / wider configs might still
+    benefit from also dropping the QKV/MLP-input activations, which
+    SDPA's LSE trick doesn't touch.
 
-    Train via `NANOOPS_L_ATTN_CHECKPOINT=1`. nanoops/train.sh exports it
-    by default, so user-facing default is ON; setting the var empty
-    disables. Only triggers during training (kv_cache is None).
-    Inference (kv_cache present) bypasses.
+    Only triggers during training (kv_cache is None). Inference bypasses.
     """
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and kv_cache is None:
         return _ckpt.checkpoint(
