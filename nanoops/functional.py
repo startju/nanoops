@@ -1460,11 +1460,18 @@ class SlidingWindowSDPA(torch.autograd.Function):
                                           +43.8% vs baseline       -30% dt
 
     The B=4 row needs both SlidingWindowSDPA (cuts the P-matrix peak so
-    B=4 doesn't immediately OOM) AND `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+    B=4 doesn't immediately OOM) AND `PYTORCH_ALLOC_CONF=expandable_segments:True`
     (recovers 1-2 GiB of allocator fragmentation that otherwise pushes
     the run past the 24 GiB ceiling). Either one alone leaves the run
     OOM at the first training iter. With both, peak settles at
     ~22.7/24 GiB — tight but stable. nanoops/train.sh sets both by default.
+    (The current train.sh default ALSO enables NANOOPS_MLP_CHECKPOINT=1,
+    which trades a +7% wall-time cost for ~3.7 GiB of MLP activation
+    memory savings — so the actual "today" stack at d20+B=4 is
+    ~30,500 tok/s / 19 GiB peak / ~31 h ETA. The +44% above is the
+    sliding-window stack's peak measurement; MLP checkpoint exists to
+    trade some of that wall time back for headroom that unlocks the
+    larger --depth=24 config.)
 
     Loss curves match across all rows to within ~6e-5 bf16 rounding noise.
 

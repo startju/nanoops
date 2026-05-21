@@ -91,7 +91,7 @@ bash nanoops/train.sh --depth=20 --device-batch-size=4
 
 # 自动设置的环境变量（train.sh 帮你 export）：
 #   NANOOPS=1                                       启用 nanoops 集成
-#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   回收碎片化内存
+#   PYTORCH_ALLOC_CONF=expandable_segments:True     回收碎片化内存
 #   NANOOPS_MLP_CHECKPOINT=1                        省 ~3.7 GiB peak
 #
 # Opt-in 实验开关：

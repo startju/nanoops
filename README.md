@@ -106,7 +106,7 @@ bash nanoops/train.sh --depth=20 --device-batch-size=4
 
 # Active env vars (set automatically by train.sh):
 #   NANOOPS=1                                       activates the integration
-#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   recovers fragmentation
+#   PYTORCH_ALLOC_CONF=expandable_segments:True     recovers fragmentation
 #   NANOOPS_MLP_CHECKPOINT=1                        ~3.7 GiB peak savings
 #
 # Opt-in experimental knobs:
