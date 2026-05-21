@@ -250,7 +250,13 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# NANOOPS_NO_COMPILE=1 skips torch.compile — frees ~1 GiB of CUDAGraph/
+# compile workspace which is critical for fitting d24+B=1 on a SINGLE
+# 24 GiB GPU (the optim-step transient peaks at 23.1 GiB with compile,
+# vs ~22 GiB without). Costs eager-mode dispatch overhead but lets
+# single-GPU training actually fit. 2-GPU runs don't need this.
+if not os.environ.get("NANOOPS_NO_COMPILE"):
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
