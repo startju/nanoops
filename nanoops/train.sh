@@ -43,12 +43,23 @@ torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
     --device-batch-size=4 \
     --run=$WANDB_RUN \
     "$@"
-# device-batch-size=4 (matches speedrun) is now possible because:
-#   1. SlidingWindowSDPA (default ON) cuts ~2 GiB of P-matrix peak
+# device-batch-size=4 (matches speedrun) is possible on 24 GiB cards
+# because three optimizations stack:
+#   1. SlidingWindowSDPA (default ON): cuts ~2 GiB of P-matrix peak
 #      across the 15 sliding layers
-#   2. expandable_segments=True (set above) recovers the 1-2 GiB lost
-#      to allocator fragmentation
-# Together these let B=4 fit at ~23.4/24 GiB on 2× RTX 3090, giving
-# ~33,000 tok/s, MFU 67% (vs B=2's 30,600 tok/s and the original
-# 22,700 tok/s baseline — total ~45% improvement on the stack).
-# Drop to --device-batch-size=2 if you OOM on tighter memory.
+#   2. expandable_segments=True (set above): recovers ~1-2 GiB lost to
+#      allocator fragmentation
+#   3. NANOOPS_MLP_CHECKPOINT=1 (set above): cuts ~3.7 GiB of MLP
+#      activations for +7% wall time (0.62 s/GiB freed)
+# Measured on 2× RTX 3090, d20:
+#   tok/sec ~30,500, MFU ~62%, peak ~19 GiB, dt ~34s, ETA ~31h.
+# (Without MLP_CHECKPOINT it'd be ~32,700 tok/s + 22.7 GiB peak / 29h ETA,
+# but the freed memory is what lets deeper runs / larger seq-len fit.)
+#
+# Depth scaling notes (on 2× RTX 3090, 24 GiB each):
+#   --depth=20: B=4 fits comfortably (this default)
+#   --depth=22: untested, likely B=2
+#   --depth=24: only B=1 fits (~22.3 GiB peak, MFU drops to ~53%, 2× slower)
+#               — auto-config widens to D=1536 and 1.67× params, too much
+#               for 24 GiB cards even with all the optimizations on.
+# Drop --device-batch-size for tighter memory.
