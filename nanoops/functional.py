@@ -594,7 +594,7 @@ class CrossEntropy(torch.autograd.Function):
         safe_target = torch.where(valid_mask, target, 0)
         target_idx = safe_target.unsqueeze(dim)
         per_sample = (log_sum_exp - input.gather(dim, target_idx)).squeeze(dim)
-        per_sample = per_sample * valid_mask  # 0 at ignored positions
+        per_sample.mul_(valid_mask)  # in-place: 0 at ignored positions
         # ─────────────────────────────────────────────────────────────────
         # CTX TRADE-OFF: valid_mask + target_idx are CHEAP to recompute in
         # backward (both derive from `target` + `ignore_index`):
@@ -1002,8 +1002,13 @@ class ScaledDotProductAttention(torch.autograd.Function):
             G = 1
             key_e, value_e = key, value
 
-        # scores = Q @ K^T * scale
-        scores = (query @ key_e.transpose(-2, -1)) * scale
+        # scores = Q @ K^T * scale. The matmul output is a fresh P-sized
+        # tensor with no other refs, so we apply scale in-place to avoid
+        # allocating a second P-sized tensor. Same in-place pattern is used
+        # for the mask steps below — each one keeps `scores` as the single
+        # P-sized buffer rather than rolling over to a new tensor.
+        scores = query @ key_e.transpose(-2, -1)
+        scores.mul_(scale)
 
         if is_causal:
             L, S = scores.shape[-2], scores.shape[-1]
@@ -1014,13 +1019,13 @@ class ScaledDotProductAttention(torch.autograd.Function):
             # convention. Cached-generation use cases (where you want
             # right-aligned causal) should pass an explicit attn_mask.
             causal_mask = torch.ones(L, S, dtype=torch.bool, device=scores.device).tril()
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
+            scores.masked_fill_(~causal_mask, float("-inf"))
 
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(~attn_mask, float("-inf"))
+                scores.masked_fill_(~attn_mask, float("-inf"))
             else:
-                scores = scores + attn_mask
+                scores.add_(attn_mask)
 
         probs = torch.softmax(scores, dim=-1)
         output = probs @ value_e
