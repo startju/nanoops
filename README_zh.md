@@ -1,4 +1,4 @@
-# nanoops: nanochat on RTX 3090 —— 教学 fork
+# nanochat3090: nanochat on RTX 3090 —— 教学 fork
 
 > English version: [README.md](README.md)
 
