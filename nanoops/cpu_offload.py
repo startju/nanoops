@@ -41,6 +41,25 @@ def _cpu_pinned_zeros(shape, dtype):
     return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=True)
 
 
+def migrate_optimizer_state_to_cpu_pinned(optimizer) -> None:
+    """Walk `optimizer.state` and migrate every GPU-resident tensor back to
+    CPU pinned memory. Call this ONCE immediately after
+    `optimizer.load_state_dict(loaded_state)` when a checkpoint resume put
+    state on GPU.
+
+    Why eager > lazy per-step: the per-step `_ensure_cpu_pinned` guard below
+    is a safety net, but it fires inside `patched_compute_*` / `patched_step_*`
+    — which is during the FIRST training iter when GPU mem is already near
+    ceiling (forward activations alive). Doing it eagerly here (before the
+    training loop's first forward) means GPU has ~17 GiB headroom for the
+    transient old-state-still-alive-while-new-CPU-being-pinned phase.
+    """
+    for p_state in optimizer.state.values():
+        for k, v in list(p_state.items()):
+            if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                p_state[k] = v.detach().to("cpu", non_blocking=False).pin_memory()
+
+
 def _ensure_cpu_pinned(state: dict, keys: tuple[str, ...]) -> None:
     """If any of `state[key]` lives on GPU (e.g. just loaded via
     optimizer.load_state_dict(checkpoint, map_location=device)),

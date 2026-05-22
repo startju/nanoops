@@ -342,6 +342,14 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+    # nanoops CPU offload: load_state_dict put the state on GPU (map_location=device).
+    # Migrate back to CPU pinned NOW — before the first forward starts allocating
+    # activation memory — so the migration has ~17 GiB headroom instead of running
+    # at the 24 GiB ceiling during the first optim step.
+    if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
+        from nanoops.cpu_offload import migrate_optimizer_state_to_cpu_pinned
+        migrate_optimizer_state_to_cpu_pinned(optimizer)
+        print0("[nanoops] migrated resumed optimizer state to CPU pinned memory")
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
