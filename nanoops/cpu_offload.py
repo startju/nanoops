@@ -31,10 +31,17 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
 
     State (exp_avg, exp_avg_sq) lives in pinned CPU memory; per optimizer
     step we H2D copy to GPU buffers, run the fused AdamW kernel, then
-    D2H back.
+    D2H back. empty_cache at entry releases the 256-fwd+bwd allocator
+    cache so the per-param H2D copies can find contiguous space; same
+    rationale as the MuonAdamW versions below. NOTE: torchrun always
+    sets RANK/LOCAL_RANK/WORLD_SIZE in env, so NPROC=1 *also* uses
+    DistMuonAdamW (not single-GPU MuonAdamW) — meaning this is the
+    code path that runs in BOTH dual-GPU and single-GPU cases.
     """
     import torch.distributed as dist
     from nanochat.optim import adamw_step_fused
+
+    torch.cuda.empty_cache()
 
     param_infos = info['param_infos']
     for p in group['params']:
@@ -80,10 +87,15 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
         # D2H — async copy back to pinned CPU buffer
         state['exp_avg'].copy_(exp_avg_g, non_blocking=True)
         state['exp_avg_sq'].copy_(exp_avg_sq_g, non_blocking=True)
+        del exp_avg_g, exp_avg_sq_g
 
         if not pinfo['is_small']:
             future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
             gather_list.append(dict(future=future, params=None))
+
+    # Release per-param H2D transients back to driver so the next 256
+    # fwd+bwd cycles get a clean allocator.
+    torch.cuda.empty_cache()
 
 
 def patched_compute_muon(self, group, info, gather_list, rank):
@@ -91,10 +103,15 @@ def patched_compute_muon(self, group, info, gather_list, rank):
 
     Muon state buffers (momentum_buffer, second_momentum_buffer) live on
     CPU pinned memory; only the OWNED slice is copied H2D per step
-    (non-owned chunks don't participate on this rank).
+    (non-owned chunks don't participate on this rank). NOTE: when
+    world_size=1 (NPROC=1 single-GPU runs via torchrun), this code
+    H2D's the FULL state slice — ~5 GiB on d24, which is why we need
+    the empty_cache at end to release the transient back to the driver.
     """
     import torch.distributed as dist
     from nanochat.optim import muon_step_fused
+
+    torch.cuda.empty_cache()
 
     info['future'].wait()
     params = group['params']
@@ -148,6 +165,7 @@ def patched_compute_muon(self, group, info, gather_list, rank):
         # D2H — async copy back
         state["momentum_buffer"][:num_owned].copy_(mom_g, non_blocking=True)
         state["second_momentum_buffer"][:num_owned].copy_(mom2_g, non_blocking=True)
+        del mom_g, mom2_g, stacked_owned
 
     if num_owned < chunk_size:
         updated_params[num_owned:].zero_()
@@ -157,6 +175,11 @@ def patched_compute_muon(self, group, info, gather_list, rank):
         stacked_params, updated_params, async_op=True
     ).get_future()
     gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+
+    # Release per-step transient (mom_g, mom2_g, stacked_owned, updated_params
+    # — the local-scope refs we can drop) back to the driver.
+    del updated_params
+    torch.cuda.empty_cache()
 
 
 # -----------------------------------------------------------------------------
