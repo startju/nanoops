@@ -60,14 +60,20 @@ WANDB_RUN=${WANDB_RUN:-dummy}
 # release dance that single-GPU memory pressure needs) live on MuonAdamW.
 # Going via DistMuonAdamW for single-GPU wires through patched_compute_*
 # which is missing those single-GPU mitigations.
+#
+# `python -u` forces unbuffered stdout — torchrun's launcher does this
+# automatically, but plain python block-buffers stdout when redirected
+# to a file, so step lines / patch list would never appear in the log
+# until the buffer fills or the process exits.
 if [ "$NPROC" = "1" ]; then
-    python -m scripts.base_train --depth=24 --target-param-data-ratio=8 \
-        --device-batch-size=1 --run=$WANDB_RUN "$@"
+    python -u -m scripts.base_train --depth=24 --target-param-data-ratio=8 \
+        --device-batch-size=1 --val-device-batch-size=16 --run=$WANDB_RUN "$@"
 else
     torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
         --depth=24 \
         --target-param-data-ratio=8 \
         --device-batch-size=1 \
+        --val-device-batch-size=16 \
         --run=$WANDB_RUN \
         "$@"
 fi
