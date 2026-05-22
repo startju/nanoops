@@ -423,6 +423,13 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
+    # nsys profile STOP check at TOP of loop — closes the capture window
+    # BEFORE the eval/save section, so checkpoint save (~30-60s of disk I/O
+    # with rank 1 idle waiting on barriers) doesn't show up as "untagged
+    # time" in the trace. Pair with the START check further down.
+    if os.environ.get("NANOOPS_NSYS_END_STEP") and step == int(os.environ["NANOOPS_NSYS_END_STEP"]):
+        torch.cuda.cudart().cudaProfilerStop()
+
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -513,15 +520,14 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
-    # nsys profile window: NANOOPS_NSYS_START_STEP / NANOOPS_NSYS_END_STEP (env)
-    # wrap `nsys profile --capture-range=cudaProfilerApi` and these env vars
-    # control which steps actually emit trace events. Outside the window we
-    # train normally but produce no trace overhead.
-    if os.environ.get("NANOOPS_NSYS_START_STEP"):
-        if step == int(os.environ["NANOOPS_NSYS_START_STEP"]):
-            torch.cuda.cudart().cudaProfilerStart()
-        if step == int(os.environ.get("NANOOPS_NSYS_END_STEP", "-1")):
-            torch.cuda.cudart().cudaProfilerStop()
+    # nsys profile START check: paired with the STOP check at the top of the
+    # loop. Both gated by `--capture-range=cudaProfilerApi`. Fires immediately
+    # before the step=START_STEP training iter so that iter is fully captured.
+    if (
+        os.environ.get("NANOOPS_NSYS_START_STEP")
+        and step == int(os.environ["NANOOPS_NSYS_START_STEP"])
+    ):
+        torch.cuda.cudart().cudaProfilerStart()
 
     # evaluate the gradient
     synchronize()
