@@ -1,19 +1,23 @@
-"""CPU offload of optimizer state for nanchat's DistMuonAdamW.
+"""CPU offload of optimizer state for nanchat's Muon + AdamW optimizers.
 
-Drop-in replacements for `DistMuonAdamW._compute_adamw` and
-`._compute_muon` that allocate optim state in pinned CPU memory and
-async-copy H2D / D2H around the existing fused kernels.
+Drop-in replacements for the per-step optimizer methods on BOTH
+nanchat optimizer classes: state (exp_avg / exp_avg_sq for AdamW,
+momentum_buffer / second_momentum_buffer for Muon) lives in pinned
+CPU memory; per optimizer step we H2D copy to GPU, run the existing
+fused kernel, then D2H back.
 
 Wired in by `nanoops.integration._apply` when `NANOOPS_OFFLOAD_OPTIM=1`;
 reversed by `_restore` via the standard `originals` dict.
 
-Both classes are handled:
+Two class pairs are handled:
   - `DistMuonAdamW` (distributed, >1 GPU): patches `_compute_adamw` and
     `_compute_muon` — state lives sharded across ranks via ZeRO-1, this
     moves each rank's slice to CPU.
   - `MuonAdamW` (single GPU): patches `_step_adamw` and `_step_muon` —
-    full-size state lives on CPU (no ZeRO sharding to begin with), the
-    only path to fit a model that otherwise overflows VRAM.
+    full-size state lives on CPU (no ZeRO sharding to begin with).
+
+The single-GPU path is reached when `nanoops/train.sh` is invoked with
+NPROC=1 (no torchrun → no RANK env → nanchat's Factory picks MuonAdamW).
 
 Limitation: state loaded from a checkpoint comes back on whichever
 device the checkpoint stored. The first optim step after resume re-pays
@@ -24,6 +28,17 @@ re-pin via the lazy alloc path.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
+
+# Imported at module top — the file is only imported from
+# nanoops.integration._apply() when NANOOPS_OFFLOAD_OPTIM=1, by which
+# time nanchat.optim is guaranteed already loaded (no circular import).
+from nanochat.optim import adamw_step_fused, muon_step_fused
+
+
+def _cpu_pinned_zeros(shape, dtype):
+    """Optimizer state on the CPU side: zeros tensor pinned for async DMA."""
+    return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=True)
 
 
 def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
@@ -34,9 +49,6 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
     D2H back. Dual-GPU only (single-GPU goes through the simpler
     patched_step_adamw via train.sh's NPROC=1 / no-torchrun branch).
     """
-    import torch.distributed as dist
-    from nanochat.optim import adamw_step_fused
-
     param_infos = info['param_infos']
     for p in group['params']:
         pinfo = param_infos[p]
@@ -52,13 +64,8 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
 
         if not state:
             state['step'] = 0
-            # Allocate on CPU pinned memory — pin_memory enables async H2D/D2H
-            state['exp_avg'] = torch.zeros(
-                p_slice.shape, dtype=p_slice.dtype, device="cpu", pin_memory=True,
-            )
-            state['exp_avg_sq'] = torch.zeros(
-                p_slice.shape, dtype=p_slice.dtype, device="cpu", pin_memory=True,
-            )
+            state['exp_avg'] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
+            state['exp_avg_sq'] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
         state['step'] += 1
 
         # H2D — async because state is pinned
@@ -96,9 +103,6 @@ def patched_compute_muon(self, group, info, gather_list, rank):
     single-GPU goes through patched_step_muon via train.sh's NPROC=1
     no-torchrun branch.
     """
-    import torch.distributed as dist
-    from nanochat.optim import muon_step_fused
-
     info['future'].wait()
     params = group['params']
     chunk_size = info['chunk_size']
@@ -111,18 +115,14 @@ def patched_compute_muon(self, group, info, gather_list, rank):
 
     state = self.state[p]
     if "momentum_buffer" not in state:
-        state["momentum_buffer"] = torch.zeros(
-            chunk_size, *shape, dtype=dtype, device="cpu", pin_memory=True,
-        )
+        state["momentum_buffer"] = _cpu_pinned_zeros((chunk_size, *shape), dtype)
     if "second_momentum_buffer" not in state:
         state_shape = (
             (chunk_size, shape[-2], 1)
             if shape[-2] >= shape[-1]
             else (chunk_size, 1, shape[-1])
         )
-        state["second_momentum_buffer"] = torch.zeros(
-            state_shape, dtype=dtype, device="cpu", pin_memory=True,
-        )
+        state["second_momentum_buffer"] = _cpu_pinned_zeros(state_shape, dtype)
     red_dim = -1 if shape[-2] >= shape[-1] else -2
 
     updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -168,8 +168,6 @@ def patched_compute_muon(self, group, info, gather_list, rank):
 
 def patched_step_adamw(self, group):
     """CPU-offloaded version of MuonAdamW._step_adamw (single-GPU path)."""
-    from nanochat.optim import adamw_step_fused
-
     for p in group['params']:
         if p.grad is None:
             continue
@@ -178,12 +176,8 @@ def patched_step_adamw(self, group):
 
         if not state:
             state['step'] = 0
-            state['exp_avg'] = torch.zeros(
-                p.shape, dtype=p.dtype, device="cpu", pin_memory=True,
-            )
-            state['exp_avg_sq'] = torch.zeros(
-                p.shape, dtype=p.dtype, device="cpu", pin_memory=True,
-            )
+            state['exp_avg'] = _cpu_pinned_zeros(p.shape, p.dtype)
+            state['exp_avg_sq'] = _cpu_pinned_zeros(p.shape, p.dtype)
         state['step'] += 1
 
         exp_avg_g = state['exp_avg'].to(p.device, non_blocking=True)
@@ -208,8 +202,6 @@ def patched_step_adamw(self, group):
 
 def patched_step_muon(self, group):
     """CPU-offloaded version of MuonAdamW._step_muon (single-GPU path)."""
-    from nanochat.optim import muon_step_fused
-
     params = group['params']
     if not params:
         return
@@ -220,22 +212,18 @@ def patched_step_muon(self, group):
     shape, device, dtype = p.shape, p.device, p.dtype
 
     if "momentum_buffer" not in state:
-        state["momentum_buffer"] = torch.zeros(
-            num_params, *shape, dtype=dtype, device="cpu", pin_memory=True,
-        )
+        state["momentum_buffer"] = _cpu_pinned_zeros((num_params, *shape), dtype)
     if "second_momentum_buffer" not in state:
         state_shape = (
             (num_params, shape[-2], 1)
             if shape[-2] >= shape[-1]
             else (num_params, 1, shape[-1])
         )
-        state["second_momentum_buffer"] = torch.zeros(
-            state_shape, dtype=dtype, device="cpu", pin_memory=True,
-        )
+        state["second_momentum_buffer"] = _cpu_pinned_zeros(state_shape, dtype)
     red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-    # Single-GPU's muon H2D copies the FULL state (no ZeRO sharding to
-    # H2D copy full state to GPU buffers
+    # H2D copy the full state to GPU buffers (single-GPU has no ZeRO
+    # sharding, so unlike the dist version we copy momentum_buffer in full).
     mom_g = state["momentum_buffer"].to(device, non_blocking=True)
     mom2_g = state["second_momentum_buffer"].to(device, non_blocking=True)
 
