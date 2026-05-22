@@ -83,6 +83,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-keep-last", type=int, default=-1, help="keep only the N most recent checkpoints (-1 = keep all). After each save, delete older model_*.pt / meta_*.json / optim_*.pt sets beyond the N newest by step.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -513,6 +514,26 @@ while True:
             },
             rank=ddp_rank,
         )
+        # --save-keep-last N: delete older checkpoint sets beyond the N
+        # newest by step. Each "set" = model_NNNNNN.pt + meta_NNNNNN.json +
+        # optim_NNNNNN_rank*.pt files at the same step number. Only rank 0
+        # does the deletion (file system is shared); other ranks no-op.
+        if args.save_keep_last > 0 and master_process:
+            import glob, re
+            model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+            steps = sorted({
+                int(re.search(r"model_(\d+)\.pt$", f).group(1)) for f in model_files
+            })
+            for old_step in steps[:-args.save_keep_last]:
+                for pattern in (f"model_{old_step:06d}.pt",
+                                f"meta_{old_step:06d}.json",
+                                f"optim_{old_step:06d}_rank*.pt"):
+                    for p in glob.glob(os.path.join(checkpoint_dir, pattern)):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                print0(f"Pruned old checkpoint at step {old_step}")
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
