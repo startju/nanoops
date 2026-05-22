@@ -68,7 +68,7 @@ WANDB_RUN=${WANDB_RUN:-dummy}
 if [ "$NPROC" = "1" ]; then
     python -u -m scripts.base_train --depth=24 --target-param-data-ratio=8 \
         --device-batch-size=1 --val-device-batch-size=16 \
-        --save-every=50 --save-keep-last=3 \
+        --save-every=50 --save-keep-last=3 --resume-from-step=-2 \
         --run=$WANDB_RUN "$@"
 else
     torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
@@ -78,6 +78,7 @@ else
         --val-device-batch-size=16 \
         --save-every=50 \
         --save-keep-last=3 \
+        --resume-from-step=-2 \
         --run=$WANDB_RUN \
         "$@"
 fi

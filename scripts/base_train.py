@@ -75,7 +75,7 @@ parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate 
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
-parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable, -2 = auto = latest model_*.pt in checkpoint dir)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -163,6 +163,21 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+
+# --resume-from-step=-2 means "auto-pick latest checkpoint in the dir". Useful
+# when paired with --save-every / --save-keep-last so the next run just picks
+# up wherever the previous one left off without needing to read the dir manually.
+if args.resume_from_step == -2:
+    import glob, re
+    candidates = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
+    if candidates:
+        steps = sorted(int(re.search(r"model_(\d+)\.pt$", c).group(1)) for c in candidates)
+        args.resume_from_step = steps[-1]
+        print0(f"--resume-from-step=auto resolved to step {args.resume_from_step}")
+    else:
+        print0(f"--resume-from-step=auto but no checkpoints in {checkpoint_dir} — starting fresh")
+        args.resume_from_step = -1
+
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
