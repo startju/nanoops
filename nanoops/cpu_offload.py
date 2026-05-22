@@ -41,6 +41,29 @@ def _cpu_pinned_zeros(shape, dtype):
     return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=True)
 
 
+def _ensure_cpu_pinned(state: dict, keys: tuple[str, ...]) -> None:
+    """If any of `state[key]` lives on GPU (e.g. just loaded via
+    optimizer.load_state_dict(checkpoint, map_location=device)),
+    migrate it to CPU pinned memory in-place.
+
+    Why this matters: our offload pattern relies on state being on CPU
+    pinned memory so the per-step H2D / D2H copies can stream
+    asynchronously and the GPU side is just a transient buffer. When
+    nanchat resumes from a checkpoint, PyTorch loads the optimizer
+    state onto whichever `map_location` device the load was given
+    (the GPU in this case), so without this migration step the
+    offload silently breaks — state stays GPU-resident and the
+    ~2-3 GiB per rank we expected to free... isn't.
+
+    One-time cost at the FIRST optim step after resume: ~D2H of state
+    + pin_memory page allocation. Subsequent steps skip the if-branch.
+    """
+    for k in keys:
+        t = state.get(k)
+        if t is not None and t.device.type != "cpu":
+            state[k] = t.detach().to("cpu", non_blocking=False).pin_memory()
+
+
 def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
     """CPU-offloaded version of DistMuonAdamW._compute_adamw.
 
@@ -66,6 +89,11 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
             state['step'] = 0
             state['exp_avg'] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
             state['exp_avg_sq'] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
+        else:
+            # Resume-from-checkpoint guard: if state was just loaded via
+            # optimizer.load_state_dict(map_location=GPU), migrate it back
+            # to CPU pinned so the offload actually works.
+            _ensure_cpu_pinned(state, ("exp_avg", "exp_avg_sq"))
         state['step'] += 1
 
         # H2D — async because state is pinned
@@ -123,6 +151,8 @@ def patched_compute_muon(self, group, info, gather_list, rank):
             else (chunk_size, 1, shape[-1])
         )
         state["second_momentum_buffer"] = _cpu_pinned_zeros(state_shape, dtype)
+    # Resume guard: same as patched_compute_adamw above.
+    _ensure_cpu_pinned(state, ("momentum_buffer", "second_momentum_buffer"))
     red_dim = -1 if shape[-2] >= shape[-1] else -2
 
     updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -178,6 +208,9 @@ def patched_step_adamw(self, group):
             state['step'] = 0
             state['exp_avg'] = _cpu_pinned_zeros(p.shape, p.dtype)
             state['exp_avg_sq'] = _cpu_pinned_zeros(p.shape, p.dtype)
+        else:
+            # Resume guard: see _ensure_cpu_pinned.
+            _ensure_cpu_pinned(state, ("exp_avg", "exp_avg_sq"))
         state['step'] += 1
 
         exp_avg_g = state['exp_avg'].to(p.device, non_blocking=True)
@@ -220,6 +253,8 @@ def patched_step_muon(self, group):
             else (num_params, 1, shape[-1])
         )
         state["second_momentum_buffer"] = _cpu_pinned_zeros(state_shape, dtype)
+    # Resume guard: see _ensure_cpu_pinned.
+    _ensure_cpu_pinned(state, ("momentum_buffer", "second_momentum_buffer"))
     red_dim = -1 if shape[-2] >= shape[-1] else -2
 
     # H2D copy the full state to GPU buffers (single-GPU has no ZeRO
