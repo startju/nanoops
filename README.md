@@ -86,6 +86,31 @@ a debugger, and the bundled tests (`tests/test_nanoops_e2e.py`,
 `tests/test_sdpa_parity.py`, ...) cross-check every op against
 PyTorch's reference — so you always have ground truth to compare against.
 
+**Why RTX 3090 (and not a rented H100).** As a beginner you'll spend
+the vast majority of your time **debugging and learning**, not actually
+training: reading the source, stepping through a backward in a
+debugger, swapping one implementation detail for another, comparing
+loss curves against the PyTorch reference, re-running a 20-iter probe,
+profiling memory. Renting an H100 ($2-4/hr spot) for those phases is
+~10-20× more expensive per useful learning hour — you're paying for
+flops you mostly aren't using.
+
+The cheapest setups for each learning goal:
+  - **Just ops + training internals** → **single RTX 3090**
+    (~$0.18/hr spot, or own one outright once → $0/hr ongoing).
+    Trains everything in this repo up through d24 with the offload
+    stack; no distributed surprises to debug.
+  - **Adding NCCL / DDP / collective comm to the learning goals**
+    → **dual RTX 3090** (~$0.36/hr spot). The smallest setup where
+    real `dist.all_reduce` / `dist.reduce_scatter` actually run
+    cross-device (a 1-GPU torchrun box gives you env vars but no
+    actual cross-rank network), so you can profile NCCL bottlenecks,
+    test ZeRO sharding strategies, and reproduce DDP-specific bugs.
+
+H100s become rational only when wall-time per training run dominates
+your debug iteration time — typically once you've built confidence in
+the code and just want throughput.
+
 ### Measured speedup journey (d20 base_train on a 3090, dual-GPU numbers)
 
 | Config                                | tok/sec    | MFU       | Peak GPU mem | vs baseline |
