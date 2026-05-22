@@ -39,6 +39,14 @@ export NANOOPS_MLP_CHECKPOINT="${NANOOPS_MLP_CHECKPOINT:-1}"
 # to escape that exact 21.58 GiB allocated + 1.35 GiB fragmentation
 # pattern). Opt out with empty value.
 export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
+# L-layer (full-attention) activation checkpoint ON by default. The 18
+# sliding S layers already use LSE-only chunked SDPA so their ctx is
+# small; the 6 full-attention L layers per d24-SSSL group keep more
+# activation memory and benefit most from re-running their forward in
+# backward. Combined with MLP_CHECKPOINT this is the last activation
+# trick needed to fit d24+B=1 on a single 24 GiB GPU. Opt out with
+# empty value.
+export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
