@@ -1,5 +1,7 @@
 """Triton kernels for nanoops (Tier 3 — opt-in CUDA kernel rewrites).
 
+⚠️  WIP — skip for code review.
+
 Each kernel here mirrors the math of the corresponding Python op in
 `functional.py` but fuses multiple passes into a single GPU kernel.
 Wins come from:
@@ -11,6 +13,22 @@ Wins come from:
 Activated via env var per op (e.g. `NANOOPS_TRITON_NORM_MLP=1`).
 If triton isn't installed or the env var isn't set, callers fall back
 to the eager Python implementation in `functional.py`.
+
+Known WIP items (do not block on these during review):
+  - `flash_sdpa`: forward has a NaN bug at sliding-window boundaries
+    where a Q row's window doesn't overlap an early K tile (online
+    softmax's exp(-inf - -inf) → NaN). Needs the standard
+    "if m_new == -inf, skip update" guard.
+  - `_norm_mlp_block_fwd_kernel`: full two-matmul-fused MLP forward,
+    written but not yet wrapped in an autograd.Function. Dead code
+    until that wiring lands.
+  - `value_gate`: kernel implements per-element gate (out shape
+    (M, D_v)), but nanchat's ResFormer uses per-head gate (out shape
+    (M, n_kv_head)) broadcast across head_dim. Math doesn't match
+    nanchat's actual usage — needs a reshape pre/post or a different
+    `gate_w` shape to drop in.
+  - None of the Triton kernels are wired into `integration.py` yet —
+    purely opt-in via direct import + env var.
 """
 
 from __future__ import annotations
