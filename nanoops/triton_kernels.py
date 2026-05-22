@@ -1483,3 +1483,152 @@ def rotary_qk_norm_scale(
 ) -> torch.Tensor:
     """Fused rotary embedding + RMSNorm + multiplicative scale for Q or K."""
     return RotaryQKNormScale.apply(qk, cos, sin, scale, eps)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fused residual-add + RMSNorm — placed at block boundaries:
+#     y_new = norm(x + residual)
+# Two consecutive elementwise passes that share the same (M, D) tile
+# layout, so fusion is a clean win: one HBM read of (x, residual), one
+# write of (y, also save x+residual as `summed` for ctx in case caller
+# also needs it). Cheap, useful at the seam between attn-block output
+# and mlp-block norm-input.
+# ─────────────────────────────────────────────────────────────────────
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fused_add_norm_fwd_kernel(
+        x_ptr, res_ptr, nw_ptr,
+        y_ptr, rms_inv_ptr, summed_ptr,
+        M, D,
+        eps,
+        stride_xm, stride_xd,
+        stride_rm, stride_rd,
+        stride_ym, stride_yd,
+        stride_sm, stride_sd,
+        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """y = norm(x + residual) — per-row RMSNorm of the elementwise sum.
+        Also stores `summed = x + residual` since the caller usually
+        needs it as the next layer's residual stream (avoids re-doing
+        the add)."""
+        pid_m = tl.program_id(0)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        # We require D == BLOCK_D — D is small enough (≤ ~2K typical
+        # transformer hidden) to fit in one tile column-wise.
+
+        x_ptrs = x_ptr + rows[:, None] * stride_xm + cols[None, :] * stride_xd
+        r_ptrs = res_ptr + rows[:, None] * stride_rm + cols[None, :] * stride_rd
+        x = tl.load(x_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        r = tl.load(r_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        summed = x + r
+
+        # Save summed back to HBM so the caller can re-use it as the
+        # next block's residual stream (no need to re-add).
+        s_ptrs = summed_ptr + rows[:, None] * stride_sm + cols[None, :] * stride_sd
+        tl.store(s_ptrs, summed.to(summed_ptr.dtype.element_ty), mask=row_mask[:, None])
+
+        # RMSNorm: rsqrt(mean(summed²) + eps), then * norm_weight
+        sum_sq = tl.sum(summed * summed, axis=1)
+        rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0).to(tl.float32)
+        y = summed * rms_inv[:, None] * nw[None, :]
+
+        y_ptrs = y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yd
+        tl.store(y_ptrs, y.to(y_ptr.dtype.element_ty), mask=row_mask[:, None])
+        tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
+
+
+class FusedAddNorm(torch.autograd.Function):
+    """y = norm(x + residual), also returns summed = x + residual.
+
+    Forward: one Triton kernel does add + RMSNorm + writes both y and
+    summed. Backward reuses the standard RMSNorm-backward Triton kernel
+    plus the identity passthroughs:
+        d_summed = d_norm + d_summed_external   (norm bwd + downstream grad)
+        d_x = d_residual = d_summed              (sum passthrough)
+    """
+
+    @staticmethod
+    def forward(ctx, x, residual, norm_weight, eps=1e-6):
+        assert x.is_cuda and x.is_contiguous()
+        assert residual.is_cuda and residual.is_contiguous()
+        assert norm_weight.is_cuda
+        M, D = x.shape
+        assert residual.shape == (M, D)
+        assert norm_weight.shape == (D,)
+        y = torch.empty_like(x)
+        summed = torch.empty_like(x)
+        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+        BLOCK_M = 32
+        grid = (triton.cdiv(M, BLOCK_M),)
+        _fused_add_norm_fwd_kernel[grid](
+            x, residual, norm_weight,
+            y, rms_inv, summed,
+            M, D, eps,
+            x.stride(0), x.stride(1),
+            residual.stride(0), residual.stride(1),
+            y.stride(0), y.stride(1),
+            summed.stride(0), summed.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_D=D,
+        )
+        ctx.save_for_backward(summed, norm_weight, rms_inv)
+        ctx.M, ctx.D = M, D
+        return y, summed
+
+    @staticmethod
+    def backward(ctx, dy, d_summed_external):
+        summed, nw, rms_inv = ctx.saved_tensors
+        M, D = ctx.M, ctx.D
+        dy = dy.contiguous()
+        d_summed_external = d_summed_external.contiguous()
+
+        # RMSNorm backward (Triton — reuse _rms_norm_bwd_kernel from MLP fusion)
+        # Input to norm was `summed`; weight is `nw`. Backward gives d_summed_from_norm + dnw.
+        BLOCK_M_BWD, BLOCK_K_BWD = 32, 64
+        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+        d_summed_from_norm = torch.empty_like(summed)
+        dnw_partials = torch.empty(
+            (num_m_tiles, D), dtype=nw.dtype, device=summed.device,
+        )
+        grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_K_BWD))
+        _rms_norm_bwd_kernel[grid_bwd](
+            summed, rms_inv, nw,
+            dy,
+            d_summed_from_norm, dnw_partials,
+            M, D,
+            summed.stride(0), summed.stride(1),
+            dy.stride(0), dy.stride(1),
+            d_summed_from_norm.stride(0), d_summed_from_norm.stride(1),
+            BLOCK_M=BLOCK_M_BWD, BLOCK_K=BLOCK_K_BWD,
+        )
+        dnw = dnw_partials.sum(dim=0)
+
+        # Sum passthrough: d_summed = d_summed_from_norm + d_summed_external
+        # (downstream may consume `summed` directly as next-block residual)
+        d_summed_total = d_summed_from_norm + d_summed_external
+        # x + residual: d_x = d_residual = d_summed_total
+        d_x = d_summed_total
+        d_residual = d_summed_total
+        return d_x, d_residual, dnw, None
+
+
+def fused_add_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused `y = norm(x + residual)`. Also returns `summed = x + residual`
+    so the caller can plug it directly into the next block's residual
+    stream (no re-add needed).
+
+    The canonical block-boundary fusion: between an attn block's output
+    and the mlp block's norm-input (or symmetrically between mlp output
+    and the next layer's attn norm-input).
+    """
+    return FusedAddNorm.apply(x, residual, norm_weight, eps)
