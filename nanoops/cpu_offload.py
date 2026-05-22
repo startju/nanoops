@@ -94,7 +94,12 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
             gather_list.append(dict(future=future, params=None))
 
     # Release per-param H2D transients back to driver so the next 256
-    # fwd+bwd cycles get a clean allocator.
+    # fwd+bwd cycles get a clean allocator. CRITICAL: must synchronize
+    # FIRST — the per-param D2H copies were issued with non_blocking=True
+    # so the GPU buffers are still bound to pending stream events. The
+    # CUDA allocator refuses to release blocks with outstanding events,
+    # so empty_cache without sync is a no-op for those transients.
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
 
@@ -176,9 +181,14 @@ def patched_compute_muon(self, group, info, gather_list, rank):
     ).get_future()
     gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
-    # Release per-step transient (mom_g, mom2_g, stacked_owned, updated_params
-    # — the local-scope refs we can drop) back to the driver.
+    # Release per-step transient (mom_g, mom2_g, stacked_owned, updated_params)
+    # back to the driver. Same sync-before-empty_cache rationale as in
+    # patched_compute_adamw: updated_params is referenced by the still-
+    # pending async all_gather_into_tensor, and mom_g/mom2_g's storages
+    # are bound to async D2H stream events. Without sync, empty_cache
+    # can't release any of them.
     del updated_params
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
 
