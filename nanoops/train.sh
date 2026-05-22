@@ -51,12 +51,26 @@ export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
 
-torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
-    --depth=24 \
-    --target-param-data-ratio=8 \
-    --device-batch-size=1 \
-    --run=$WANDB_RUN \
-    "$@"
+# NPROC=1: launch via plain python (NOT torchrun). torchrun unconditionally
+# sets RANK / LOCAL_RANK / WORLD_SIZE in env, which makes nanchat's
+# is_ddp_requested() return True and Factory pick DistMuonAdamW. We want
+# single-GPU to use the simpler MuonAdamW class — both because it's the
+# right tool for the job and because nanoops.cpu_offload's
+# patched_step_adamw / patched_step_muon (which handle the GPU-transient
+# release dance that single-GPU memory pressure needs) live on MuonAdamW.
+# Going via DistMuonAdamW for single-GPU wires through patched_compute_*
+# which is missing those single-GPU mitigations.
+if [ "$NPROC" = "1" ]; then
+    python -m scripts.base_train --depth=24 --target-param-data-ratio=8 \
+        --device-batch-size=1 --run=$WANDB_RUN "$@"
+else
+    torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
+        --depth=24 \
+        --target-param-data-ratio=8 \
+        --device-batch-size=1 \
+        --run=$WANDB_RUN \
+        "$@"
+fi
 # --depth=24 / device-batch-size=1 on 2× RTX 3090 (24 GiB each):
 # d24 auto-widens to D=1536, n_layer=24, ~1.5B params, ~1.67× heavier than
 # d20. Even with all three optimizations active (sliding window +
