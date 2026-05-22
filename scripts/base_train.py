@@ -513,9 +513,21 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # nsys profile window: NANOOPS_NSYS_START_STEP / NANOOPS_NSYS_END_STEP (env)
+    # wrap `nsys profile --capture-range=cudaProfilerApi` and these env vars
+    # control which steps actually emit trace events. Outside the window we
+    # train normally but produce no trace overhead.
+    if os.environ.get("NANOOPS_NSYS_START_STEP"):
+        if step == int(os.environ["NANOOPS_NSYS_START_STEP"]):
+            torch.cuda.cudart().cudaProfilerStart()
+        if step == int(os.environ.get("NANOOPS_NSYS_END_STEP", "-1")):
+            torch.cuda.cudart().cudaProfilerStop()
+
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    torch.cuda.nvtx.range_push(f"iter_{step}")
+    torch.cuda.nvtx.range_push("fwd+bwd")
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -525,7 +537,9 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    torch.cuda.nvtx.range_pop()  # fwd+bwd
     # step the optimizer
+    torch.cuda.nvtx.range_push("optim_step")
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
@@ -547,6 +561,8 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    torch.cuda.nvtx.range_pop()  # optim_step
+    torch.cuda.nvtx.range_pop()  # iter_N
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
