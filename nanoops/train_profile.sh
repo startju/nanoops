@@ -32,9 +32,9 @@ source .venv/bin/activate
 
 # nsys profile window: bracket which steps are captured. Pick the window
 # AFTER compile+warmup so what's in the trace is steady-state training.
-PROFILE_START=${PROFILE_START:-5}
-PROFILE_END=${PROFILE_END:-8}
-PROFILE_NUM_ITERS=${PROFILE_NUM_ITERS:-10}
+PROFILE_START=${PROFILE_START:-2}
+PROFILE_END=${PROFILE_END:-4}
+PROFILE_NUM_ITERS=${PROFILE_NUM_ITERS:-5}
 PROFILE_OUTPUT=${PROFILE_OUTPUT:-/tmp/nanoops_profile}
 
 # Env vars consumed by scripts/base_train.py to drive cudaProfilerStart/Stop
@@ -85,12 +85,33 @@ else
             "${COMMON_ARGS[@]}" "$@"
 fi
 
-# Tips for inspecting the trace:
-#   - Local GUI: `nsight-sys $PROFILE_OUTPUT.nsys-rep`
-#   - CLI stats: `nsys stats $PROFILE_OUTPUT.nsys-rep` (CUDA API + kernel time tables)
-#   - Filter by NVTX: in GUI, "Timeline → Filter" → search "iter_5" / "fwd+bwd" / "optim_step"
-#   - For nanoops you'll most want to look at:
-#     - SDPA kernels under "fwd+bwd" → time per layer + chunk granularity
-#     - cudaMemcpyAsync under "optim_step" → PCIe H2D/D2H for state offload
-#     - NCCL kernels (dual-GPU): all_reduce/all_gather, look for idle gaps
-#     - cudaMalloc/cudaFree spikes → allocator hot paths
+# ─── Post-run: auto-print summary stats so you don't have to grep nsys CLI ───
+NSYS_REP=${PROFILE_OUTPUT}.nsys-rep
+if [ -f "$NSYS_REP" ]; then
+    SIZE=$(du -h "$NSYS_REP" | cut -f1)
+    echo ""
+    echo "════════════════════════════════════════════════════════════"
+    echo " Trace ready: $NSYS_REP ($SIZE)"
+    echo "════════════════════════════════════════════════════════════"
+
+    echo ""
+    echo "── NVTX Range Summary ──"
+    nsys stats --report nvtx_sum --force-export=true "$NSYS_REP" 2>/dev/null \
+        | grep -A 100 "NVTX Range Summary" | head -20
+
+    echo ""
+    echo "── Top 10 CUDA Kernels ──"
+    nsys stats --report cuda_gpu_kern_sum --format table "$NSYS_REP" 2>/dev/null \
+        | grep -A 13 "CUDA GPU Kernel Summary" | head -15
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════"
+    echo " View locally:"
+    echo "   scp <server>:$NSYS_REP ."
+    echo "   nsight-sys $(basename $NSYS_REP)"
+    echo " More CLI reports:"
+    echo "   nsys stats --report cuda_gpu_sum     $NSYS_REP   # all GPU activity"
+    echo "   nsys stats --report cuda_api_sum     $NSYS_REP   # CUDA API calls"
+    echo "   nsys stats --report nvtx_pushpop_sum $NSYS_REP   # per-NVTX breakdown"
+    echo "════════════════════════════════════════════════════════════"
+fi
