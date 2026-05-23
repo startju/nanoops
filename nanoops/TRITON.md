@@ -257,6 +257,64 @@ A **warp** = 32 threads. The fundamental scheduling unit.
     blocks can co-reside.
   - `num_stages=2` — pipelining depth for `tl.load`/`tl.dot`.
 
+### Occupancy: how register / thread / block budgets combine
+
+Occupancy = `resident warps on SM / max warps on SM` (48 for 3090).
+Higher is generally better — more warp variety → more chances to hide
+latency by switching when a warp stalls on memory. The three per-SM
+caps (registers, threads, blocks) and the per-block shared-memory cap
+all act as **simultaneous upper bounds** on `blocks/SM` — the actual
+value is the minimum across all of them.
+
+For a hypothetical kernel: 128 threads/block, 32 regs/thread, 4 KB
+shared memory/block:
+
+| Limit                              | Per-block usage | Blocks/SM allowed   |
+| ---------------------------------- | --------------- | ------------------- |
+| Registers (65,536 total)           | 128 × 32 = 4 K  | 16                  |
+| Threads (1,536 total)              | 128             | **12**              |
+| Shared memory (100 KB total)       | 4 KB            | 25                  |
+| Per-SM block cap                   | n/a             | 16                  |
+| **`min` → actual blocks/SM**       |                 | **12**              |
+
+12 blocks × (128/32) = **48 warps resident** → **100% occupancy**.
+
+For a heavier kernel: 512 threads/block, 64 regs/thread, 48 KB
+shared/block:
+
+| Limit                              | Per-block usage | Blocks/SM allowed   |
+| ---------------------------------- | --------------- | ------------------- |
+| Registers                          | 512 × 64 = 32 K | 2                   |
+| Threads                            | 512             | 3                   |
+| **Shared memory**                  | **48 KB**       | **2**               |
+| Per-SM block cap                   | n/a             | 16                  |
+| **`min`**                          |                 | **2**               |
+
+2 blocks × (512/32) = **32 warps resident** → 32/48 = **67% occupancy**.
+
+Three knobs Triton exposes to tune this:
+
+- **BLOCK_M / BLOCK_N / BLOCK_K** ↑ → per-block thread / register /
+  shared-memory usage ↑ → blocks/SM ↓ → occupancy can drop.
+- **`num_warps=N`** (per `triton.Config`) ↑ → per-block thread count
+  ↑ → same effect.
+- **`num_stages=N`** ↑ → more pipelining buffers in shared memory →
+  shared-memory usage ↑ → blocks/SM ↓.
+
+There's no universally optimal occupancy — it depends on the kernel:
+
+- **Compute-bound** (matmul-heavy): larger tiles + moderate occupancy
+  (50-75%) typically wins, since fewer-bigger blocks keep the
+  arithmetic units saturated with less scheduling churn.
+- **Bandwidth-bound** (norm, elementwise): high occupancy (80-100%)
+  matters more, since latency hiding via warp switching is the
+  dominant lever.
+
+Triton's `triton.autotune` tries multiple `(BLOCK, num_warps,
+num_stages)` configs and picks the fastest empirically — typically the
+right answer rather than manual derivation, since the actual best
+config depends on cache effects too.
+
 ### What this means for our kernels
 
 - **Shared memory budget is the binding constraint.** Most of our

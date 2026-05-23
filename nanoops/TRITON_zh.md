@@ -234,6 +234,56 @@ break-even) **翻成算力 bound** (~1024 >> break-even)。
     但能共驻的 block 少。
   - `num_stages=2` —— `tl.load` / `tl.dot` 的 pipelining 深度。
 
+### Occupancy：register / thread / block 三个 budget 怎么共同决定
+
+Occupancy = `SM 上活跃 warp 数 / SM 最大 warp 数`（3090 上 = 48）。
+**越高一般越好**——更多 warp 候选 → scheduler 切换时更容易找到能跑的 warp →
+更好的 latency hiding。三个 per-SM cap（register / thread / block）加上
+per-block shared mem cap 都是 `blocks/SM` 的**同时上限**——实际值是所有
+限制的**最小值**。
+
+举例 kernel A：128 thread/block，32 regs/thread，4 KB shared mem/block：
+
+| 限制                              | 单 block 用量    | 允许 blocks/SM      |
+| ---------------------------------- | --------------- | ------------------- |
+| Register (65,536 总)              | 128 × 32 = 4 K  | 16                  |
+| Thread (1,536 总)                 | 128             | **12**              |
+| Shared mem (100 KB 总)            | 4 KB            | 25                  |
+| Per-SM block 硬上限                | n/a             | 16                  |
+| **取 min → 实际 blocks/SM**        |                 | **12**              |
+
+12 blocks × (128/32) = **48 个活跃 warp** → **100% occupancy**。
+
+更重的 kernel B：512 thread/block，64 regs/thread，48 KB shared mem/block：
+
+| 限制                              | 单 block 用量    | 允许 blocks/SM      |
+| ---------------------------------- | --------------- | ------------------- |
+| Register                          | 512 × 64 = 32 K | 2                   |
+| Thread                            | 512             | 3                   |
+| **Shared mem**                    | **48 KB**       | **2**               |
+| Per-SM block 硬上限                | n/a             | 16                  |
+| **min**                           |                 | **2**               |
+
+2 blocks × (512/32) = **32 个活跃 warp** → 32/48 = **67% occupancy**。
+
+Triton 提供三个旋钮可以调：
+
+- **BLOCK_M / BLOCK_N / BLOCK_K** ↑ → 单 block 的 thread / register /
+  shared mem 用量 ↑ → blocks/SM ↓ → occupancy 可能掉。
+- **`num_warps=N`**（`triton.Config` 里）↑ → 单 block thread 数 ↑ → 同上。
+- **`num_stages=N`** ↑ → 多一份 pipeline buffer 在 shared mem 里 →
+  shared mem 用量 ↑ → blocks/SM ↓。
+
+**没有放之四海的最优 occupancy**，看 kernel 性质：
+
+- **算力 bound**（matmul-heavy）：**大 tile + 中等 occupancy** (50-75%)
+  通常最快——少而大的 block 让算术单元持续饱和、调度切换 overhead 少。
+- **带宽 bound**（norm、elementwise）：**高 occupancy** (80-100%) 更
+  重要——warp switching hide HBM 延迟是主要杠杆。
+
+Triton 的 `triton.autotune` 会跑多组 `(BLOCK, num_warps, num_stages)`
+config 实测选最快——比手算靠谱，因为最优 config 还跟 cache 行为相关。
+
 ### 这些参数对我们 kernel 意味着什么
 
 - **Shared memory 是最紧的瓶颈**。我们大部分 kernel 的 tile 尺寸（BLOCK_M,
