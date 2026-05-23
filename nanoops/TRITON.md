@@ -240,10 +240,21 @@ registers so the HBM traffic shrinks to just `Q + K + V + O` (~25 MB),
 flipping SDPA from bandwidth-bound (~114 < 152 break-even) to
 compute-bound (~1024 >> break-even).
 
-This **8x AI gain** is exactly why Flash Attention is 2-4× faster than
-naive SDPA — same FLOPs, ~9× less HBM traffic. Sliding-window
-attention shrinks both numbers proportionally (band of size W instead
-of L), but the same Flash-vs-naive ratio still applies.
+This is why Flash Attention is 2-4× faster than naive SDPA — bytes drop
+~9× while FLOPs change only slightly:
+
+- **Forward FLOPs**: nearly identical (~5% more on Flash for the
+  online softmax's rescale bookkeeping).
+- **Backward FLOPs**: ~33% MORE on Flash, because Flash recomputes
+  the P matrix from a fresh `Q @ K^T` instead of saving P. Classic
+  FLOPs-for-memory trade.
+
+Net effect: even though Flash backward does ~30% more arithmetic,
+the ~10× HBM bandwidth saving dominates wall time (the workload was
+bandwidth-bound, so saving bandwidth trumps spending FLOPs). Sliding-
+window attention shrinks both bytes and FLOPs proportionally (band
+size `W` instead of full `L`), but the Flash-vs-naive ratio stays
+the same.
 
 ### Tensor cores vs CUDA (FP32) cores
 

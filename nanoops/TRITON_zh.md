@@ -216,9 +216,18 @@ Flash 用 online softmax + tile streaming 让 P 留 register，HBM 流量
 缩到只剩 `Q + K + V + O` (~25 MB)，把 SDPA 从带宽 bound (~114 < 152
 break-even) **翻成算力 bound** (~1024 >> break-even)。
 
-**8x AI 提升**就是 Flash Attention 比 naive SDPA 快 2-4× 的根源——
-**FLOPs 没变，HBM 流量少 9×**。Sliding window attention 把两个数字按
-比例缩小（band size W 代替 L），但 Flash-vs-naive 的比值不变。
+Flash Attention 比 naive SDPA 快 2-4× 的根源——bytes 少 ~9×，FLOPs 也
+有变化但幅度小：
+
+- **Forward FLOPs**：几乎相同（Flash 多 ~5%，是 online softmax 的 rescale
+  bookkeeping）。
+- **Backward FLOPs**：Flash **多 ~33%**——backward 时不存 P，而是 `Q@K^T`
+  现算一遍重建 P。典型的 **FLOPs 换 memory** trade。
+
+净效果：Flash backward 多算 ~30% 但 HBM 带宽省 ~10×，wall time 仍少 2-4×
+（在带宽 bound 阶段，省带宽远比多算 FLOPs 重要）。Sliding window attention
+把 bytes 和 FLOPs 都按比例缩小（band size `W` 代替全 `L`），但 Flash-vs-
+naive 的比值不变。
 
 ### Tensor cores vs CUDA (FP32) cores
 
