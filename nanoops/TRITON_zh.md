@@ -83,6 +83,11 @@ Boost clock 1695 MHz，82 个 SM。
 | FP16 (Tensor) + 2:4 稀疏       | 2048 FLOPs/cycle            | 284 TFLOPS          |
 | INT8 (Tensor cores)            | 2048 ops/cycle              | 284 TOPS            |
 
+（**2:4 稀疏** = 一种硬件加速的 weight 格式：**每 4 个连续元素里最多 2
+个非零**（另 2 个**必须**是 0）。Tensor core 跳过零乘法，吞吐翻倍。需要
+weight 预先 prune 到这个 pattern——通常用于 inference weight，nanoops
+不用。）
+
 **Memory 侧**：HBM 带宽 936 GB/s。bf16 算力 / 带宽 = 142 TFLOPS / 936
 GB/s = **每 byte 152 FLOPs**。一个 op 的 arithmetic intensity（每 byte
 FLOPs）**低于这个值就是带宽 bound，高于就是算力 bound**。

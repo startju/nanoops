@@ -89,6 +89,12 @@ Boost clock 1695 MHz, 82 SMs.
 | FP16 (Tensor) with 2:4 sparsity  | 2048 FLOPs/cycle           | 284 TFLOPS          |
 | INT8 (Tensor cores)              | 2048 ops/cycle             | 284 TOPS            |
 
+(**2:4 sparsity** = a hardware-accelerated weight format where every
+4 consecutive elements have at most 2 non-zero (the other 2 are
+exactly zero). The Tensor core skips the zero multiplies, doubling
+throughput. Requires the weight tensor to be pre-pruned to this
+pattern — typically applied to inference weights, not used in nanoops.)
+
 **Memory side**: 936 GB/s HBM bandwidth. Compute-to-bandwidth ratio at
 bf16 = 142 TFLOPS / 936 GB/s = **152 FLOPs per byte**. Any op below
 that ratio is bandwidth-bound; above it is compute-bound.
