@@ -1501,19 +1501,20 @@ if _HAS_TRITON:
     @triton.jit
     def _fused_add_norm_fwd_kernel(
         x_ptr, res_ptr, nw_ptr,
-        y_ptr, rms_inv_ptr, summed_ptr,
+        y_ptr, y_norm_ptr, rms_inv_ptr, summed_ptr,
         M, D,
         eps,
         stride_xm, stride_xd,
         stride_rm, stride_rd,
         stride_ym, stride_yd,
+        stride_ynm, stride_ynd,
         stride_sm, stride_sd,
         BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         """y = norm(x + residual) — per-row RMSNorm of the elementwise sum.
-        Also stores `summed = x + residual` since the caller usually
-        needs it as the next layer's residual stream (avoids re-doing
-        the add)."""
+        Also stores `summed = x + residual` (for the caller's residual
+        stream) and `y_norm = summed * rms_inv` (the un-scaled normalized
+        value, saved for backward so we don't redo the multiply)."""
         pid_m = tl.program_id(0)
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.arange(0, BLOCK_D)
@@ -1532,25 +1533,125 @@ if _HAS_TRITON:
         s_ptrs = summed_ptr + rows[:, None] * stride_sm + cols[None, :] * stride_sd
         tl.store(s_ptrs, summed.to(summed_ptr.dtype.element_ty), mask=row_mask[:, None])
 
-        # RMSNorm: rsqrt(mean(summed²) + eps), then * norm_weight
+        # RMSNorm: rsqrt(mean(summed²) + eps)
         sum_sq = tl.sum(summed * summed, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
-        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0).to(tl.float32)
-        y = summed * rms_inv[:, None] * nw[None, :]
 
+        # y_norm = summed * rms_inv (unscaled). Save to HBM for backward —
+        # rms_norm bwd needs this exact value; storing it now saves a
+        # multiply per element in the bwd kernel.
+        y_norm = summed * rms_inv[:, None]
+        yn_ptrs = y_norm_ptr + rows[:, None] * stride_ynm + cols[None, :] * stride_ynd
+        tl.store(yn_ptrs, y_norm.to(y_norm_ptr.dtype.element_ty), mask=row_mask[:, None])
+
+        # y = y_norm * nw (final scaled output)
+        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0).to(tl.float32)
+        y = y_norm * nw[None, :]
         y_ptrs = y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yd
         tl.store(y_ptrs, y.to(y_ptr.dtype.element_ty), mask=row_mask[:, None])
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
 
+    @triton.jit
+    def _rms_norm_bwd_with_ynorm_kernel(
+        y_norm_ptr, rms_inv_ptr, nw_ptr,
+        dxhat_ptr,
+        dx_ptr, dnw_partial_ptr,
+        M, K,
+        stride_ynm, stride_ynk,
+        stride_dxhat_m, stride_dxhat_k,
+        stride_dx_m, stride_dx_k,
+        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """Variant of _rms_norm_bwd_kernel that takes pre-computed
+        y_norm = summed * rms_inv directly (skips the per-element
+        multiply in pass 1 and pass 2). Used by FusedAddNorm which
+        stashes y_norm in HBM during forward.
+
+        Math identical to the original kernel:
+          g_eff[m, k] = dx_hat[m, k] * nw[k]
+          inner[m]    = mean_k(g_eff * y_norm)
+          dx[m, k]    = rms_inv[m] * (g_eff - y_norm * inner[m])
+          dnw_partial[m_tile, k] = sum_{m in tile} (dx_hat * y_norm)
+        """
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        ks = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        row_mask = rows < M
+        k_mask = ks < K
+
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+
+        # Pass 1: inner[m] = mean over k of g_eff * y_norm
+        inner = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for k2_start in range(0, K, BLOCK_K):
+            ks2 = k2_start + tl.arange(0, BLOCK_K)
+            k2_mask = ks2 < K
+            yn_ptrs = (
+                y_norm_ptr
+                + rows[:, None] * stride_ynm
+                + ks2[None, :] * stride_ynk
+            )
+            y_norm2 = tl.load(
+                yn_ptrs, mask=row_mask[:, None] & k2_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            dxh_ptrs = (
+                dxhat_ptr
+                + rows[:, None] * stride_dxhat_m
+                + ks2[None, :] * stride_dxhat_k
+            )
+            dxh = tl.load(
+                dxh_ptrs, mask=row_mask[:, None] & k2_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            nw2 = tl.load(nw_ptr + ks2, mask=k2_mask, other=0.0).to(tl.float32)
+            g_eff2 = dxh * nw2[None, :]
+            inner += tl.sum(g_eff2 * y_norm2, axis=1)
+        inner = inner / K
+
+        # Pass 2: compute dx for this k-tile
+        yn_ptrs = y_norm_ptr + rows[:, None] * stride_ynm + ks[None, :] * stride_ynk
+        y_norm = tl.load(
+            yn_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+        ).to(tl.float32)
+        dxh_ptrs = (
+            dxhat_ptr
+            + rows[:, None] * stride_dxhat_m
+            + ks[None, :] * stride_dxhat_k
+        )
+        dxh = tl.load(
+            dxh_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+        ).to(tl.float32)
+        g_eff = dxh * nw[None, :]
+        dx_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None])
+        dx_ptrs = dx_ptr + rows[:, None] * stride_dx_m + ks[None, :] * stride_dx_k
+        tl.store(
+            dx_ptrs,
+            dx_tile.to(dx_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & k_mask[None, :],
+        )
+
+        # Per-m-tile partial dnw[k] = sum over tile rows of (dx_hat * y_norm)
+        dnw_partial = tl.sum(dxh * y_norm, axis=0)
+        dnw_p_ptrs = dnw_partial_ptr + pid_m * K + ks
+        tl.store(dnw_p_ptrs, dnw_partial.to(dnw_partial_ptr.dtype.element_ty), mask=k_mask)
+
+
 class FusedAddNorm(torch.autograd.Function):
     """y = norm(x + residual), also returns summed = x + residual.
 
-    Forward: one Triton kernel does add + RMSNorm + writes both y and
-    summed. Backward reuses the standard RMSNorm-backward Triton kernel
-    plus the identity passthroughs:
-        d_summed = d_norm + d_summed_external   (norm bwd + downstream grad)
-        d_x = d_residual = d_summed              (sum passthrough)
+    Forward: one Triton kernel does add + RMSNorm + writes y, summed,
+    and the un-scaled normalized intermediate `y_norm = summed * rms_inv`.
+    y_norm is the exact value the RMSNorm-backward kernel needs internally —
+    saving it to HBM during forward means the backward kernel can load it
+    directly instead of recomputing `summed * rms_inv` per element.
+
+    Backward uses a specialized `_rms_norm_bwd_with_ynorm_kernel` that
+    consumes y_norm directly. Identity passthroughs:
+        d_summed = d_norm_from_kernel + d_summed_external
+        d_x = d_residual = d_summed
     """
 
     @staticmethod
@@ -1562,46 +1663,51 @@ class FusedAddNorm(torch.autograd.Function):
         assert residual.shape == (M, D)
         assert norm_weight.shape == (D,)
         y = torch.empty_like(x)
+        y_norm = torch.empty_like(x)
         summed = torch.empty_like(x)
         rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
         BLOCK_M = 32
         grid = (triton.cdiv(M, BLOCK_M),)
         _fused_add_norm_fwd_kernel[grid](
             x, residual, norm_weight,
-            y, rms_inv, summed,
+            y, y_norm, rms_inv, summed,
             M, D, eps,
             x.stride(0), x.stride(1),
             residual.stride(0), residual.stride(1),
             y.stride(0), y.stride(1),
+            y_norm.stride(0), y_norm.stride(1),
             summed.stride(0), summed.stride(1),
             BLOCK_M=BLOCK_M, BLOCK_D=D,
         )
-        ctx.save_for_backward(summed, norm_weight, rms_inv)
+        # Save y_norm instead of summed: backward only needs y_norm to
+        # compute dx via the rms_norm bwd path. summed isn't needed for
+        # any gradient; it's just a forward-side residual stream output.
+        ctx.save_for_backward(y_norm, norm_weight, rms_inv)
         ctx.M, ctx.D = M, D
         return y, summed
 
     @staticmethod
     def backward(ctx, dy, d_summed_external):
-        summed, nw, rms_inv = ctx.saved_tensors
+        y_norm, nw, rms_inv = ctx.saved_tensors
         M, D = ctx.M, ctx.D
         dy = dy.contiguous()
         d_summed_external = d_summed_external.contiguous()
 
-        # RMSNorm backward (Triton — reuse _rms_norm_bwd_kernel from MLP fusion)
-        # Input to norm was `summed`; weight is `nw`. Backward gives d_summed_from_norm + dnw.
+        # RMSNorm backward using pre-computed y_norm (saved by forward to
+        # skip the multiply that _rms_norm_bwd_kernel would do internally).
         BLOCK_M_BWD, BLOCK_K_BWD = 32, 64
         num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
-        d_summed_from_norm = torch.empty_like(summed)
+        d_summed_from_norm = torch.empty_like(y_norm)
         dnw_partials = torch.empty(
-            (num_m_tiles, D), dtype=nw.dtype, device=summed.device,
+            (num_m_tiles, D), dtype=nw.dtype, device=y_norm.device,
         )
         grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_K_BWD))
-        _rms_norm_bwd_kernel[grid_bwd](
-            summed, rms_inv, nw,
+        _rms_norm_bwd_with_ynorm_kernel[grid_bwd](
+            y_norm, rms_inv, nw,
             dy,
             d_summed_from_norm, dnw_partials,
             M, D,
-            summed.stride(0), summed.stride(1),
+            y_norm.stride(0), y_norm.stride(1),
             dy.stride(0), dy.stride(1),
             d_summed_from_norm.stride(0), d_summed_from_norm.stride(1),
             BLOCK_M=BLOCK_M_BWD, BLOCK_K=BLOCK_K_BWD,
