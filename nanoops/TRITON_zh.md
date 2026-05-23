@@ -332,15 +332,6 @@ naive 的比值不变。
   能 fuse 进 `tl.dot` epilogue 把 elementwise launch 消化掉的，**几乎
   总是值得做**。
 
-### 与其他 GPU 对比（移植参考）
-
-| GPU         | SMs | Shared/SM | 显存            | 带宽         | 对我们 kernel 的影响                |
-| ----------- | --- | --------- | --------------- | ------------ | ----------------------------------- |
-| **RTX 3090**| 82  | 100 KB    | 24 GB GDDR6X    | 936 GB/s     | （我们的目标硬件）                  |
-| RTX 4090    | 128 | 100 KB    | 24 GB GDDR6X    | 1008 GB/s    | 同样 tile size 应该直接能用         |
-| A100 80GB   | 108 | 164 KB    | 80 GB HBM2e     | 1935 GB/s    | tile 可以放大 ~1.5×                 |
-| H100 SXM    | 132 | 228 KB    | 80 GB HBM3      | 3000+ GB/s   | 大 tile + 解锁 FA3 / TMA 路径       |
-
 ---
 
 （第 2 章及后续 —— 单 kernel 深度解读 —— 待写）

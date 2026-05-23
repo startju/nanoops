@@ -371,15 +371,6 @@ A **warp** = 32 threads. The fundamental scheduling unit.
   elementwise launch with an epilogue inside a `tl.dot`-using kernel
   is almost always a win.
 
-### Comparison with other GPUs (for porting context)
-
-| GPU         | SMs | Shared/SM | Mem            | Bandwidth   | Notable for our kernels             |
-| ----------- | --- | --------- | -------------- | ----------- | ----------------------------------- |
-| **RTX 3090**| 82  | 100 KB    | 24 GB GDDR6X   | 936 GB/s    | (our target)                        |
-| RTX 4090    | 128 | 100 KB    | 24 GB GDDR6X   | 1008 GB/s   | Same tile sizes likely fine         |
-| A100 80GB   | 108 | 164 KB    | 80 GB HBM2e    | 1935 GB/s   | Can roughly 1.5× the tile sizes     |
-| H100 SXM    | 132 | 228 KB    | 80 GB HBM3     | 3000+ GB/s  | Bigger tiles + FA3 / TMA path opens |
-
 ---
 
 (Chapters 2+ — per-kernel deep dive — TBD)
