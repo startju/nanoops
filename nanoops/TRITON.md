@@ -292,6 +292,47 @@ shared/block:
 
 2 blocks × (512/32) = **32 warps resident** → 32/48 = **67% occupancy**.
 
+#### Register pressure — when the limit really bites
+
+A per-thread architectural max of 255 registers means `reg/thread ×
+active threads ≤ 65,536`. So `255 × 1536 = 391,680` is impossible —
+you can't actually run 1,536 threads each using 255 registers. The
+hardware uses register count to **directly cap active thread count**.
+
+Sweep over reg/thread (3090, ignoring shared-mem/block-cap):
+
+| reg/thread | Active threads/SM | Active warps | Occupancy |
+| ---------- | ----------------- | ------------ | --------- |
+| 32         | 1,536 (hw cap)    | 48           | **100%**  |
+| 42         | 1,536 (hw cap)    | 48           | **100%** ← sweet spot (65,536/42=1,560) |
+| 43         | 1,524             | 47           | 98%       |
+| 64         | 1,024             | 32           | 67%       |
+| 128        | 512               | 16           | 33%       |
+| 255 (max)  | **256**           | **8**        | **17%**   |
+
+42 regs/thread is the cliff: any more and occupancy starts dropping
+because the register file runs out before the 1,536-thread cap does.
+
+#### Why compilers sometimes pick high reg counts anyway
+
+Going over 255 registers isn't allowed — they get **spilled to local
+memory** (a private region in HBM). One spill access ≈ 300 cycles, vs
+1 cycle for a register read. **Spilling is much worse than lower
+occupancy**, so compilers (NVCC, Triton) trade occupancy down to avoid
+spilling whenever they can.
+
+A complex SDPA-backward kernel might genuinely need 100+ registers
+per thread → 33% occupancy → and the larger tile size that the
+register budget bought back more than makes up for fewer warps. nanoops'
+matmul kernels typically land in the 50-100 reg/thread range,
+30-70% occupancy.
+
+There's no Triton API to set reg/thread directly; it's chosen by the
+compiler based on the kernel body, `BLOCK_*` sizes, `num_warps`, and
+`num_stages`. To force a cap, the CUDA path uses
+`nvcc -maxrregcount=N`, but it's rarely the right move — the compiler's
+spill-vs-occupancy trade-off is usually better than hand-tuning.
+
 Three knobs Triton exposes to tune this:
 
 - **BLOCK_M / BLOCK_N / BLOCK_K** ↑ → per-block thread / register /
