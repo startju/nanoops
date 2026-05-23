@@ -137,6 +137,26 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 register 里，**省下 2·M·D 的 HBM round-trip**——带宽 bound 的 op 上**纯
 赚**，没副作用。`fused_add_norm` 在 block 边界也是一样的道理。
 
+**SDPA：为什么 Flash Attention 存在。** 同样的 AI 视角下，SDPA 有
+**两个** AI 数字，取决于 `(L, L)` 的 P 矩阵是否物化到 HBM。
+
+nanchat d24 (B=1, H=12, L=2048, D_head=128) 完整 attention
+(Q@K^T + softmax + @V，两步合计)：
+
+| 实现                                    | 总 FLOPs | 总 Bytes | AI                |
+| --------------------------------------- | -------- | -------- | ----------------- |
+| Naive SDPA（物化 P 到 HBM）             | 25.8 G   | ~226 MB  | **~114 FLOPs/byte** (偏带宽)  |
+| Flash SDPA（P 留 register）             | 25.8 G   | ~25 MB   | **~1024 FLOPs/byte** (算力 bound) |
+
+P 矩阵在这个 scale 下是 `B·H·L·L = 100 MB`，naive 字节数被它主导。
+Flash 用 online softmax + tile streaming 让 P 留 register，HBM 流量
+缩到只剩 `Q + K + V + O` (~25 MB)，把 SDPA 从带宽 bound (~114 < 152
+break-even) **翻成算力 bound** (~1024 >> break-even)。
+
+**8x AI 提升**就是 Flash Attention 比 naive SDPA 快 2-4× 的根源——
+**FLOPs 没变，HBM 流量少 9×**。Sliding window attention 把两个数字按
+比例缩小（band size W 代替 L），但 Flash-vs-naive 的比值不变。
+
 ### Tensor cores vs CUDA (FP32) cores
 
 **完全不同的两套硬件单元**，做不同工作。理解切分方式决定你怎么算 kernel

@@ -149,6 +149,29 @@ into the adjacent matmul kernel (`NormMLPReluSquare`,
 saving the 2·M·D round-trip — pure bandwidth win on a bandwidth-bound
 op, no downside. Same idea for fused_add_norm at block boundaries.
 
+**SDPA: why Flash Attention exists.** Same AI lens shows the SDPA
+case has *two* numbers depending on whether the `(L, L)` P matrix
+gets materialized.
+
+For nanchat d24 (B=1, H=12, L=2048, D_head=128), full attention
+(Q@K^T + softmax + @V, both passes):
+
+| Implementation                          | Total FLOPs | Total bytes | AI                |
+| --------------------------------------- | ----------- | ----------- | ----------------- |
+| Naive SDPA (materialize P to HBM)       | 25.8 G      | ~226 MB     | **~114 FLOPs/byte** (bandwidth-ish) |
+| Flash SDPA (P stays in registers)       | 25.8 G      | ~25 MB      | **~1024 FLOPs/byte** (compute-bound) |
+
+The P matrix is `B·H·L·L = 100 MB` at this scale and dominates the
+naive byte count. Flash's online softmax + tile streaming keeps P in
+registers so the HBM traffic shrinks to just `Q + K + V + O` (~25 MB),
+flipping SDPA from bandwidth-bound (~114 < 152 break-even) to
+compute-bound (~1024 >> break-even).
+
+This **8x AI gain** is exactly why Flash Attention is 2-4× faster than
+naive SDPA — same FLOPs, ~9× less HBM traffic. Sliding-window
+attention shrinks both numbers proportionally (band of size W instead
+of L), but the same Flash-vs-naive ratio still applies.
+
 ### Tensor cores vs CUDA (FP32) cores
 
 These are **different physical units**, optimized for different work
