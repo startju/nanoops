@@ -92,8 +92,18 @@ weight 预先 prune 到这个 pattern——通常用于 inference weight，nanoo
 GB/s = **每 byte 152 FLOPs**。一个 op 的 arithmetic intensity（每 byte
 FLOPs）**低于这个值就是带宽 bound，高于就是算力 bound**。
 
-nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：arithmetic intensity
-= `M·N·K / (M·K + K·N + M·N)` FLOPs/byte (bf16) —
+**Arithmetic intensity 怎么算**（matmul `C = A @ B`，shape
+`(M, K) @ (K, N) → (M, N)`，全 bf16）：
+
+- **FLOPs** = `2·M·N·K`——每个 output 元素需要 K 次 multiply-add，每个
+  multiply-add = 2 FLOPs
+- **Bytes** = `2·(M·K + K·N + M·N)`——读 A + 读 B + 写 C，bf16 每元素 2 字节
+- **AI** = FLOPs / Bytes = `M·N·K / (M·K + K·N + M·N)`（2 互相消掉）
+
+跟 152 FLOPs/byte 分水岭（= 142 TFLOPS / 936 GB/s）比，**高于**是算力
+bound，**低于**是带宽 bound。
+
+nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 
 | Matmul 位置                | Shape (M, K, N)       | AI (FLOPs/byte) |
 | -------------------------- | --------------------- | --------------- |

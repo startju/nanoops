@@ -99,8 +99,20 @@ pattern — typically applied to inference weights, not used in nanoops.)
 bf16 = 142 TFLOPS / 936 GB/s = **152 FLOPs per byte**. Any op below
 that ratio is bandwidth-bound; above it is compute-bound.
 
+**How arithmetic intensity is computed** (for a matmul `C = A @ B`,
+shapes `(M, K) @ (K, N) → (M, N)`, all bf16):
+
+- **FLOPs** = `2·M·N·K` — each output element needs K multiply-adds (each
+  multiply-add = 2 FLOPs)
+- **Bytes** = `2·(M·K + K·N + M·N)` — read A + read B + write C, 2 bytes
+  per bf16 element
+- **AI** = FLOPs / Bytes = `M·N·K / (M·K + K·N + M·N)` (the 2's cancel)
+
+The break-even at 152 FLOPs/byte (= 142 TFLOPS / 936 GB/s) tells you
+whether the matmul is bottlenecked by GPU compute (above) or HBM
+bandwidth (below).
+
 For nanchat-d24 matmuls at training shapes (M=2048, K=1536; N varies):
-arithmetic intensity = `M·N·K / (M·K + K·N + M·N)` FLOPs/byte (bf16) —
 
 | Matmul site                | Shape (M, K, N)       | AI (FLOPs/byte) |
 | -------------------------- | --------------------- | --------------- |
