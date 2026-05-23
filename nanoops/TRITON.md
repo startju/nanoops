@@ -89,8 +89,11 @@ Boost clock 1695 MHz, 82 SMs.
 | FP16 (Tensor) with 2:4 sparsity  | 2048 FLOPs/cycle           | 284 TFLOPS          |
 | INT8 (Tensor cores)              | 2048 ops/cycle             | 284 TOPS            |
 
-(Consumer Ampere has half rate vs A100 for FP16-with-FP32-accumulate;
-the 142 TFLOPS figure already reflects that "consumer cap".)
+(Consumer Ampere has a NVIDIA-imposed cap on FP16/BF16 with FP32
+accumulator. The 142 TFLOPS figure already reflects that cap. The
+FP16-with-FP16-accumulator path runs at the uncapped ~284 TFLOPS, but
+training needs the FP32 accumulator for numerical stability so the
+142 TFLOPS number is what we actually see.)
 
 **Memory side**: 936 GB/s HBM bandwidth. Compute-to-bandwidth ratio at
 bf16 = 142 TFLOPS / 936 GB/s = **152 FLOPs per byte**. Any op below
