@@ -15,6 +15,40 @@
 这些参数定的**。换其他 GPU（4090 / A100 / H100 / 消费级 Ada）跑大部分
 kernel 还能用，但 tile size 多半已经不是最优了。
 
+### 整 chip 总览
+
+| 项                  | 数值                  |
+| ------------------- | --------------------- |
+| **SM 数**           | **82**                |
+| 总 FP32 cores       | 82 × 128 = 10,496     |
+| 总 Tensor cores     | 82 × 4 = 328          |
+| 总 register file    | 82 × 64K = 5.4 M regs |
+| 总 shared mem       | 82 × 100 KB = 8.2 MB  |
+| **显存**            | **24 GB GDDR6X**      |
+| HBM 带宽            | **936 GB/s**          |
+| Compute capability  | **8.6**               |
+
+### 每 SM 资源
+
+| 资源                     | 数值              | 说明                                  |
+| ------------------------ | ----------------- | ------------------------------------- |
+| L1 / Shared memory      | 128 KB combined   | 可配置切分 L1 vs shared              |
+| Shared mem **每 block 上限** | **100 KB**        | per-block 申请；共住 block 共享 SM 的 100 KB 池 → 卡 blocks/SM |
+| Registers / SM          | 65,536 × 32-bit   | = 256 KB；per-thread 分配，SM 上所有活跃 thread 共享这个池 → **既限活跃 thread 数也限 blocks/SM**（通过 thread 换算） |
+| Max threads / SM        | 1,536             | = 48 warps；卡 blocks/SM 为 `1536 / threads_per_block` |
+| Max blocks / SM         | 16                | 不管资源够不够，硬件 block 共住上限 |
+| Tensor cores            | 4 (3rd gen)       | bf16 / fp16 / tf32 / int8             |
+| FP32 cores              | 128               |                                       |
+| Warp size               | 32 threads        |                                       |
+
+### 每 Thread Block 限制
+
+| 限制                | 数值       |
+| ------------------- | ---------- |
+| Max threads          | 1024 (32 warps) |
+| Max shared memory    | **100 KB** |
+| Max registers/thread | 255（超了 spill 到 local memory，慢）|
+
 ### Compile-time vs runtime：什么时候 frozen
 
 理解本章关键的一条事实：**几乎所有影响 occupancy 的量都是编译期 frozen
@@ -64,40 +98,6 @@ occupancy      = resident_warps / 48
   只是 `48 × 32` 的换算。
 - **④ 是 per-block 总 register 用量** —— `threads_per_block · reg/thread`
   是一个 block 从 SM 65,536-register 池子里占的总量。
-
-### 每 SM 资源
-
-| 资源                     | 数值              | 说明                                  |
-| ------------------------ | ----------------- | ------------------------------------- |
-| L1 / Shared memory      | 128 KB combined   | 可配置切分 L1 vs shared              |
-| Shared mem **每 block 上限** | **100 KB**        | per-block 申请；共住 block 共享 SM 的 100 KB 池 → 卡 blocks/SM |
-| Registers / SM          | 65,536 × 32-bit   | = 256 KB；per-thread 分配，SM 上所有活跃 thread 共享这个池 → **既限活跃 thread 数也限 blocks/SM**（通过 thread 换算） |
-| Max threads / SM        | 1,536             | = 48 warps；卡 blocks/SM 为 `1536 / threads_per_block` |
-| Max blocks / SM         | 16                | 不管资源够不够，硬件 block 共住上限 |
-| Tensor cores            | 4 (3rd gen)       | bf16 / fp16 / tf32 / int8             |
-| FP32 cores              | 128               |                                       |
-| Warp size               | 32 threads        |                                       |
-
-### 每 Thread Block 限制
-
-| 限制                | 数值       |
-| ------------------- | ---------- |
-| Max threads          | 1024 (32 warps) |
-| Max shared memory    | **100 KB** |
-| Max registers/thread | 255（超了 spill 到 local memory，慢）|
-
-### 整 chip 总览
-
-| 项                  | 数值                  |
-| ------------------- | --------------------- |
-| **SM 数**           | **82**                |
-| 总 FP32 cores       | 82 × 128 = 10,496     |
-| 总 Tensor cores     | 82 × 4 = 328          |
-| 总 register file    | 82 × 64K = 5.4 M regs |
-| 总 shared mem       | 82 × 100 KB = 8.2 MB  |
-| **显存**            | **24 GB GDDR6X**      |
-| HBM 带宽            | **936 GB/s**          |
-| Compute capability  | **8.6**               |
 
 ### FMA 和 MMA —— 两种基础算子
 

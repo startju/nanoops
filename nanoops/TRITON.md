@@ -17,6 +17,40 @@ below is keyed to these numbers. If you port to a different GPU
 (RTX 4090 / A100 / H100 / consumer Ada), most kernels will run, but the
 tile sizes are likely no longer optimal.
 
+### Whole-chip totals
+
+| Item                | Value                |
+| ------------------- | -------------------- |
+| **SMs**             | **82**               |
+| Total FP32 cores    | 82 × 128 = 10,496    |
+| Total Tensor cores  | 82 × 4 = 328         |
+| Total register file | 82 × 64K = 5.4 M regs|
+| Total shared mem    | 82 × 100 KB = 8.2 MB |
+| **Device memory**   | **24 GB GDDR6X**     |
+| HBM bandwidth       | **936 GB/s**         |
+| Compute capability  | **8.6**              |
+
+### Per-SM resources
+
+| Resource                | Value           | Notes                                     |
+| ----------------------- | --------------- | ----------------------------------------- |
+| L1 / shared memory      | 128 KB combined | configurable split between L1 and shared  |
+| Shared mem **per block**| **100 KB max**  | per-block allocation; co-resident blocks share the SM's 100 KB pool → caps blocks/SM |
+| Registers per SM        | 65,536 × 32-bit | = 256 KB; per-thread allocation, all active threads on SM share this pool → caps both active-thread count AND blocks/SM (via thread count) |
+| Max threads / SM        | 1,536           | = 48 warps; caps blocks/SM as `1536 / threads_per_block` |
+| Max blocks / SM         | 16              | hardware cap on number of co-resident blocks regardless of resources |
+| Tensor cores            | 4 (3rd gen)     | bf16 / fp16 / tf32 / int8                 |
+| FP32 cores              | 128             |                                           |
+| Warp size               | 32 threads      |                                           |
+
+### Per-thread-block limits
+
+| Limit              | Value      |
+| ------------------ | ---------- |
+| Max threads        | 1024 (32 warps) |
+| Max shared memory  | **100 KB** |
+| Max registers/thread | 255 (more → spill to local memory, slow) |
+
 ### Compile-time vs runtime: what's frozen when
 
 A central fact that makes the rest of this chapter make sense:
@@ -71,40 +105,6 @@ Subtleties:
 - **④ counts per-block total register use** — `threads_per_block ·
   reg/thread` is what one block claims from the SM's 65,536-register
   pool.
-
-### Per-SM resources
-
-| Resource                | Value           | Notes                                     |
-| ----------------------- | --------------- | ----------------------------------------- |
-| L1 / shared memory      | 128 KB combined | configurable split between L1 and shared  |
-| Shared mem **per block**| **100 KB max**  | per-block allocation; co-resident blocks share the SM's 100 KB pool → caps blocks/SM |
-| Registers per SM        | 65,536 × 32-bit | = 256 KB; per-thread allocation, all active threads on SM share this pool → caps both active-thread count AND blocks/SM (via thread count) |
-| Max threads / SM        | 1,536           | = 48 warps; caps blocks/SM as `1536 / threads_per_block` |
-| Max blocks / SM         | 16              | hardware cap on number of co-resident blocks regardless of resources |
-| Tensor cores            | 4 (3rd gen)     | bf16 / fp16 / tf32 / int8                 |
-| FP32 cores              | 128             |                                           |
-| Warp size               | 32 threads      |                                           |
-
-### Per-thread-block limits
-
-| Limit              | Value      |
-| ------------------ | ---------- |
-| Max threads        | 1024 (32 warps) |
-| Max shared memory  | **100 KB** |
-| Max registers/thread | 255 (more → spill to local memory, slow) |
-
-### Whole-chip totals
-
-| Item                | Value                |
-| ------------------- | -------------------- |
-| **SMs**             | **82**               |
-| Total FP32 cores    | 82 × 128 = 10,496    |
-| Total Tensor cores  | 82 × 4 = 328         |
-| Total register file | 82 × 64K = 5.4 M regs|
-| Total shared mem    | 82 × 100 KB = 8.2 MB |
-| **Device memory**   | **24 GB GDDR6X**     |
-| HBM bandwidth       | **936 GB/s**         |
-| Compute capability  | **8.6**              |
 
 ### FMA vs MMA — the two primitive ops
 
