@@ -99,11 +99,18 @@ pattern — typically applied to inference weights, not used in nanoops.)
 bf16 = 142 TFLOPS / 936 GB/s = **152 FLOPs per byte**. Any op below
 that ratio is bandwidth-bound; above it is compute-bound.
 
-For nanchat-d24 matmuls (M=2048, K=1536, N=1536): arithmetic intensity
-= 2*M*K*N / (M*K + K*N + M*N) ≈ 766 FLOPs/byte → comfortably
-compute-bound. Plain elementwise ops (relu, add) ≈ 1-2 FLOPs/byte →
-bandwidth-bound. SDPA's `Q@K^T` is somewhere in between depending on
-seq length.
+For nanchat-d24 matmuls at training shapes (M=2048, K=1536; N varies):
+arithmetic intensity = `M·N·K / (M·K + K·N + M·N)` FLOPs/byte (bf16) —
+
+| Matmul site                | Shape (M, K, N)       | AI (FLOPs/byte) |
+| -------------------------- | --------------------- | --------------- |
+| c_q / c_k / c_v / attn c_proj | (2048, 1536, 1536) | **558**         |
+| MLP c_fc (D → 4D)          | (2048, 1536, 6144)    | **770**         |
+| MLP c_proj (4D → D)        | (2048, 6144, 1536)    | **770**         |
+
+All comfortably above the 152 FLOPs/byte break-even → **compute-bound**.
+Plain elementwise ops (relu, add) ≈ 1-2 FLOPs/byte → **bandwidth-bound**.
+SDPA's `Q@K^T` is in between depending on seq length and head dim.
 
 ### Tensor cores vs CUDA (FP32) cores
 

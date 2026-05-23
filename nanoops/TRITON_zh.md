@@ -92,10 +92,18 @@ weight 预先 prune 到这个 pattern——通常用于 inference weight，nanoo
 GB/s = **每 byte 152 FLOPs**。一个 op 的 arithmetic intensity（每 byte
 FLOPs）**低于这个值就是带宽 bound，高于就是算力 bound**。
 
-nanchat d24 matmul (M=2048, K=1536, N=1536)：arithmetic intensity =
-2*M*K*N / (M*K + K*N + M*N) ≈ **766 FLOPs/byte** → 妥妥算力 bound。
-普通 elementwise op (relu, add) ≈ 1-2 FLOPs/byte → **带宽 bound**。
-SDPA 的 `Q@K^T` 介于中间，看 seq length。
+nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：arithmetic intensity
+= `M·N·K / (M·K + K·N + M·N)` FLOPs/byte (bf16) —
+
+| Matmul 位置                | Shape (M, K, N)       | AI (FLOPs/byte) |
+| -------------------------- | --------------------- | --------------- |
+| c_q / c_k / c_v / attn c_proj | (2048, 1536, 1536) | **558**         |
+| MLP c_fc (D → 4D)          | (2048, 1536, 6144)    | **770**         |
+| MLP c_proj (4D → D)        | (2048, 6144, 1536)    | **770**         |
+
+全部远超 152 FLOPs/byte 分水岭 → **算力 bound**。普通 elementwise op
+(relu, add) ≈ 1-2 FLOPs/byte → **带宽 bound**。SDPA 的 `Q@K^T` 介于
+中间，看 seq length 和 head dim。
 
 ### Tensor cores vs CUDA (FP32) cores
 
