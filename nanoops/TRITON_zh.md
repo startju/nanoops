@@ -32,7 +32,7 @@ kernel 还能用，但 tile size 多半已经不是最优了。
 
 | 资源                     | 数值              | 说明                                  |
 | ------------------------ | ----------------- | ------------------------------------- |
-| L1 / Shared memory      | 128 KB combined   | 可配置切分 L1 vs shared              |
+| L1 / Shared memory      | 128 KB combined   | 零和分配：`shared_carveout + L1 = 128 KB`；sm_86 允许的 shared 值是 `{0, 8, 16, 32, 64, 100} KB`——选 shared 100 KB 时 L1 只剩 28 KB |
 | Shared mem **每 block 上限** | **100 KB**        | per-block 申请；共住 block 共享 SM 的 100 KB 池 → 卡 blocks/SM |
 | Registers / SM          | 65,536 × 32-bit   | = 256 KB；per-thread 分配，SM 上所有活跃 thread 共享这个池 → **既限活跃 thread 数也限 blocks/SM**（通过 thread 换算） |
 | Max threads / SM        | 1,536             | = 48 warps；卡 blocks/SM 为 `1536 / threads_per_block` |

@@ -34,7 +34,7 @@ tile sizes are likely no longer optimal.
 
 | Resource                | Value           | Notes                                     |
 | ----------------------- | --------------- | ----------------------------------------- |
-| L1 / shared memory      | 128 KB combined | configurable split between L1 and shared  |
+| L1 / shared memory      | 128 KB combined | zero-sum split: `shared_carveout + L1 = 128 KB`; sm_86 allowed shared values are `{0, 8, 16, 32, 64, 100} KB` — selecting 100 KB shared leaves only 28 KB L1 |
 | Shared mem **per block**| **100 KB max**  | per-block allocation; co-resident blocks share the SM's 100 KB pool → caps blocks/SM |
 | Registers per SM        | 65,536 × 32-bit | = 256 KB; per-thread allocation, all active threads on SM share this pool → caps both active-thread count AND blocks/SM (via thread count) |
 | Max threads / SM        | 1,536           | = 48 warps; caps blocks/SM as `1536 / threads_per_block` |
