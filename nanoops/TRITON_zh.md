@@ -83,11 +83,6 @@ Boost clock 1695 MHz，82 个 SM。
 | FP16 (Tensor) + 2:4 稀疏       | 2048 FLOPs/cycle            | 284 TFLOPS          |
 | INT8 (Tensor cores)            | 2048 ops/cycle              | 284 TOPS            |
 
-（消费级 Ampere 对 FP16/BF16-with-FP32-accumulate 有 NVIDIA 强制的速率 cap。
-上表 142 TFLOPS 已经反映了这个 cap。FP16-with-FP16-accumulator 路径不被
-cap，能跑到 ~284 TFLOPS，但训练需要 FP32 accumulator 才能数值稳定，所以
-实际遇到的就是 142 TFLOPS。）
-
 **Memory 侧**：HBM 带宽 936 GB/s。bf16 算力 / 带宽 = 142 TFLOPS / 936
 GB/s = **每 byte 152 FLOPs**。一个 op 的 arithmetic intensity（每 byte
 FLOPs）**低于这个值就是带宽 bound，高于就是算力 bound**。
