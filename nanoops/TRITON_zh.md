@@ -111,9 +111,31 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 | MLP c_fc (D → 4D)          | (2048, 1536, 6144)    | **770**         |
 | MLP c_proj (4D → D)        | (2048, 6144, 1536)    | **770**         |
 
-全部远超 152 FLOPs/byte 分水岭 → **算力 bound**。普通 elementwise op
-(relu, add) ≈ 1-2 FLOPs/byte → **带宽 bound**。SDPA 的 `Q@K^T` 介于
-中间，看 seq length 和 head dim。
+全部远超 152 FLOPs/byte 分水岭 → **算力 bound**。
+
+**RMSNorm 和其他 elementwise / reduction op 严重 bandwidth-bound** ——
+比 break-even 差 100×。对一行 D 个元素：
+
+- FLOPs ≈ `4·D`（`mean(x²)` ≈ 2D，再 `x · rms_inv · weight` = 2D）
+- Bytes (bf16) ≈ `4·D`（读 x = 2D，写 y = 2D；weight 整 kernel 共享 `D`，
+  摊薄忽略）
+- **AI ≈ 1 FLOPs/byte** —— 比 152 break-even 差约 **100×**，重度带宽 bound
+
+各 op AI 对比（训练 shape）：
+
+| Op                          | AI (FLOPs/byte) | 性质        |
+| --------------------------- | --------------- | ----------- |
+| MLP / QKV matmul            | 558 – 770       | 算力 bound  |
+| SDPA `Q@K^T` (B=1, L=2048)  | ~50 – 100       | 中间        |
+| **RMSNorm**                 | **~1**          | 带宽 bound  |
+| Elementwise (add, relu)     | ~0.5            | 带宽 bound  |
+| Memcpy H2D / D2H            | 0               | 带宽 bound  |
+
+**这就是 fusion 设计的根源**：独立的 RMSNorm kernel 做 ~4·M·D 字节 HBM
+流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
+（`NormMLPReluSquare`、`NormQKVProjection`），让归一化的中间值留在
+register 里，**省下 2·M·D 的 HBM round-trip**——带宽 bound 的 op 上**纯
+赚**，没副作用。`fused_add_norm` 在 block 边界也是一样的道理。
 
 ### Tensor cores vs CUDA (FP32) cores
 

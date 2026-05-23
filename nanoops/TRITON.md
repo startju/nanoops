@@ -121,8 +121,33 @@ For nanchat-d24 matmuls at training shapes (M=2048, K=1536; N varies):
 | MLP c_proj (4D → D)        | (2048, 6144, 1536)    | **770**         |
 
 All comfortably above the 152 FLOPs/byte break-even → **compute-bound**.
-Plain elementwise ops (relu, add) ≈ 1-2 FLOPs/byte → **bandwidth-bound**.
-SDPA's `Q@K^T` is in between depending on seq length and head dim.
+
+**RMSNorm and other elementwise/reduction ops are heavily
+bandwidth-bound** — about 100× below break-even. For one row of D
+elements:
+
+- FLOPs ≈ `4·D` (mean(x²) = ~2D, then `x · rms_inv · weight` = 2D)
+- Bytes (bf16) ≈ `4·D` (read x = 2D, write y = 2D; weight read is `D`
+  per kernel, amortized away)
+- **AI ≈ 1 FLOPs/byte** — vs 152 break-even, this is bandwidth-bound
+  by ~100×
+
+Summary table (training-shape scale):
+
+| Op                          | AI (FLOPs/byte) | Bound      |
+| --------------------------- | --------------- | ---------- |
+| MLP / QKV matmul            | 558 – 770       | compute    |
+| SDPA `Q@K^T` (B=1, L=2048)  | ~50 – 100       | mixed      |
+| **RMSNorm**                 | **~1**          | bandwidth  |
+| Elementwise (add, relu)     | ~0.5            | bandwidth  |
+| Memcpy H2D / D2H            | 0               | bandwidth  |
+
+**Why this motivates the fusion stack:** standalone RMSNorm kernel
+does ~4·M·D bytes of HBM traffic for ~0 compute return. Fusing norm
+into the adjacent matmul kernel (`NormMLPReluSquare`,
+`NormQKVProjection`) keeps the normalized intermediate in registers,
+saving the 2·M·D round-trip — pure bandwidth win on a bandwidth-bound
+op, no downside. Same idea for fused_add_norm at block boundaries.
 
 ### Tensor cores vs CUDA (FP32) cores
 
