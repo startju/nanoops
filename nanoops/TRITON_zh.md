@@ -1,4 +1,4 @@
-# nanoops Triton Kernels —— 架构笔记
+# nanoops Triton Kernels
 
 `nanoops/triton_kernels.py` 里 fused CUDA kernel 的深度解读。面向**读过
 代码、想理解设计取舍**的人（block size 怎么选的、fusion 边界在哪、ctx

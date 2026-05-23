@@ -1,4 +1,4 @@
-# nanoops Triton Kernels — Architecture Notes
+# nanoops Triton Kernels
 
 Deep dive into the fused CUDA kernels in `nanoops/triton_kernels.py`. Aimed
 at someone who's read the kernels and wants to understand the design
