@@ -22,10 +22,10 @@ tile sizes are likely no longer optimal.
 | Resource                | Value           | Notes                                     |
 | ----------------------- | --------------- | ----------------------------------------- |
 | L1 / shared memory      | 128 KB combined | configurable split between L1 and shared  |
-| Shared mem **per block**| **100 KB max**  | hard cap our kernels must respect         |
-| Registers per SM        | 65,536 × 32-bit | = 256 KB                                  |
-| Max threads / SM        | 1,536           | = 48 warps                                |
-| Max blocks / SM         | 16              |                                           |
+| Shared mem **per block**| **100 KB max**  | per-block allocation; co-resident blocks share the SM's 100 KB pool → caps blocks/SM |
+| Registers per SM        | 65,536 × 32-bit | = 256 KB; per-thread allocation, all active threads on SM share this pool → caps both active-thread count AND blocks/SM (via thread count) |
+| Max threads / SM        | 1,536           | = 48 warps; caps blocks/SM as `1536 / threads_per_block` |
+| Max blocks / SM         | 16              | hardware cap on number of co-resident blocks regardless of resources |
 | Tensor cores            | 4 (3rd gen)     | bf16 / fp16 / tf32 / int8                 |
 | FP32 cores              | 128             |                                           |
 | Warp size               | 32 threads      |                                           |

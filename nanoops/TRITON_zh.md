@@ -20,10 +20,10 @@ kernel 还能用，但 tile size 多半已经不是最优了。
 | 资源                     | 数值              | 说明                                  |
 | ------------------------ | ----------------- | ------------------------------------- |
 | L1 / Shared memory      | 128 KB combined   | 可配置切分 L1 vs shared              |
-| Shared mem **每 block 上限** | **100 KB**        | 我们 kernel 必须遵守的硬上限         |
-| Registers / SM          | 65,536 × 32-bit   | = 256 KB                              |
-| Max threads / SM        | 1,536             | = 48 warps                            |
-| Max blocks / SM         | 16                |                                       |
+| Shared mem **每 block 上限** | **100 KB**        | per-block 申请；共住 block 共享 SM 的 100 KB 池 → 卡 blocks/SM |
+| Registers / SM          | 65,536 × 32-bit   | = 256 KB；per-thread 分配，SM 上所有活跃 thread 共享这个池 → **既限活跃 thread 数也限 blocks/SM**（通过 thread 换算） |
+| Max threads / SM        | 1,536             | = 48 warps；卡 blocks/SM 为 `1536 / threads_per_block` |
+| Max blocks / SM         | 16                | 不管资源够不够，硬件 block 共住上限 |
 | Tensor cores            | 4 (3rd gen)       | bf16 / fp16 / tf32 / int8             |
 | FP32 cores              | 128               |                                       |
 | Warp size               | 32 threads        |                                       |
