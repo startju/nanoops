@@ -29,7 +29,7 @@ time**, not at launch.
 | `reg/thread`              | **compile time** | compiler (Triton / NVCC) after static analysis of the kernel body |
 | `shared_mem / block`      | **compile time** | compiler (static sum of all `tl.load` buffers, accumulators, `num_stages` pipeline depth) |
 | `grid_dim` (block count)  | runtime         | user — `kernel[grid](...)` |
-| `blocks/SM`               | runtime         | hardware (GigaThread Engine), as `min(16, 1536/threads, 100KB/shared, (65536/reg)/threads)` over the above compile-time values |
+| `blocks/SM`               | runtime         | hardware (GigaThread Engine); see exact formula below |
 | Which SM each block lands on | runtime      | hardware (GigaThread Engine) |
 
 What this implies:
@@ -43,6 +43,34 @@ What this implies:
   pipelined kernel.
 - Once compiled, occupancy is **deterministic per kernel** — the
   hardware doesn't reshuffle resources at runtime.
+
+The exact formula the GigaThread Engine uses, in warp terms (warp =
+the actual scheduling unit, **NOT** thread):
+
+```
+warps_per_block = ⌈threads_per_block / 32⌉
+
+blocks/SM = min(
+    16,                                                   # ① hardware block cap
+    ⌊48 / warps_per_block⌋,                               # ② per-SM warp cap (= 1536 threads)
+    ⌊100 KB / shared_per_block⌋,                          # ③ shared mem pool
+    ⌊65,536 / (threads_per_block · reg_per_thread)⌋,      # ④ register file pool
+)
+
+resident_warps = blocks/SM · warps_per_block
+occupancy      = resident_warps / 48
+```
+
+Subtleties:
+- **`⌈ / 32⌉`** — if `threads_per_block` isn't a multiple of 32, the
+  last warp still claims a full 32-lane slot (with inactive lanes).
+- **`⌊ ⌋`** — block count is integer; the SM can't host 1.5 blocks.
+- **② is fundamentally a warp cap** — the 48-warp scheduler limit is
+  the hardware constraint; the "1536 thread" framing is just
+  `48 × 32`.
+- **④ counts per-block total register use** — `threads_per_block ·
+  reg/thread` is what one block claims from the SM's 65,536-register
+  pool.
 
 ### Per-SM resources
 

@@ -26,7 +26,7 @@ kernel 还能用，但 tile size 多半已经不是最优了。
 | `reg/thread`                | **编译期**       | 编译器（Triton / NVCC）静态分析 kernel 后决定 |
 | `shared_mem / block`        | **编译期**       | 编译器（静态算 `tl.load` buffer + 累加器 + `num_stages` pipeline 深度） |
 | `grid_dim` (block 总数)      | runtime          | 用户 —— `kernel[grid](...)` |
-| `blocks/SM`                 | runtime          | 硬件（GigaThread Engine），按 `min(16, 1536/threads, 100KB/shared, (65536/reg)/threads)` 算 |
+| `blocks/SM`                 | runtime          | 硬件（GigaThread Engine）；精确公式见下文 |
 | 每个 block 落哪个 SM         | runtime          | 硬件（GigaThread Engine） |
 
 含义：
@@ -38,6 +38,32 @@ kernel 还能用，但 tile size 多半已经不是最优了。
   深的 kernel 间接影响。
 - 编译完后，每个 kernel 的 occupancy **是确定的**——硬件不会 runtime 重新
   调资源分配。
+
+GigaThread Engine 用的精确公式（以 warp 为粒度——**warp 才是真正的调度
+单位，不是 thread**）：
+
+```
+warps_per_block = ⌈threads_per_block / 32⌉
+
+blocks/SM = min(
+    16,                                                   # ① 硬件 block 上限
+    ⌊48 / warps_per_block⌋,                               # ② 每 SM warp 上限（= 1536 thread）
+    ⌊100 KB / shared_per_block⌋,                          # ③ Shared mem 池
+    ⌊65,536 / (threads_per_block · reg_per_thread)⌋,      # ④ Register file 池
+)
+
+resident_warps = blocks/SM · warps_per_block
+occupancy      = resident_warps / 48
+```
+
+几个细节：
+- **`⌈ / 32⌉`** —— `threads_per_block` 不是 32 倍数时，最后一个 warp 仍
+  占整 32-lane 资源（有 inactive lane）。
+- **`⌊ ⌋`** —— block count 是整数；SM 不能装 1.5 个 block。
+- **② 本质是 warp 上限** —— 48-warp scheduler 是硬件硬约束；"1536 thread"
+  只是 `48 × 32` 的换算。
+- **④ 是 per-block 总 register 用量** —— `threads_per_block · reg/thread`
+  是一个 block 从 SM 65,536-register 池子里占的总量。
 
 ### 每 SM 资源
 
