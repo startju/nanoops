@@ -153,14 +153,17 @@ Boost clock 1695 MHz, 82 SMs.
 | FP32 (CUDA cores)                | 128 cores × 2 FLOPs/cycle  | **35.6 TFLOPS**     |
 | TF32 (Tensor cores)              | 512 FLOPs/cycle            | **71 TFLOPS**       |
 | **FP16 / BF16 (Tensor cores)**   | 1024 FLOPs/cycle           | **142 TFLOPS**      |
-| FP16 (Tensor) with 2:4 sparsity  | 2048 FLOPs/cycle           | 284 TFLOPS          |
+| FP16 / BF16 (Tensor) with 2:4 sparsity | 2048 FLOPs/cycle  | 284 TFLOPS          |
 | INT8 (Tensor cores)              | 2048 ops/cycle             | 284 TOPS            |
+| INT8 (Tensor) with 2:4 sparsity  | 4096 ops/cycle             | 568 TOPS            |
 
 (**2:4 sparsity** = a hardware-accelerated weight format where every
 4 consecutive elements have at most 2 non-zero (the other 2 are
 exactly zero). The Tensor core skips the zero multiplies, doubling
-throughput. Requires the weight tensor to be pre-pruned to this
-pattern — typically applied to inference weights, not used in nanoops.)
+throughput. Supported on all of Ampere's Tensor-core dtypes
+(FP16 / BF16 / TF32 / INT8) via the `mma.sp.sync` PTX instruction.
+Requires the weight tensor to be pre-pruned to this pattern —
+typically applied to inference weights, not used in nanoops.)
 
 **Memory side**: 936 GB/s HBM bandwidth. Compute-to-bandwidth ratio at
 bf16 = 142 TFLOPS / 936 GB/s = **152 FLOPs per byte**. Any op below
