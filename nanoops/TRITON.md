@@ -44,7 +44,11 @@ tile sizes are likely no longer optimal.
 | FP32 cores              | 128             |                                           |
 | Warp size               | 32 threads      |                                           |
 
-### Per-thread-block limits
+### Per-block limits
+
+(NVIDIA's full term is "thread block"; "block" is the standard shorthand
+used in CUDA APIs — `blockDim`, `blockIdx`, `<<<grid, block>>>` — and in
+the rest of this doc.)
 
 | Limit              | Value      |
 | ------------------ | ---------- |

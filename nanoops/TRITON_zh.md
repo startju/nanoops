@@ -42,7 +42,10 @@ kernel 还能用，但 tile size 多半已经不是最优了。
 | FP32 cores              | 128               |                                       |
 | Warp size               | 32 threads        |                                       |
 
-### 每 Thread Block 限制
+### 每 Block 限制
+
+（NVIDIA 全名叫 "thread block"，但 CUDA API（`blockDim`、`blockIdx`、
+`<<<grid, block>>>`）和本文其余地方都简称 "**block**"。两个是同一个概念。）
 
 | 限制                | 数值       |
 | ------------------- | ---------- |
