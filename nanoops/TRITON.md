@@ -5,6 +5,8 @@ at someone who's read the kernels and wants to understand the design
 choices (block sizes, fusion boundaries, what to save in ctx, etc.) —
 not a Triton tutorial.
 
+> 中文版：[TRITON_zh.md](TRITON_zh.md)
+
 ---
 
 ## Chapter 1 — Target hardware: RTX 3090 (Ampere SM_86 / GA102)
