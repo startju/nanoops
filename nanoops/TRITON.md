@@ -17,6 +17,33 @@ below is keyed to these numbers. If you port to a different GPU
 (RTX 4090 / A100 / H100 / consumer Ada), most kernels will run, but the
 tile sizes are likely no longer optimal.
 
+### Compile-time vs runtime: what's frozen when
+
+A central fact that makes the rest of this chapter make sense:
+**almost everything that constrains occupancy is frozen at compile
+time**, not at launch.
+
+| Quantity                  | Decided when    | Decided by              |
+| ------------------------- | --------------- | ----------------------- |
+| `threads_per_block`       | **compile time** | user (via `num_warps` × 32 for Triton, or `<<<grid, block>>>` for CUDA C++) |
+| `reg/thread`              | **compile time** | compiler (Triton / NVCC) after static analysis of the kernel body |
+| `shared_mem / block`      | **compile time** | compiler (static sum of all `tl.load` buffers, accumulators, `num_stages` pipeline depth) |
+| `grid_dim` (block count)  | runtime         | user — `kernel[grid](...)` |
+| `blocks/SM`               | runtime         | hardware (GigaThread Engine), as `min(16, 1536/threads, 100KB/shared, (65536/reg)/threads)` over the above compile-time values |
+| Which SM each block lands on | runtime      | hardware (GigaThread Engine) |
+
+What this implies:
+
+- A single Triton kernel definition compiles to **N separate binaries**
+  if you sweep `num_warps`, `num_stages`, or `BLOCK_*` via
+  `triton.autotune` — each binary has its own frozen `reg/thread` and
+  `shared/block`.
+- `reg/thread` is *not* something the user can pick directly; you only
+  influence it indirectly by writing a smaller / larger / more
+  pipelined kernel.
+- Once compiled, occupancy is **deterministic per kernel** — the
+  hardware doesn't reshuffle resources at runtime.
+
 ### Per-SM resources
 
 | Resource                | Value           | Notes                                     |

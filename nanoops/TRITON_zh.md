@@ -15,6 +15,30 @@
 这些参数定的**。换其他 GPU（4090 / A100 / H100 / 消费级 Ada）跑大部分
 kernel 还能用，但 tile size 多半已经不是最优了。
 
+### Compile-time vs runtime：什么时候 frozen
+
+理解本章关键的一条事实：**几乎所有影响 occupancy 的量都是编译期 frozen
+的**，不是 launch 时定的。
+
+| 量                          | 何时定           | 谁定                          |
+| --------------------------- | ---------------- | ----------------------------- |
+| `threads_per_block`         | **编译期**       | 用户（Triton 通过 `num_warps × 32`，CUDA C++ 通过 `<<<grid, block>>>`） |
+| `reg/thread`                | **编译期**       | 编译器（Triton / NVCC）静态分析 kernel 后决定 |
+| `shared_mem / block`        | **编译期**       | 编译器（静态算 `tl.load` buffer + 累加器 + `num_stages` pipeline 深度） |
+| `grid_dim` (block 总数)      | runtime          | 用户 —— `kernel[grid](...)` |
+| `blocks/SM`                 | runtime          | 硬件（GigaThread Engine），按 `min(16, 1536/threads, 100KB/shared, (65536/reg)/threads)` 算 |
+| 每个 block 落哪个 SM         | runtime          | 硬件（GigaThread Engine） |
+
+含义：
+
+- 一个 Triton kernel 定义如果用 `triton.autotune` 扫 `num_warps` /
+  `num_stages` / `BLOCK_*`，**会编译出 N 份独立 binary**——每份各有自己
+  frozen 的 `reg/thread` 和 `shared/block`。
+- `reg/thread` **不是用户直接挑的**——只能通过写更简单 / 复杂 / pipeline
+  深的 kernel 间接影响。
+- 编译完后，每个 kernel 的 occupancy **是确定的**——硬件不会 runtime 重新
+  调资源分配。
+
 ### 每 SM 资源
 
 | 资源                     | 数值              | 说明                                  |
