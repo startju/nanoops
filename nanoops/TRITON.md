@@ -197,8 +197,11 @@ bandwidth-bound** — about 100× below break-even. For one row of D
 elements:
 
 - FLOPs ≈ `4·D` (mean(x²) = ~2D, then `x · rms_inv · weight` = 2D)
-- Bytes (bf16) ≈ `4·D` (read x = 2D, write y = 2D; weight read is `D`
-  per kernel, amortized away)
+- Bytes (bf16) ≈ `4·D` (**fused** kernel reads x once = 2D, writes y = 2D;
+  weight read is `D` per kernel, amortized away). A naive 2-pass
+  implementation would read x twice → 6D bytes, AI = 0.67 FLOPs/byte.
+  Triton/CUDA kernels keep the row of x in registers across the two
+  passes, so HBM only touches it once.
 - **AI ≈ 1 FLOPs/byte** — vs 152 break-even, this is bandwidth-bound
   by ~100×
 

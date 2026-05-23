@@ -178,8 +178,10 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 比 break-even 差 100×。对一行 D 个元素：
 
 - FLOPs ≈ `4·D`（`mean(x²)` ≈ 2D，再 `x · rms_inv · weight` = 2D）
-- Bytes (bf16) ≈ `4·D`（读 x = 2D，写 y = 2D；weight 整 kernel 共享 `D`，
-  摊薄忽略）
+- Bytes (bf16) ≈ `4·D`（**fused** kernel 读 x **一次** = 2D，写 y = 2D；
+  weight 整 kernel 共享 `D`，摊薄忽略）。朴素 2-pass 实现要读 x 两遍 →
+  6D bytes，AI 降到 0.67 FLOPs/byte。Triton/CUDA kernel 把整行 x 持
+  register 跨两 pass，HBM 只读一次。
 - **AI ≈ 1 FLOPs/byte** —— 比 152 break-even 差约 **100×**，重度带宽 bound
 
 各 op AI 对比（训练 shape）：
