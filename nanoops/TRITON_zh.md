@@ -1,8 +1,14 @@
 # nanoops Triton Kernels
 
-`nanoops/triton_kernels.py` 里 fused CUDA kernel 的深度解读。面向**读过
-代码、想理解设计取舍**的人（block size 怎么选的、fusion 边界在哪、ctx
-该 save 什么），**不是 Triton 入门教程**。
+面向 **Triton 初学者**——介绍在 **RTX 3090 架构下最优 fusion** 怎么做。
+读完之后你能理解 `nanoops/triton_kernels.py` 里每个 kernel 的设计取舍：
+block size 是怎么按 3090 真实预算选出来的、fusion 边界为什么落在那里、
+什么留 register / 什么 save ctx / 什么 backward 重算——全部都是对着芯片
+的 compute/bandwidth 比例算出来的，不是凭感觉。
+
+文档从最底层的硬件数字（SM 数、shared mem、register file）出发，一层
+层往上推到 fused kernel 设计。读完后回头看 `triton_kernels.py` 里任何
+一个 kernel，你都能讲清楚每个选择背后的理由。
 
 > English version: [TRITON.md](TRITON.md)
 

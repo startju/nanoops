@@ -1,9 +1,17 @@
 # nanoops Triton Kernels
 
-Deep dive into the fused CUDA kernels in `nanoops/triton_kernels.py`. Aimed
-at someone who's read the kernels and wants to understand the design
-choices (block sizes, fusion boundaries, what to save in ctx, etc.) —
-not a Triton tutorial.
+A walkthrough of writing fused GPU kernels in Triton, targeting the
+RTX 3090. Written for someone new to Triton who wants to understand
+**why the fusion choices in `nanoops/triton_kernels.py` look the way
+they do** — block sizes are picked against actual 3090 budgets,
+fusion boundaries follow from the chip's compute/bandwidth ratio,
+and what to keep in registers vs save in ctx vs recompute is driven
+by the same arithmetic-intensity tradeoffs.
+
+The doc starts from raw hardware numbers (SM count, shared mem,
+register file) and works up to fused-kernel design. By the end you
+should be able to read any kernel in `triton_kernels.py` and see
+why every choice was made.
 
 > 中文版：[TRITON_zh.md](TRITON_zh.md)
 
