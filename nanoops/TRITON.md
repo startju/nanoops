@@ -384,4 +384,377 @@ A **warp** = 32 threads. The fundamental scheduling unit.
 
 ---
 
-(Chapters 2+ — per-kernel deep dive — TBD)
+## Chapter 2 — FusedAddNorm: a worked example of 2-op fusion
+
+The simplest fused kernel in this repo. It exists purely as a learning
+artifact — nanchat's production blocks fold the RMSNorm directly into
+the adjacent matmul (see `NormQKVProjection` on the attn side,
+`NormMLPReluSquare` on the mlp side), so a standalone `add → norm`
+op boundary doesn't actually appear in the hot path. But every
+pattern this kernel uses is a building block of those bigger fused
+kernels, so it's the cleanest place to learn them.
+
+### What it computes
+
+Mathematically:
+```
+summed = x + residual
+y      = summed · rsqrt(mean(summed²) + eps) · weight    # weight optional
+```
+
+API returns both `y` and `summed` to the caller:
+- `y` → flows to the next block's matmul input
+- `summed` → the next block's residual stream (caller doesn't need to
+  recompute `x + residual` later)
+
+Three Triton kernels make this work end-to-end through autograd:
+
+| Kernel | Grid | Role |
+|---|---|---|
+| `_fused_add_norm_fwd_kernel` | 1D over M | fwd: writes `y` + `summed` + `rms_inv` |
+| `_fused_add_norm_inner_kernel` | 1D over M | bwd stage 1: pre-computes `inner[m]` |
+| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd stage 2: writes `d_summed` + `dnw_partial` |
+
+### 2.1 Forward kernel
+
+Single-pass design — one program processes one `(BLOCK_M, BLOCK_D)`
+tile, loads everything, computes both the reduction and the
+per-element output, writes back.
+
+```python
+@triton.jit
+def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
+                               y_ptr, summed_ptr, rms_inv_ptr,
+                               M, D, eps,
+                               BLOCK_M: tl.constexpr,
+                               BLOCK_D: tl.constexpr,
+                               HAS_NW: tl.constexpr):
+    pid_m = tl.program_id(0)
+    rows  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols  = tl.arange(0, BLOCK_D)
+    mask  = (rows < M)[:, None] & (cols < D)[None, :]
+    offs  = rows[:, None] * D + cols[None, :]
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    r = tl.load(res_ptr + offs, mask=mask, other=0.0)
+    summed = x + r
+    tl.store(summed_ptr + offs, summed, mask=mask)        # ← for caller's residual stream + bwd
+
+    summed_f32 = summed.to(tl.float32)                    # fp32 from here for numerical match
+    sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
+    rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+    tl.store(rms_inv_ptr + rows, rms_inv, mask=rows < M)  # ← needed by bwd
+
+    y = summed_f32 * rms_inv[:, None]
+    if HAS_NW:
+        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0).to(tl.float32)
+        y = y * nw[None, :]
+    tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
+```
+
+Patterns to notice:
+- **`BLOCK_D = next_power_of_2(D)`** with a `col_mask` to handle
+  non-pow2 `D` (nanchat d24 has `D=1536` → `BLOCK_D=2048`, 512 lanes
+  masked). Triton's `tl.arange` requires a pow-of-2 length.
+- **2D mask** = row mask × col mask, applied to every load/store. Out-of-bounds
+  loads return `0` (the additive / multiplicative identity for the
+  downstream `sum_sq` — chosen deliberately).
+- **`HAS_NW: tl.constexpr`** branches at compile time. The
+  no-affine-weight path simply skips the `nw` load + multiply; one binary
+  is compiled per `(HAS_NW=True, HAS_NW=False)` value.
+- **`element_ty` cast at store** lets the same kernel handle any
+  caller dtype (bf16 / fp16 / fp32) without modification.
+- **`summed` is written to HBM mid-kernel**, not at the end. This is
+  intentional: the caller's residual stream needs the bf16 value, but
+  the fp32 compute pipeline downstream of the store keeps using
+  `summed_f32` in registers without re-loading.
+
+### 2.2 Backward path: why 2 kernels
+
+The naïve choice would be one bwd kernel mirroring the fwd's 1D grid.
+That doesn't work because of register pressure:
+
+A 1D-over-M bwd kernel would need every program to hold a full
+`(BLOCK_M, D)` tile of *each* of: `summed`, `dy`, `y_norm`, `g_eff`,
+`dx`, plus a per-channel `dnw` accumulator. At `D=1536` that's
+~5 × 32 × 1536 = 245K fp32 elements / 128 threads ≈ **1900 regs/thread**
+— catastrophic spill.
+
+The fix: **split the bwd grid along D too**. Each program now only
+handles a `(BLOCK_M, BLOCK_D)` output tile of `dx`. Per-program tile
+shrinks from ~245K elements to ~10K, register pressure becomes
+manageable.
+
+But splitting along D introduces a new problem. The per-row reduction
+needed for the math —
+
+```
+inner[m] = mean_d(g_eff[m, *] · y_norm[m, *])
+```
+
+— spans the *whole* D axis. Every program working on the same `m_tile`
+would need this same scalar. The straightforward solution is for each
+program to loop over all D in pass 1 to compute its own copy of
+`inner[m]`. At `D=1536, BLOCK_D=64` that's a 24× redundant computation.
+
+L2 cache absorbs most of the *bytes* (neighboring d_tile programs
+share the same `summed` / `dy` rows, ~96 KB per m_tile, fits in 3090's
+6 MB L2), so the wall-time cost isn't 24×, but the FLOPs ARE wasted.
+Following Flash Attention's pre-compute-reduction pattern, we split
+the work into two kernels:
+
+**Stage 1 — `_fused_add_norm_inner_kernel`** (1D over M, one
+program per `BLOCK_M` rows, processes full D in one tile)
+```python
+inner[m] = mean_d(g_eff[m, *] * y_norm[m, *])
+# writes (M,) fp32 buffer
+```
+
+**Stage 2 — `_fused_add_norm_bwd_kernel`** (2D over M × D, each
+program handles one `(BLOCK_M, BLOCK_D)` output tile)
+```python
+inner_m = tl.load(inner_ptr + rows)              # single scalar per row, prebuilt
+dx[m, d] = rms_inv[m] * (g_eff[m, d] - y_norm[m, d] * inner_m[m]) + d_ext[m, d]
+```
+
+The bwd kernel's pass 1 (which used to loop over all D) collapses to
+a single scalar load per row. Same total HBM traffic as the
+single-kernel version (we read `summed`/`dy` once in inner, once in
+bwd), but no more redundant per-row reduction in compute.
+
+### 2.3 d_summed_external is fused into the bwd kernel
+
+The autograd Function returns two outputs (`y`, `summed`), so backward
+receives two gradients (`dy`, `d_summed_external`). The first is the
+norm's output gradient; the second is from the caller using `summed`
+directly downstream.
+
+The naïve setup would compute `d_summed_from_norm` in the bwd kernel,
+then do a Python `d_summed_total = d_summed_from_norm + d_summed_external`.
+That's an extra torch elementwise op — its own kernel launch (~10-30 μs)
+plus a 4·M·D HBM round-trip (~10-15 μs for d24 shape).
+
+Instead, the bwd kernel takes `d_summed_external` as an extra input
+and folds the add into the same tile store:
+
+```python
+d_summed_tile = rms_inv * (g_eff - y_norm * inner) + d_ext   # ← `+ d_ext` is the fuse
+tl.store(d_summed_ptr + offs, d_summed_tile.to(...), mask=mask)
+```
+
+Pure register-level add, no extra HBM traffic, no extra kernel launch.
+
+### 2.4 Sizing — applying Chapter 1's budgets
+
+Forward kernel uses the formula from Chapter 1's "what this means for
+our kernels":
+
+```python
+BLOCK_D = triton.next_power_of_2(D)                              # pow-of-2 for tl.arange
+num_warps = 4                                                    # design target (eager Triton default)
+BLOCK_M = max(1, min(
+    triton.next_power_of_2(M // 64),                             # M-saturation: grid ≳ 64
+    triton.next_power_of_2(4096 * num_warps // BLOCK_D),         # reg budget: tile ≤ 16K
+))
+tile = BLOCK_M * BLOCK_D
+num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // 4096))))   # bump nw if tile spills
+```
+
+Worked example at d24 shape (M=2048, D=1536):
+- `BLOCK_D = next_pow_of_2(1536) = 2048`
+- `M // 64 = 32 → next_pow_of_2 = 32`
+- `4096 × 4 // 2048 = 8 → next_pow_of_2 = 8`
+- `BLOCK_M = min(32, 8) = 8`
+- `tile = 8 × 2048 = 16K → nw stays at 4`
+- Grid: `cdiv(2048, 8) = 256` programs
+
+Backward kernels use **fixed config** (BLOCK_M=32, BLOCK_D=64, nw=4) —
+no autotune. The reason isn't perf (autotune's picks were similar);
+it's that Triton's autotune dispatch path retains some operations
+that don't survive CUDA Graph stream capture. Hard-coding the config
+makes the bwd path graph-friendly.
+
+For the inner kernel (1D over M, structurally identical to fwd) we
+use the same formula as fwd.
+
+### 2.5 Numerical precision
+
+This kernel matches `F.rms_norm`'s numerical behavior **bit-for-bit**
+on bf16 inputs. We verified empirically: PyTorch's `F.rms_norm`
+internally promotes bf16 → fp32 for the reduction and elementwise
+scale, then casts back. Our kernel does the same:
+
+| Operation | Where it lives | Why |
+|---|---|---|
+| HBM load of `x`, `r` | bf16 (caller's dtype) | Cheaper bandwidth |
+| `summed = x + r`, residual-stream store | bf16 in registers | Caller expects bf16 |
+| `sum_sq` reduction, `rsqrt`, y multiply | **fp32 in registers** | Match F.rms_norm precision |
+| Final `y` store | cast back to bf16 | Caller expects bf16 |
+
+The bf16 form of `summed` is needed only briefly to write the
+residual-stream buffer; everything downstream of that store lives in
+fp32 registers until the final y cast.
+
+**Net register pressure is the same as a fully-fp32-internal
+implementation** (n_regs=255 at tile=16384, nw=4). The bf16 path is
+about HBM dtype compatibility, not register savings. This is a place
+where the "save registers by staying low-precision" intuition fails:
+once you need fp32 for accuracy somewhere, the compiler keeps the
+fp32 version alive across the rest of the kernel.
+
+### 2.6 Expected savings — HBM and launch ledger
+
+Before measuring, work out what fusion should save on paper. The
+short version: **forward saves a real HBM round-trip; backward saves
+launches and intermediate buffers but not HBM bytes**.
+
+#### Forward
+
+Naive native (two ops: `summed = x + r`, then `y = F.rms_norm(summed)`):
+```
+torch.add (x + r → summed):
+  read x        M·D
+  read r        M·D
+  write summed  M·D
+F.rms_norm (summed → y):
+  read summed   M·D                     ← this is what fusion eliminates
+  write y       M·D
+─────────────────────────────────────────
+Total:          5·M·D
+```
+
+Fused (one kernel):
+```
+read x          M·D
+read r          M·D
+write summed    M·D    (caller residual stream still needs it)
+write y         M·D
+─────────────────────────────────────────
+Total:          4·M·D
+```
+
+Net forward savings:
+- **HBM: 1·M·D bytes** — the `summed` value never leaves registers
+  between `x + r` and the norm reduction.
+- **Kernel launches: 1** (two ops collapse to one Triton kernel).
+- **Intermediate buffer: 1** (no separate `summed` allocation for
+  the torch.add output).
+
+For d24 (M=2048, D=1536, bf16): 1·M·D = 6.3 MB / 936 GB/s ≈ 6.7 μs
+of HBM time, plus ~10-30 μs of avoided launch overhead.
+
+#### Backward
+
+Naive native (single `F.rms_norm.backward` kernel + Python
+accumulation of the external gradient):
+```
+F.rms_norm.backward:
+  read summed              M·D
+  read dy                  M·D
+  write d_summed_from_norm M·D                              ─┐
+                                                             │ subtotal 3·M·D
+Python d_summed = d_summed_from_norm + d_summed_external:
+  read d_summed_from_norm  M·D
+  read d_summed_external   M·D
+  write d_summed_total     M·D                              ─┘ subtotal 3·M·D
+─────────────────────────────────────────
+Total:                     6·M·D
+```
+
+Fused (2-kernel split, d_summed_external folded into bwd kernel):
+```
+_fused_add_norm_inner_kernel:
+  read summed/y            M·D
+  read dy                  M·D
+  write inner_buf          ~0  (M floats)                   ─┐ subtotal 2·M·D
+                                                             │
+_fused_add_norm_bwd_kernel:                                  │
+  read summed/y            M·D   ← repeat read (L2 likely hits)
+  read dy                  M·D   ← repeat read (L2 likely hits)
+  read d_summed_external   M·D
+  read inner_buf           ~0
+  write d_summed           M·D                              ─┘ subtotal 4·M·D
+─────────────────────────────────────────
+Total:                     6·M·D
+```
+
+Same total HBM bytes. So what does the bwd fusion actually save?
+
+- **1 intermediate buffer**: native has to allocate
+  `d_summed_from_norm` (M·D bytes) as a holding tank between the norm
+  bwd kernel and the Python `+`. Fused skips this allocation.
+- **1 kernel launch**: native fires a torch elementwise add for the
+  `d_summed_from_norm + d_summed_external` combine (~10-30 μs).
+  Fused folds it into the bwd kernel's `dx` store (`+ d_ext` happens
+  in registers right before the store).
+- **1 autograd graph node**: native goes through an `AccumulateGrad`
+  step; fused returns the combined gradient directly.
+
+The fused side spends one of those saved launches re-buying it for
+the inner pre-compute kernel — so **net kernel-launch count is the
+same** as native. The real wins are the intermediate buffer + the
+Python `+` op + slightly better cache locality:
+
+- L2 reuse across the two fused kernels: the second kernel re-reads
+  `summed` and `dy` that the first kernel just read, so 3090's 6 MB
+  L2 absorbs most of that "repeat" traffic.
+- Compared to native's intermediate buffer flowing through HBM, the
+  fused path lets the gradient pieces stay closer to registers /
+  caches.
+
+#### Takeaway
+
+**Forward fusion saves bytes + launches + buffer** — a clean
+three-way win. **Backward fusion saves only launches + buffer**
+(bytes are the same). This asymmetry shows up everywhere: it's why
+Flash Attention's forward speedup is bigger than its backward
+speedup, and why kernel-fusion projects generally announce
+"forward N× faster" but quietly admit backward is closer to parity.
+The lesson: **whenever you can re-use values from a previous step
+in registers instead of round-tripping through HBM, that's a real
+bandwidth saving; everything else (launch overhead, buffer
+allocation) is smaller-margin polish**.
+
+### 2.7 Performance reality
+
+The kernel itself is competitive with native:
+
+| Mode | fused | native | ratio |
+|---|---|---|---|
+| Kernel-only timing (CUDA event around the launch) | ~88 μs | ~91 μs | fused tied / slightly faster |
+| **CUDA Graph fwd replay** | **~76 μs** | ~90 μs | **fused 15% faster** |
+| Plain eager `fused_add_norm(...)` call | ~184 μs | ~91 μs | fused 2× *slower* |
+
+The eager-mode slowdown is **not** the kernel — it's the
+`autograd.Function` + Triton dispatch overhead per call (~100 μs of
+fixed cost: 3× `torch.empty_like`, `save_for_backward`, ctx attribute
+setup, kernel launch arg packing). This overhead vanishes inside any
+larger compiled / graph-captured pipeline.
+
+The fundamental lesson: **for kernels this short, Python framework
+overhead can easily exceed the kernel's actual GPU work**. A
+single-op `torch.compile(fused_add_norm)` makes things *worse*
+because the compile dispatcher adds its own overhead. The fusion
+only pays off when:
+1. The op is invoked inside a larger model wrapped in
+   `torch.compile(model)` so the dispatcher overhead is amortized, OR
+2. The whole training step is `torch.cuda.CUDAGraph`-captured so the
+   per-call Python work happens only at capture time.
+
+This is the same reason production transformer kernels are
+*bigger* (Flash Attention covers the whole `Q@K^T → softmax → @V`
+chain, not individual ops): kernel launches and Python dispatchers
+are constant per-op overhead, so longer kernels win on amortization
+even if their per-element throughput isn't faster than a chain of
+small kernels.
+
+That's also why nanchat's production path skips this kernel:
+`NormMLPReluSquare` and `NormQKVProjection` fold the norm directly
+into the matmul kernel, so there's no standalone op-boundary call
+that this `add+norm` fusion could attach to. This kernel exists to
+demonstrate the patterns; the bigger production kernels are where
+the patterns pay off.
+
+---
+
+(Chapters 3+ — TBD)

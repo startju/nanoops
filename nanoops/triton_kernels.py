@@ -49,6 +49,542 @@ NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Fused residual-add + RMSNorm — placed at block boundaries:
+#     y_new = norm(x + residual)
+#
+# Forward: two consecutive elementwise passes that share the same
+# (M, D) tile layout, so fusion is a clean win — one HBM read of
+# (x, residual), one write of y, plus a residual-stream write of
+# summed = x + residual (which the next block needs anyway and the
+# backward kernel also consumes).
+#
+# Backward: split into two Triton kernels (Flash-Attention style
+# pre-computed reduction), since a single 1D-over-M bwd kernel would
+# spill registers on full-D tiles:
+#   1. _fused_add_norm_inner_kernel — 1D grid over M, computes the
+#      per-row reduction inner[m] = mean_d(g_eff * y_norm) once
+#   2. _fused_add_norm_bwd_kernel — 2D grid over (M, D), reads the
+#      pre-computed inner, writes d_summed and per-m-tile dnw_partial.
+#      d_summed_external (the caller's gradient w.r.t. summed used as
+#      a downstream residual) is folded in via a kernel-level add at
+#      the dx store, saving an extra Python + op.
+#
+# Cheap, useful at the seam between attn-block output and mlp-block
+# norm-input. See FusedAddNorm class docstring + TRITON.md Chapter 2.
+# ─────────────────────────────────────────────────────────────────────
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fused_add_norm_fwd_kernel(
+        x_ptr,
+        res_ptr,
+        nw_ptr,
+        y_ptr,
+        summed_ptr,
+        rms_inv_ptr,
+        M,
+        D,
+        eps,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_NW: tl.constexpr,
+    ):
+        """y = norm(x + residual) — per-row RMSNorm of the elementwise sum.
+        Stores `summed = x + residual` (for the caller's residual stream;
+        also reused by backward to reconstruct y_norm via `summed * rms_inv`).
+
+        Layout assumptions (asserted at autograd boundary):
+          - all (M, D) tensors contiguous → row stride = D, col stride = 1
+          - BLOCK_D is the smallest power of 2 ≥ D; cols beyond D are
+            masked (load contributes 0, store skipped). So D can be e.g.
+            1536 with BLOCK_D=2048.
+
+        Precision: computation runs in fp32 throughout to match F.rms_norm
+        bit-for-bit on bf16 inputs (PyTorch's F.rms_norm internally promotes
+        bf16 → fp32 for the reduction and elementwise scale, then casts back
+        — verified empirically). The bf16 form of `summed` is needed only
+        briefly to write the caller's residual-stream buffer; everything
+        downstream of that store lives in fp32 registers until the final
+        y cast at store time. Net register pressure is the same as a
+        full-fp32-internal implementation (n_regs=255 at tile=16384,
+        nw=4) — bf16 is for HBM/caller dtype compatibility, not for
+        register savings. See FusedAddNorm class docstring for the
+        spill-aware tile sizing that keeps this within budget.
+
+        HAS_NW=False ⇒ no per-channel affine weight; output is plain
+        `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
+        pid_m = tl.program_id(0)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        col_mask = cols < D
+        mask_2d = row_mask[:, None] & col_mask[None, :]
+
+        offs = rows[:, None] * D + cols[None, :]
+        # Load in input dtype; masked-off elements get 0 (additive /
+        # multiplicative identity for the downstream sum_sq).
+        x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0)
+        r = tl.load(res_ptr + offs, mask=mask_2d, other=0.0)
+        summed = x + r
+
+        # Save summed back to HBM (input dtype) — dual purpose: caller's
+        # next-block residual stream + backward reconstruction of y_norm.
+        tl.store(summed_ptr + offs, summed, mask=mask_2d)
+
+        # Compute pipeline runs in fp32 (matches F.rms_norm bit-for-bit;
+        # see kernel docstring). summed_f32 stays live in registers from
+        # here through the y store, so register pressure is fp32-internal
+        # in effect — the bf16 `summed` was only kept around for the HBM
+        # write above.
+        summed_f32 = summed.to(tl.float32)
+        sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
+        rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+        tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
+
+        y_f32 = summed_f32 * rms_inv[:, None]
+        if HAS_NW:
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            y_f32 = y_f32 * nw[None, :]
+        tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
+
+    @triton.jit
+    def _fused_add_norm_inner_kernel(
+        ynorm_src_ptr,
+        rms_inv_ptr,
+        nw_ptr,
+        dy_ptr,
+        inner_ptr,
+        M,
+        D,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_NW: tl.constexpr,
+    ):
+        """Pre-computes inner[m] = mean_d(g_eff * y_norm) for the bwd kernel,
+        so the bwd kernel doesn't redundantly recompute this per d_tile
+        (D/BLOCK_D times per m_tile).
+
+        Same `ynorm_src_ptr` semantics as the bwd kernel:
+          - HAS_NW=True : ynorm_src is `summed`, reconstruct y_norm = summed * rms_inv
+          - HAS_NW=False: ynorm_src is `y` itself which equals y_norm directly
+
+        Grid is 1D over m_tiles — each program does one (BLOCK_M, D)
+        row tile reduction. BLOCK_D = next_power_of_2(D) so the whole D
+        fits in a single tile column-wise (same pattern as fwd kernel).
+
+        Writes one fp32 per row to `inner_ptr` (shape (M,))."""
+        pid_m = tl.program_id(0)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        col_mask = cols < D
+        mask_2d = row_mask[:, None] & col_mask[None, :]
+        offs = rows[:, None] * D + cols[None, :]
+
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        if HAS_NW:
+            y_norm = src * rms_inv[:, None]
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            g_eff = dy_t * nw[None, :]
+        else:
+            y_norm = src
+            g_eff = dy_t
+
+        inner = tl.sum(g_eff * y_norm, axis=1) / D
+        tl.store(inner_ptr + rows, inner, mask=row_mask)
+
+    # Fixed-config kernel (no @triton.autotune) for CUDA Graph compatibility.
+    # Triton autotune's dispatch path retains some non-capture-friendly
+    # operations even with cache hit, so wrapping this kernel inside
+    # `torch.cuda.make_graphed_callables` for fwd+bwd fails with
+    # `cudaErrorStreamCaptureInvalidated`. Using a fixed config makes
+    # the call path purely capture-friendly.
+    #
+    # Config (BLOCK_M=32, BLOCK_D=64, num_warps=4, num_stages=2) is a
+    # conservative middle-ground from the autotune sweep that worked
+    # across all nanchat shapes (D ≤ 4096). Caller must pass these as
+    # kwargs to keep them visible at the call site rather than buried
+    # in autotune state.
+    @triton.jit
+    def _fused_add_norm_bwd_kernel(
+        ynorm_src_ptr,
+        rms_inv_ptr,
+        nw_ptr,
+        dy_ptr,
+        d_ext_ptr,
+        inner_ptr,
+        d_summed_ptr,
+        dnw_partial_ptr,
+        M,
+        D,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_NW: tl.constexpr,
+    ):
+        """RMSNorm backward second-stage kernel (paired with
+        `_fused_add_norm_inner_kernel` which pre-computes inner[m]).
+
+        The `ynorm_src_ptr` tensor is interpreted based on HAS_NW:
+          - HAS_NW=True : pointer is to `summed`; kernel reconstructs
+            y_norm = summed * rms_inv inline (one multiply per loaded
+            tile, runs on idle FP32 cores). Used so fwd doesn't need a
+            separate 2·M·D HBM write for y_norm.
+          - HAS_NW=False: pointer is to `y` itself, which equals y_norm
+            (since `y = summed * rms_inv * 1` when there's no per-channel
+            affine). Kernel uses it directly — saves the multiply.
+
+        Grid is 2D (M_tile × D_tile): each program produces one
+        (BLOCK_M × BLOCK_D) slice of d_summed and writes one
+        (BLOCK_M × BLOCK_D) partial of dnw. Splitting along D keeps
+        per-program register pressure manageable (vs a 1D-over-M grid
+        which would force the whole D into a single tile and spill).
+
+        `inner_ptr` is the per-row reduction `inner[m] = mean_d(g_eff *
+        y_norm)`, pre-computed by `_fused_add_norm_inner_kernel`. This
+        avoids each d_tile program recomputing the same full-D reduction
+        (would be D/BLOCK_D × redundant otherwise).
+
+        `d_ext_ptr` is the gradient w.r.t. `summed` coming from outside
+        (caller's direct consumption of summed as residual stream). The
+        kernel adds it to the RMSNorm-bwd-computed gradient in pass 2
+        so the final `d_summed` already contains the total — saves an
+        extra Python torch elementwise add + its HBM round-trip
+        (~50 μs/call at d24 shape).
+
+        Math (when HAS_NW=True; `dy` is gradient of the fwd-output `y`):
+          y_norm[m, d]   = summed[m, d] * rms_inv[m]
+          g_eff[m, d]    = dy[m, d] * nw[d]
+          d_summed[m, d] = rms_inv[m] * (g_eff - y_norm * inner[m]) + d_ext[m, d]
+          dnw_partial[m_tile, d] = sum_{m in tile} (dy * y_norm)
+
+        When HAS_NW=False: y_norm[m, d] = ynorm_src[m, d] directly,
+        g_eff collapses to dy, dnw_partial is not produced; nw_ptr
+        and dnw_partial_ptr are not dereferenced.
+        """
+        pid_m = tl.program_id(0)
+        pid_d = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        ds = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        d_mask = ds < D
+
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        if HAS_NW:
+            nw = tl.load(nw_ptr + ds, mask=d_mask, other=0.0).to(tl.float32)
+        # Pre-computed per-row inner — replaces the previous pass-1
+        # full-D reduction loop. One scalar load per row, not redone
+        # per d_tile program.
+        inner = tl.load(inner_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+
+        # Compute d_summed for this (m_tile, d_tile) slice.
+        # All (M, D) tensors are contiguous (autograd boundary ensures
+        # this), so row stride = D, col stride = 1 — no per-tensor
+        # stride params needed.
+        offs = rows[:, None] * D + ds[None, :]
+        mask_2d = row_mask[:, None] & d_mask[None, :]
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        if HAS_NW:
+            y_norm = src * rms_inv[:, None]
+        else:
+            y_norm = src
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        if HAS_NW:
+            g_eff = dy_t * nw[None, :]
+        else:
+            g_eff = dy_t
+        # Fold external d_summed (caller's direct consumption of summed)
+        # into d_summed in-kernel — saves an extra Python `+` op + its
+        # HBM round-trip outside.
+        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        d_summed_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
+        tl.store(
+            d_summed_ptr + offs,
+            d_summed_tile.to(d_summed_ptr.dtype.element_ty),
+            mask=mask_2d,
+        )
+
+        # Per-m-tile partial dnw[d] = sum over tile rows of (dy * y_norm)
+        # — only when affine weight exists.
+        if HAS_NW:
+            dnw_partial = tl.sum(dy_t * y_norm, axis=0)
+            dnw_p_ptrs = dnw_partial_ptr + pid_m * D + ds
+            tl.store(
+                dnw_p_ptrs,
+                dnw_partial.to(dnw_partial_ptr.dtype.element_ty),
+                mask=d_mask,
+            )
+
+
+class FusedAddNorm(torch.autograd.Function):
+    """y = norm(x + residual), also returns summed = x + residual.
+
+    NOTE: Demo / learning kernel — the simplest example of a two-op
+    Triton fusion (elementwise add + RMSNorm). NOT wired into nanchat's
+    hot path for an architectural reason, not a perf one: nanchat's
+    production blocks fold the RMSNorm directly into the adjacent
+    matmul kernel (see NormMLPReluSquare on the mlp side,
+    NormQKVProjection on the attn side), so a standalone
+    `add → norm` op boundary doesn't exist as a call site to optimize.
+
+    Performance is fine in isolation — kernel-only actually beats
+    native `x + r; F.rms_norm(...)` at d24 shape (e.g. ~75 μs vs ~90 μs
+    under CUDA Graph fwd capture). The ~2× slowdown of `fused_add_norm`
+    vs native that you see in plain eager benchmarks (~184 μs vs ~91 μs
+    per call at d24) is the autograd.Function + Triton dispatch
+    overhead, which disappears once the kernel runs inside a larger
+    compiled / graph-captured pipeline.
+
+    Kept here as the first Triton kernel for learning purposes — it
+    covers the core patterns: 2D tile loading, power-of-2-rounded
+    BLOCK_D with col masking, fp32-promoted reduction, HAS_NW
+    constexpr branch, and on-the-fly y_norm reconstruction in bwd.
+
+    Forward: one Triton kernel does add + RMSNorm + writes y and summed
+    (no separate y_norm tensor — it stays in registers during fwd).
+
+    Backward uses `_fused_add_norm_bwd_kernel`, which loads summed
+    and reconstructs y_norm = summed * rms_inv on the fly. The extra
+    multiply runs on otherwise-idle FP32 cores (bwd is bandwidth-bound),
+    so the net win is saving the 2·M·D fwd HBM write of y_norm. summed
+    is saved anyway for the caller's residual stream.
+
+    `norm_weight` may be None → no per-channel affine scale (plain
+    `summed / RMS(summed)`); gradient w.r.t. norm_weight is then also
+    None and the dnw_partials reduction is skipped entirely.
+
+    Identity passthroughs:
+        d_summed = d_norm_from_kernel + d_summed_external
+        d_x = d_residual = d_summed
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor | None,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert x.is_cuda and x.is_contiguous()
+        assert residual.is_cuda and residual.is_contiguous()
+        M, D = x.shape
+        assert residual.shape == (M, D)
+        has_nw = norm_weight is not None
+        if has_nw:
+            assert norm_weight.is_cuda
+            assert norm_weight.shape == (D,)
+        y = torch.empty_like(x)
+        summed = torch.empty_like(x)
+        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+
+        # Triton's tl.arange requires power-of-2 BLOCK_D; non-pow2 D
+        # (e.g. d24's 1536) gets padded and the kernel's col_mask zeroes
+        # the trailing lanes so they don't affect the reduction.
+        BLOCK_D = triton.next_power_of_2(D)
+
+        # Tile sizing under Ampere's 255-reg/thread spill cap.
+        #
+        # Per-thread reg usage in this kernel:
+        #     real_regs/thread ≈ 2 × (BLOCK_M × BLOCK_D) / (nw × 32)
+        # (each fp32 element = 1 reg, ~2× factor for live intermediates).
+        # Setting ≤ 255 gives: tile ≤ 255 × 16 × nw ≈ 4080 × nw. We round
+        # to 4096 (= 2^12) for pow-of-2-aligned arithmetic — since our
+        # tile is always pow-of-2, tile / 4096 is then always integer, no
+        # ceil/floor edge case. The 16-element slack per warp is absorbed
+        # by compiler's actual reg use (verified: tile=16384 at nw=4
+        # measures n_regs=255, 0 spills).
+        #
+        # Design target nw=4 (Triton stock default): ~5-13% slower than
+        # aggressive nw=8 (tile=32K) on benchmarks but more blocks/SM and
+        # simpler — this is a learning kernel; production hot path doesn't
+        # use it (see class docstring). The initial nw=4 here sizes
+        # BLOCK_M below; final nw gets recomputed from the resulting tile
+        # so unusually large D auto-scales instead of silently spilling.
+        num_warps = 4
+
+        # BLOCK_M = min(reg-budget cap, M-saturation cap), both rounded
+        # to pow-of-2 (kernel requires pow-of-2 BLOCK_M):
+        #   - reg budget cap = 4096 × nw / BLOCK_D  (from inequality above)
+        #   - M-saturation cap = M // 64: keeps grid ≳ 64 programs ≈
+        #     filling the 3090's 82 SMs in one wave for any M. For nanchat
+        #     M=2048 this evaluates to 32 (matching the previous hardcoded
+        #     value); larger M auto-grows BLOCK_M to avoid extra waves of
+        #     launch overhead, smaller M shrinks it to keep enough programs
+        #     in the grid. (Per-row reduction doesn't benefit from bigger
+        #     BLOCK_M anyway — rows are independent, no cross-row reuse.)
+        # Outer max(1, ...) handles small-M case where M // 64 = 0.
+        BLOCK_M = max(
+            1,
+            min(
+                triton.next_power_of_2(M // 64),
+                triton.next_power_of_2(4096 * num_warps // BLOCK_D),
+            ),
+        )
+
+        # Final nw: solve reg-cap inequality for nw given the tile.
+        # Nanchat shapes (tile ≤ 16K) all yield nw=4. For D > 16K (where
+        # BLOCK_M=1 floored forces tile = BLOCK_D > 16K), nw auto-scales
+        # to 8 (D ≤ 32K) or 16 (D ≤ 64K) — safety net so the kernel
+        # degrades gracefully instead of silently spilling on unexpected D.
+        # Cap at 16: nw=32 → 1024 threads/block → only 1 block/SM (32/48
+        # warp slots, 67% occupancy); nw=16 keeps 3 blocks/SM (full 48-
+        # warp occupancy). max(1, tile // 4096) guards next_pow2 against
+        # the tile < 4096 case where the floor div yields 0.
+        tile = BLOCK_M * BLOCK_D
+        num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // 4096))))
+
+        # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
+        # valid placeholder pointer (Triton still requires the arg).
+        grid = (triton.cdiv(M, BLOCK_M),)
+        nw_arg = norm_weight if has_nw else x
+        _fused_add_norm_fwd_kernel[grid](
+            x,
+            residual,
+            nw_arg,
+            y,
+            summed,
+            rms_inv,
+            M,
+            D,
+            eps,
+            BLOCK_M=BLOCK_M,
+            BLOCK_D=BLOCK_D,
+            HAS_NW=has_nw,
+            num_warps=num_warps,
+        )
+        # ctx stash strategy depends on HAS_NW:
+        #  - HAS_NW=True : save `summed`; bwd recomputes y_norm = summed * rms_inv.
+        #  - HAS_NW=False: save `y` instead — since `y == y_norm` here
+        #    (no per-channel weight), bwd reads it directly with no multiply.
+        # summed is always returned forward-side for the residual stream.
+        ynorm_src = summed if has_nw else y
+        ctx.save_for_backward(ynorm_src, norm_weight, rms_inv)
+        ctx.M, ctx.D = M, D
+        ctx.has_nw = has_nw
+        return y, summed
+
+    @staticmethod
+    def backward(
+        ctx,
+        dy: torch.Tensor,
+        d_summed_external: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, None]:
+        ynorm_src, nw, rms_inv = ctx.saved_tensors
+        M, D = ctx.M, ctx.D
+        has_nw = ctx.has_nw
+        dy = dy.contiguous()
+        d_summed_external = d_summed_external.contiguous()
+
+        # Fixed-config bwd kernel (no autotune) for CUDA Graph
+        # capturability. Config chosen as a sweep-tested middle-ground.
+        BLOCK_M_BWD = 32
+        BLOCK_D_BWD = 64
+        NUM_WARPS_BWD = 4
+        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+
+        # Single output buffer holds the FULL d_summed (bwd kernel fuses
+        # in d_summed_external — see kernel docstring).
+        d_summed = torch.empty_like(ynorm_src)
+        # inner[m] buffer — written by inner kernel, read by bwd kernel.
+        # Eliminates redundant per-d-tile recomputation of the per-row
+        # reduction inside bwd.
+        inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
+        if has_nw:
+            # Exact (num_m_tiles, D) since BLOCK_M is fixed — no more
+            # worst-case zero-padding hack needed.
+            dnw_partials = torch.empty(
+                (num_m_tiles, D),
+                dtype=nw.dtype,
+                device=ynorm_src.device,
+            )
+            nw_arg = nw
+            dnw_arg = dnw_partials
+        else:
+            # Dummy pointers when HAS_NW=False — kernel won't dereference.
+            nw_arg = ynorm_src
+            dnw_arg = ynorm_src
+
+        # Stage 1: pre-compute inner[m] (one 1D-grid kernel, full-D per
+        # program — fwd-style sizing, no D-split, no redundancy).
+        INNER_BLOCK_D = triton.next_power_of_2(D)
+        INNER_NUM_WARPS = 4
+        INNER_BLOCK_M = max(
+            1,
+            min(
+                triton.next_power_of_2(M // 64),
+                triton.next_power_of_2(4096 * INNER_NUM_WARPS // INNER_BLOCK_D),
+            ),
+        )
+        inner_grid = (triton.cdiv(M, INNER_BLOCK_M),)
+        _fused_add_norm_inner_kernel[inner_grid](
+            ynorm_src,
+            rms_inv,
+            nw_arg,
+            dy,
+            inner_buf,
+            M,
+            D,
+            BLOCK_M=INNER_BLOCK_M,
+            BLOCK_D=INNER_BLOCK_D,
+            HAS_NW=has_nw,
+            num_warps=INNER_NUM_WARPS,
+        )
+
+        # Stage 2: bwd kernel reads pre-computed inner, computes d_summed
+        # and dnw_partials. 2D grid with fixed BLOCK_M / BLOCK_D.
+        grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))
+        _fused_add_norm_bwd_kernel[grid_bwd](
+            ynorm_src,
+            rms_inv,
+            nw_arg,
+            dy,
+            d_summed_external,
+            inner_buf,
+            d_summed,
+            dnw_arg,
+            M,
+            D,
+            BLOCK_M=BLOCK_M_BWD,
+            BLOCK_D=BLOCK_D_BWD,
+            HAS_NW=has_nw,
+            num_warps=NUM_WARPS_BWD,
+        )
+        dnw = dnw_partials.sum(dim=0) if has_nw else None
+
+        # x + residual: d_x = d_residual = d_summed
+        # (d_summed already includes d_summed_external — fused in kernel).
+        d_x = d_summed
+        d_residual = d_summed
+        return d_x, d_residual, dnw, None
+
+
+def fused_add_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused `y = norm(x + residual)`. Also returns `summed = x + residual`
+    so the caller can plug it directly into the next block's residual
+    stream (no re-add needed).
+
+    Pass `norm_weight=None` for RMSNorm without a per-channel affine
+    scale (plain `summed / RMS(summed)`).
+
+    The canonical block-boundary fusion: between an attn block's output
+    and the mlp block's norm-input (or symmetrically between mlp output
+    and the next layer's attn norm-input).
+    """
+    return FusedAddNorm.apply(x, residual, norm_weight, eps)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Fused RMSNorm + Linear + ReluSquare
 #
 # Forward math (per row m of input x ∈ ℝ^(M, K)):
@@ -1828,508 +2364,3 @@ def rotary_qk_norm_scale(
 ) -> torch.Tensor:
     """Fused rotary embedding + RMSNorm + multiplicative scale for Q or K."""
     return RotaryQKNormScale.apply(qk, cos, sin, scale, eps)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Fused residual-add + RMSNorm — placed at block boundaries:
-#     y_new = norm(x + residual)
-# Two consecutive elementwise passes that share the same (M, D) tile
-# layout, so fusion is a clean win: one HBM read of (x, residual), one
-# write of (y, also save x+residual as `summed` for ctx in case caller
-# also needs it). Cheap, useful at the seam between attn-block output
-# and mlp-block norm-input.
-# ─────────────────────────────────────────────────────────────────────
-
-
-if _HAS_TRITON:
-
-    @triton.jit
-    def _fused_add_norm_fwd_kernel(
-        x_ptr,
-        res_ptr,
-        nw_ptr,
-        y_ptr,
-        summed_ptr,
-        rms_inv_ptr,
-        M,
-        D,
-        eps,
-        BLOCK_M: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-        HAS_NW: tl.constexpr,
-    ):
-        """y = norm(x + residual) — per-row RMSNorm of the elementwise sum.
-        Stores `summed = x + residual` (for the caller's residual stream;
-        also reused by backward to reconstruct y_norm via `summed * rms_inv`).
-
-        Layout assumptions (asserted at autograd boundary):
-          - all (M, D) tensors contiguous → row stride = D, col stride = 1
-          - BLOCK_D is the smallest power of 2 ≥ D; cols beyond D are
-            masked (load contributes 0, store skipped). So D can be e.g.
-            1536 with BLOCK_D=2048.
-
-        Precision: computation runs in fp32 throughout to match F.rms_norm
-        bit-for-bit on bf16 inputs (PyTorch's F.rms_norm internally promotes
-        bf16 → fp32 for the reduction and elementwise scale, then casts back
-        — verified empirically). The bf16 form of `summed` is needed only
-        briefly to write the caller's residual-stream buffer; everything
-        downstream of that store lives in fp32 registers until the final
-        y cast at store time. Net register pressure is the same as a
-        full-fp32-internal implementation (n_regs=255 at tile=16384,
-        nw=4) — bf16 is for HBM/caller dtype compatibility, not for
-        register savings. See FusedAddNorm class docstring for the
-        spill-aware tile sizing that keeps this within budget.
-
-        HAS_NW=False ⇒ no per-channel affine weight; output is plain
-        `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
-        pid_m = tl.program_id(0)
-        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        cols = tl.arange(0, BLOCK_D)
-        row_mask = rows < M
-        col_mask = cols < D
-        mask_2d = row_mask[:, None] & col_mask[None, :]
-
-        offs = rows[:, None] * D + cols[None, :]
-        # Load in input dtype; masked-off elements get 0 (additive /
-        # multiplicative identity for the downstream sum_sq).
-        x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0)
-        r = tl.load(res_ptr + offs, mask=mask_2d, other=0.0)
-        summed = x + r
-
-        # Save summed back to HBM (input dtype) — dual purpose: caller's
-        # next-block residual stream + backward reconstruction of y_norm.
-        tl.store(summed_ptr + offs, summed, mask=mask_2d)
-
-        # Compute pipeline runs in fp32 (matches F.rms_norm bit-for-bit;
-        # see kernel docstring). summed_f32 stays live in registers from
-        # here through the y store, so register pressure is fp32-internal
-        # in effect — the bf16 `summed` was only kept around for the HBM
-        # write above.
-        summed_f32 = summed.to(tl.float32)
-        sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
-        rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
-        tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
-
-        y_f32 = summed_f32 * rms_inv[:, None]
-        if HAS_NW:
-            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
-            y_f32 = y_f32 * nw[None, :]
-        tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
-
-    @triton.jit
-    def _fused_add_norm_inner_kernel(
-        ynorm_src_ptr,
-        rms_inv_ptr,
-        nw_ptr,
-        dy_ptr,
-        inner_ptr,
-        M,
-        D,
-        BLOCK_M: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-        HAS_NW: tl.constexpr,
-    ):
-        """Pre-computes inner[m] = mean_d(g_eff * y_norm) for the bwd kernel,
-        so the bwd kernel doesn't redundantly recompute this per d_tile
-        (D/BLOCK_D times per m_tile).
-
-        Same `ynorm_src_ptr` semantics as the bwd kernel:
-          - HAS_NW=True : ynorm_src is `summed`, reconstruct y_norm = summed * rms_inv
-          - HAS_NW=False: ynorm_src is `y` itself which equals y_norm directly
-
-        Grid is 1D over m_tiles — each program does one (BLOCK_M, D)
-        row tile reduction. BLOCK_D = next_power_of_2(D) so the whole D
-        fits in a single tile column-wise (same pattern as fwd kernel).
-
-        Writes one fp32 per row to `inner_ptr` (shape (M,))."""
-        pid_m = tl.program_id(0)
-        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        cols = tl.arange(0, BLOCK_D)
-        row_mask = rows < M
-        col_mask = cols < D
-        mask_2d = row_mask[:, None] & col_mask[None, :]
-        offs = rows[:, None] * D + cols[None, :]
-
-        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
-        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-
-        if HAS_NW:
-            y_norm = src * rms_inv[:, None]
-            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
-            g_eff = dy_t * nw[None, :]
-        else:
-            y_norm = src
-            g_eff = dy_t
-
-        inner = tl.sum(g_eff * y_norm, axis=1) / D
-        tl.store(inner_ptr + rows, inner, mask=row_mask)
-
-    # Fixed-config kernel (no @triton.autotune) for CUDA Graph compatibility.
-    # Triton autotune's dispatch path retains some non-capture-friendly
-    # operations even with cache hit, so wrapping this kernel inside
-    # `torch.cuda.make_graphed_callables` for fwd+bwd fails with
-    # `cudaErrorStreamCaptureInvalidated`. Using a fixed config makes
-    # the call path purely capture-friendly.
-    #
-    # Config (BLOCK_M=32, BLOCK_D=64, num_warps=4, num_stages=2) is a
-    # conservative middle-ground from the autotune sweep that worked
-    # across all nanchat shapes (D ≤ 4096). Caller must pass these as
-    # kwargs to keep them visible at the call site rather than buried
-    # in autotune state.
-    @triton.jit
-    def _fused_add_norm_bwd_kernel(
-        ynorm_src_ptr,
-        rms_inv_ptr,
-        nw_ptr,
-        dy_ptr,
-        d_ext_ptr,
-        inner_ptr,
-        d_summed_ptr,
-        dnw_partial_ptr,
-        M,
-        D,
-        BLOCK_M: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-        HAS_NW: tl.constexpr,
-    ):
-        """RMSNorm backward second-stage kernel (paired with
-        `_fused_add_norm_inner_kernel` which pre-computes inner[m]).
-
-        The `ynorm_src_ptr` tensor is interpreted based on HAS_NW:
-          - HAS_NW=True : pointer is to `summed`; kernel reconstructs
-            y_norm = summed * rms_inv inline (one multiply per loaded
-            tile, runs on idle FP32 cores). Used so fwd doesn't need a
-            separate 2·M·D HBM write for y_norm.
-          - HAS_NW=False: pointer is to `y` itself, which equals y_norm
-            (since `y = summed * rms_inv * 1` when there's no per-channel
-            affine). Kernel uses it directly — saves the multiply.
-
-        Grid is 2D (M_tile × D_tile): each program produces one
-        (BLOCK_M × BLOCK_D) slice of d_summed and writes one
-        (BLOCK_M × BLOCK_D) partial of dnw. Splitting along D keeps
-        per-program register pressure manageable (vs a 1D-over-M grid
-        which would force the whole D into a single tile and spill).
-
-        `inner_ptr` is the per-row reduction `inner[m] = mean_d(g_eff *
-        y_norm)`, pre-computed by `_fused_add_norm_inner_kernel`. This
-        avoids each d_tile program recomputing the same full-D reduction
-        (would be D/BLOCK_D × redundant otherwise).
-
-        `d_ext_ptr` is the gradient w.r.t. `summed` coming from outside
-        (caller's direct consumption of summed as residual stream). The
-        kernel adds it to the RMSNorm-bwd-computed gradient in pass 2
-        so the final `d_summed` already contains the total — saves an
-        extra Python torch elementwise add + its HBM round-trip
-        (~50 μs/call at d24 shape).
-
-        Math (when HAS_NW=True; `dy` is gradient of the fwd-output `y`):
-          y_norm[m, d]   = summed[m, d] * rms_inv[m]
-          g_eff[m, d]    = dy[m, d] * nw[d]
-          d_summed[m, d] = rms_inv[m] * (g_eff - y_norm * inner[m]) + d_ext[m, d]
-          dnw_partial[m_tile, d] = sum_{m in tile} (dy * y_norm)
-
-        When HAS_NW=False: y_norm[m, d] = ynorm_src[m, d] directly,
-        g_eff collapses to dy, dnw_partial is not produced; nw_ptr
-        and dnw_partial_ptr are not dereferenced.
-        """
-        pid_m = tl.program_id(0)
-        pid_d = tl.program_id(1)
-
-        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        ds = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-        row_mask = rows < M
-        d_mask = ds < D
-
-        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
-        if HAS_NW:
-            nw = tl.load(nw_ptr + ds, mask=d_mask, other=0.0).to(tl.float32)
-        # Pre-computed per-row inner — replaces the previous pass-1
-        # full-D reduction loop. One scalar load per row, not redone
-        # per d_tile program.
-        inner = tl.load(inner_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
-
-        # Compute d_summed for this (m_tile, d_tile) slice.
-        # All (M, D) tensors are contiguous (autograd boundary ensures
-        # this), so row stride = D, col stride = 1 — no per-tensor
-        # stride params needed.
-        offs = rows[:, None] * D + ds[None, :]
-        mask_2d = row_mask[:, None] & d_mask[None, :]
-        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        if HAS_NW:
-            y_norm = src * rms_inv[:, None]
-        else:
-            y_norm = src
-        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        if HAS_NW:
-            g_eff = dy_t * nw[None, :]
-        else:
-            g_eff = dy_t
-        # Fold external d_summed (caller's direct consumption of summed)
-        # into d_summed in-kernel — saves an extra Python `+` op + its
-        # HBM round-trip outside.
-        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        d_summed_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
-        tl.store(
-            d_summed_ptr + offs,
-            d_summed_tile.to(d_summed_ptr.dtype.element_ty),
-            mask=mask_2d,
-        )
-
-        # Per-m-tile partial dnw[d] = sum over tile rows of (dy * y_norm)
-        # — only when affine weight exists.
-        if HAS_NW:
-            dnw_partial = tl.sum(dy_t * y_norm, axis=0)
-            dnw_p_ptrs = dnw_partial_ptr + pid_m * D + ds
-            tl.store(
-                dnw_p_ptrs,
-                dnw_partial.to(dnw_partial_ptr.dtype.element_ty),
-                mask=d_mask,
-            )
-
-
-class FusedAddNorm(torch.autograd.Function):
-    """y = norm(x + residual), also returns summed = x + residual.
-
-    NOTE: Demo / learning kernel — NOT used in nanchat's hot path.
-    Benchmarked ~2× slower than native `x + r; F.rms_norm(...)` at
-    d24 shape (D=1536, M=2048): ~184 μs vs ~91 μs per call. The
-    autograd.Function wrapping alone adds ~100 μs of fixed overhead
-    (torch.empty_like × 3, save_for_backward, ctx attribute setup);
-    Triton's per-launch cost negates the theoretical ~6 μs HBM saving
-    from fusion. Production path uses NormMLPReluSquare /
-    NormQKVProjection where norm is folded into the adjacent matmul
-    so there's no standalone add+norm call to optimize.
-
-    Kept here as the first Triton kernel for learning purposes — it
-    covers the core patterns: 2D tile loading, power-of-2-rounded
-    BLOCK_D with col masking, fp32-promoted reduction, HAS_NW
-    constexpr branch, and on-the-fly y_norm reconstruction in bwd.
-
-    Forward: one Triton kernel does add + RMSNorm + writes y and summed
-    (no separate y_norm tensor — it stays in registers during fwd).
-
-    Backward uses `_fused_add_norm_bwd_kernel`, which loads summed
-    and reconstructs y_norm = summed * rms_inv on the fly. The extra
-    multiply runs on otherwise-idle FP32 cores (bwd is bandwidth-bound),
-    so the net win is saving the 2·M·D fwd HBM write of y_norm. summed
-    is saved anyway for the caller's residual stream.
-
-    `norm_weight` may be None → no per-channel affine scale (plain
-    `summed / RMS(summed)`); gradient w.r.t. norm_weight is then also
-    None and the dnw_partials reduction is skipped entirely.
-
-    Identity passthroughs:
-        d_summed = d_norm_from_kernel + d_summed_external
-        d_x = d_residual = d_summed
-    """
-
-    @staticmethod
-    def forward(ctx, x, residual, norm_weight, eps=1e-6):
-        assert x.is_cuda and x.is_contiguous()
-        assert residual.is_cuda and residual.is_contiguous()
-        M, D = x.shape
-        assert residual.shape == (M, D)
-        has_nw = norm_weight is not None
-        if has_nw:
-            assert norm_weight.is_cuda
-            assert norm_weight.shape == (D,)
-        y = torch.empty_like(x)
-        summed = torch.empty_like(x)
-        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-
-        # Triton's tl.arange requires power-of-2 BLOCK_D; non-pow2 D
-        # (e.g. d24's 1536) gets padded and the kernel's col_mask zeroes
-        # the trailing lanes so they don't affect the reduction.
-        BLOCK_D = triton.next_power_of_2(D)
-
-        # Tile sizing under Ampere's 255-reg/thread spill cap.
-        #
-        # Per-thread reg usage in this kernel:
-        #     real_regs/thread ≈ 2 × (BLOCK_M × BLOCK_D) / (nw × 32)
-        # (each fp32 element = 1 reg, ~2× factor for live intermediates).
-        # Setting ≤ 255 gives: tile ≤ 255 × 16 × nw ≈ 4080 × nw. We round
-        # to 4096 (= 2^12) for pow-of-2-aligned arithmetic — since our
-        # tile is always pow-of-2, tile / 4096 is then always integer, no
-        # ceil/floor edge case. The 16-element slack per warp is absorbed
-        # by compiler's actual reg use (verified: tile=16384 at nw=4
-        # measures n_regs=255, 0 spills).
-        #
-        # Design target nw=4 (Triton stock default): ~5-13% slower than
-        # aggressive nw=8 (tile=32K) on benchmarks but more blocks/SM and
-        # simpler — this is a learning kernel; production hot path doesn't
-        # use it (see class docstring). The initial nw=4 here sizes
-        # BLOCK_M below; final nw gets recomputed from the resulting tile
-        # so unusually large D auto-scales instead of silently spilling.
-        num_warps = 4
-
-        # BLOCK_M = min(reg-budget cap, M-saturation cap), both rounded
-        # to pow-of-2 (kernel requires pow-of-2 BLOCK_M):
-        #   - reg budget cap = 4096 × nw / BLOCK_D  (from inequality above)
-        #   - M-saturation cap = M // 64: keeps grid ≳ 64 programs ≈
-        #     filling the 3090's 82 SMs in one wave for any M. For nanchat
-        #     M=2048 this evaluates to 32 (matching the previous hardcoded
-        #     value); larger M auto-grows BLOCK_M to avoid extra waves of
-        #     launch overhead, smaller M shrinks it to keep enough programs
-        #     in the grid. (Per-row reduction doesn't benefit from bigger
-        #     BLOCK_M anyway — rows are independent, no cross-row reuse.)
-        # Outer max(1, ...) handles small-M case where M // 64 = 0.
-        BLOCK_M = max(
-            1,
-            min(
-                triton.next_power_of_2(M // 64),
-                triton.next_power_of_2(4096 * num_warps // BLOCK_D),
-            ),
-        )
-
-        # Final nw: solve reg-cap inequality for nw given the tile.
-        # Nanchat shapes (tile ≤ 16K) all yield nw=4. For D > 16K (where
-        # BLOCK_M=1 floored forces tile = BLOCK_D > 16K), nw auto-scales
-        # to 8 (D ≤ 32K) or 16 (D ≤ 64K) — safety net so the kernel
-        # degrades gracefully instead of silently spilling on unexpected D.
-        # Cap at 16: nw=32 → 1024 threads/block → only 1 block/SM (32/48
-        # warp slots, 67% occupancy); nw=16 keeps 3 blocks/SM (full 48-
-        # warp occupancy). max(1, tile // 4096) guards next_pow2 against
-        # the tile < 4096 case where the floor div yields 0.
-        tile = BLOCK_M * BLOCK_D
-        num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // 4096))))
-
-        # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
-        # valid placeholder pointer (Triton still requires the arg).
-        grid = (triton.cdiv(M, BLOCK_M),)
-        nw_arg = norm_weight if has_nw else x
-        _fused_add_norm_fwd_kernel[grid](
-            x,
-            residual,
-            nw_arg,
-            y,
-            summed,
-            rms_inv,
-            M,
-            D,
-            eps,
-            BLOCK_M=BLOCK_M,
-            BLOCK_D=BLOCK_D,
-            HAS_NW=has_nw,
-            num_warps=num_warps,
-        )
-        # ctx stash strategy depends on HAS_NW:
-        #  - HAS_NW=True : save `summed`; bwd recomputes y_norm = summed * rms_inv.
-        #  - HAS_NW=False: save `y` instead — since `y == y_norm` here
-        #    (no per-channel weight), bwd reads it directly with no multiply.
-        # summed is always returned forward-side for the residual stream.
-        ynorm_src = summed if has_nw else y
-        ctx.save_for_backward(ynorm_src, norm_weight, rms_inv)
-        ctx.M, ctx.D = M, D
-        ctx.has_nw = has_nw
-        return y, summed
-
-    @staticmethod
-    def backward(ctx, dy, d_summed_external):
-        ynorm_src, nw, rms_inv = ctx.saved_tensors
-        M, D = ctx.M, ctx.D
-        has_nw = ctx.has_nw
-        dy = dy.contiguous()
-        d_summed_external = d_summed_external.contiguous()
-
-        # Fixed-config bwd kernel (no autotune) for CUDA Graph
-        # capturability. Config chosen as a sweep-tested middle-ground.
-        BLOCK_M_BWD = 32
-        BLOCK_D_BWD = 64
-        NUM_WARPS_BWD = 4
-        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
-
-        # Single output buffer holds the FULL d_summed (bwd kernel fuses
-        # in d_summed_external — see kernel docstring).
-        d_summed = torch.empty_like(ynorm_src)
-        # inner[m] buffer — written by inner kernel, read by bwd kernel.
-        # Eliminates redundant per-d-tile recomputation of the per-row
-        # reduction inside bwd.
-        inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
-        if has_nw:
-            # Exact (num_m_tiles, D) since BLOCK_M is fixed — no more
-            # worst-case zero-padding hack needed.
-            dnw_partials = torch.empty(
-                (num_m_tiles, D),
-                dtype=nw.dtype,
-                device=ynorm_src.device,
-            )
-            nw_arg = nw
-            dnw_arg = dnw_partials
-        else:
-            # Dummy pointers when HAS_NW=False — kernel won't dereference.
-            nw_arg = ynorm_src
-            dnw_arg = ynorm_src
-
-        # Stage 1: pre-compute inner[m] (one 1D-grid kernel, full-D per
-        # program — fwd-style sizing, no D-split, no redundancy).
-        INNER_BLOCK_D = triton.next_power_of_2(D)
-        INNER_NUM_WARPS = 4
-        INNER_BLOCK_M = max(
-            1,
-            min(
-                triton.next_power_of_2(M // 64),
-                triton.next_power_of_2(4096 * INNER_NUM_WARPS // INNER_BLOCK_D),
-            ),
-        )
-        inner_grid = (triton.cdiv(M, INNER_BLOCK_M),)
-        _fused_add_norm_inner_kernel[inner_grid](
-            ynorm_src,
-            rms_inv,
-            nw_arg,
-            dy,
-            inner_buf,
-            M,
-            D,
-            BLOCK_M=INNER_BLOCK_M,
-            BLOCK_D=INNER_BLOCK_D,
-            HAS_NW=has_nw,
-            num_warps=INNER_NUM_WARPS,
-        )
-
-        # Stage 2: bwd kernel reads pre-computed inner, computes d_summed
-        # and dnw_partials. 2D grid with fixed BLOCK_M / BLOCK_D.
-        grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))
-        _fused_add_norm_bwd_kernel[grid_bwd](
-            ynorm_src,
-            rms_inv,
-            nw_arg,
-            dy,
-            d_summed_external,
-            inner_buf,
-            d_summed,
-            dnw_arg,
-            M,
-            D,
-            BLOCK_M=BLOCK_M_BWD,
-            BLOCK_D=BLOCK_D_BWD,
-            HAS_NW=has_nw,
-            num_warps=NUM_WARPS_BWD,
-        )
-        dnw = dnw_partials.sum(dim=0) if has_nw else None
-
-        # x + residual: d_x = d_residual = d_summed
-        # (d_summed already includes d_summed_external — fused in kernel).
-        d_x = d_summed
-        d_residual = d_summed
-        return d_x, d_residual, dnw, None
-
-
-def fused_add_norm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused `y = norm(x + residual)`. Also returns `summed = x + residual`
-    so the caller can plug it directly into the next block's residual
-    stream (no re-add needed).
-
-    Pass `norm_weight=None` for RMSNorm without a per-channel affine
-    scale (plain `summed / RMS(summed)`).
-
-    The canonical block-boundary fusion: between an attn block's output
-    and the mlp block's norm-input (or symmetrically between mlp output
-    and the next layer's attn norm-input).
-    """
-    return FusedAddNorm.apply(x, residual, norm_weight, eps)
