@@ -37,6 +37,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -75,20 +76,35 @@ if _HAS_TRITON:
 
     @triton.jit
     def _norm_mlp_block_fwd_kernel(
-        x_ptr, norm_w_ptr, fc_w_ptr, proj_w_ptr, residual_ptr,
-        y_ptr, z_ptr, rms_inv_ptr,
-        M, N_fc, K, K_out,
+        x_ptr,
+        norm_w_ptr,
+        fc_w_ptr,
+        proj_w_ptr,
+        residual_ptr,
+        y_ptr,
+        z_ptr,
+        rms_inv_ptr,
+        M,
+        N_fc,
+        K,
+        K_out,
         eps,
-        stride_xm, stride_xk,
-        stride_fc_n, stride_fc_k,
-        stride_proj_p, stride_proj_n,
-        stride_res_m, stride_res_p,
-        stride_ym, stride_yp,
-        stride_zm, stride_zn,
+        stride_xm,
+        stride_xk,
+        stride_fc_n,
+        stride_fc_k,
+        stride_proj_p,
+        stride_proj_n,
+        stride_res_m,
+        stride_res_p,
+        stride_ym,
+        stride_yp,
+        stride_zm,
+        stride_zn,
         BLOCK_M: tl.constexpr,
-        BLOCK_K_OUT: tl.constexpr,    # tile size along the output (= K_out) dim of c_proj
-        BLOCK_N: tl.constexpr,        # tile size along the c_fc output / c_proj input dim
-        BLOCK_K: tl.constexpr,        # tile size along input K dim (for RMSNorm + c_fc matmul)
+        BLOCK_K_OUT: tl.constexpr,  # tile size along the output (= K_out) dim of c_proj
+        BLOCK_N: tl.constexpr,  # tile size along the c_fc output / c_proj input dim
+        BLOCK_K: tl.constexpr,  # tile size along input K dim (for RMSNorm + c_fc matmul)
     ):
         """Fully fused MLP block + residual:
             y = residual + relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T
@@ -119,7 +135,9 @@ if _HAS_TRITON:
             k_mask = ks < K
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
-                x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                x_ptrs,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
@@ -144,18 +162,20 @@ if _HAS_TRITON:
                 k_mask = ks < K
                 x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
                 x = tl.load(
-                    x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                    x_ptrs,
+                    mask=row_mask[:, None] & k_mask[None, :],
+                    other=0.0,
                 ).to(tl.float32)
                 nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
                 x_hat = x * rms_inv[:, None] * nw[None, :]
                 # W_fc shape (N_fc, K): row ns, col ks
                 fc_ptrs = (
-                    fc_w_ptr
-                    + ns[:, None] * stride_fc_n
-                    + ks[None, :] * stride_fc_k
+                    fc_w_ptr + ns[:, None] * stride_fc_n + ks[None, :] * stride_fc_k
                 )
                 fc_w = tl.load(
-                    fc_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                    fc_ptrs,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0.0,
                 ).to(tl.float32)
                 z_slab += tl.dot(x_hat, tl.trans(fc_w), input_precision="ieee")
 
@@ -181,15 +201,21 @@ if _HAS_TRITON:
             )
             proj_w = tl.load(
                 proj_ptrs,
-                mask=out_col_mask[:, None] & n_mask[None, :], other=0.0,
+                mask=out_col_mask[:, None] & n_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             out_acc += tl.dot(r_slab, tl.trans(proj_w), input_precision="ieee")
 
         # Add residual and write y
-        res_ptrs = residual_ptr + rows[:, None] * stride_res_m + out_cols[None, :] * stride_res_p
+        res_ptrs = (
+            residual_ptr
+            + rows[:, None] * stride_res_m
+            + out_cols[None, :] * stride_res_p
+        )
         residual = tl.load(
             res_ptrs,
-            mask=row_mask[:, None] & out_col_mask[None, :], other=0.0,
+            mask=row_mask[:, None] & out_col_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         y_final = residual + out_acc
 
@@ -200,18 +226,29 @@ if _HAS_TRITON:
             mask=row_mask[:, None] & out_col_mask[None, :],
         )
 
-
     @triton.jit
     def _norm_linear_relu_square_fwd_kernel(
-        x_ptr, norm_w_ptr, lin_w_ptr,
-        y_ptr, z_ptr, rms_inv_ptr,
-        M, N, K,
+        x_ptr,
+        norm_w_ptr,
+        lin_w_ptr,
+        y_ptr,
+        z_ptr,
+        rms_inv_ptr,
+        M,
+        N,
+        K,
         eps,
-        stride_xm, stride_xk,
-        stride_wn, stride_wk,
-        stride_ym, stride_yn,
-        stride_zm, stride_zn,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        stride_xm,
+        stride_xk,
+        stride_wn,
+        stride_wk,
+        stride_ym,
+        stride_yn,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         """Forward kernel. Computes y = relu(norm(x) @ W^T)² for one (BLOCK_M, BLOCK_N)
         tile, and saves z (= norm(x) @ W^T, pre-relu²) + rms_inv for backward.
@@ -233,7 +270,8 @@ if _HAS_TRITON:
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
                 x_ptrs,
-                mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
@@ -251,18 +289,16 @@ if _HAS_TRITON:
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
                 x_ptrs,
-                mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
             x_hat = x * rms_inv[:, None] * nw[None, :]
-            w_ptrs = (
-                lin_w_ptr
-                + cols[:, None] * stride_wn
-                + ks[None, :] * stride_wk
-            )
+            w_ptrs = lin_w_ptr + cols[:, None] * stride_wn + ks[None, :] * stride_wk
             w = tl.load(
                 w_ptrs,
-                mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=col_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             # input_precision="ieee" disables Triton's default TF32 downcast
             # on Ampere. TF32 has only 10-bit mantissa, while PyTorch's `@`
@@ -291,7 +327,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _relu_square_bwd_kernel(
-        z_ptr, dy_ptr, dz_ptr,
+        z_ptr,
+        dy_ptr,
+        dz_ptr,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
@@ -307,14 +345,22 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rms_norm_bwd_kernel(
-        x_ptr, rms_inv_ptr, nw_ptr,
+        x_ptr,
+        rms_inv_ptr,
+        nw_ptr,
         dxhat_ptr,
-        dx_ptr, dnw_partial_ptr,
-        M, K,
-        stride_xm, stride_xk,
-        stride_dxhat_m, stride_dxhat_k,
-        stride_dx_m, stride_dx_k,
-        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+        dx_ptr,
+        dnw_partial_ptr,
+        M,
+        K,
+        stride_xm,
+        stride_xk,
+        stride_dxhat_m,
+        stride_dxhat_k,
+        stride_dx_m,
+        stride_dx_k,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         """RMSNorm backward + partial dnw (reduced over M into row tiles).
 
@@ -350,7 +396,9 @@ if _HAS_TRITON:
             k2_mask = ks2 < K
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks2[None, :] * stride_xk
             x = tl.load(
-                x_ptrs, mask=row_mask[:, None] & k2_mask[None, :], other=0.0,
+                x_ptrs,
+                mask=row_mask[:, None] & k2_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             dxh_ptrs = (
                 dxhat_ptr
@@ -358,7 +406,9 @@ if _HAS_TRITON:
                 + ks2[None, :] * stride_dxhat_k
             )
             dxh = tl.load(
-                dxh_ptrs, mask=row_mask[:, None] & k2_mask[None, :], other=0.0,
+                dxh_ptrs,
+                mask=row_mask[:, None] & k2_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             nw2 = tl.load(nw_ptr + ks2, mask=k2_mask, other=0.0).to(tl.float32)
             y_norm2 = x * rms_inv[:, None]
@@ -369,15 +419,17 @@ if _HAS_TRITON:
         # Pass 2: compute dx for THIS k-tile
         x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
         x = tl.load(
-            x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            x_ptrs,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         dxh_ptrs = (
-            dxhat_ptr
-            + rows[:, None] * stride_dxhat_m
-            + ks[None, :] * stride_dxhat_k
+            dxhat_ptr + rows[:, None] * stride_dxhat_m + ks[None, :] * stride_dxhat_k
         )
         dxh = tl.load(
-            dxh_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            dxh_ptrs,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         y_norm = x * rms_inv[:, None]
         g_eff = dxh * nw[None, :]
@@ -392,7 +444,9 @@ if _HAS_TRITON:
         # Per-m-tile partial dnw[k]: sum over this tile's rows of (dxh * y_norm)
         dnw_partial = tl.sum(dxh * y_norm, axis=0)  # (BLOCK_K,)
         dnw_p_ptrs = dnw_partial_ptr + pid_m * K + ks
-        tl.store(dnw_p_ptrs, dnw_partial.to(dnw_partial_ptr.dtype.element_ty), mask=k_mask)
+        tl.store(
+            dnw_p_ptrs, dnw_partial.to(dnw_partial_ptr.dtype.element_ty), mask=k_mask
+        )
 
 
 class NormMLPReluSquare(torch.autograd.Function):
@@ -429,9 +483,7 @@ class NormMLPReluSquare(torch.autograd.Function):
         N_fc, K_w = fc_weight.shape
         K_proj_out, N_proj_in = proj_weight.shape
         assert K == K_w, f"x last dim {K} != fc_weight in dim {K_w}"
-        assert N_fc == N_proj_in, (
-            f"fc out dim {N_fc} != proj in dim {N_proj_in}"
-        )
+        assert N_fc == N_proj_in, f"fc out dim {N_fc} != proj in dim {N_proj_in}"
 
         # Block sizes chosen to fit 3090's 100 KB shared memory per SM.
         # Larger tiles = better arithmetic intensity but need room for
@@ -446,14 +498,27 @@ class NormMLPReluSquare(torch.autograd.Function):
 
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_fc, BLOCK_N))
         _norm_linear_relu_square_fwd_kernel[grid](
-            x, norm_weight, fc_weight,
-            r, z, rms_inv,
-            M, N_fc, K, eps,
-            x.stride(0), x.stride(1),
-            fc_weight.stride(0), fc_weight.stride(1),
-            r.stride(0), r.stride(1),
-            z.stride(0), z.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            x,
+            norm_weight,
+            fc_weight,
+            r,
+            z,
+            rms_inv,
+            M,
+            N_fc,
+            K,
+            eps,
+            x.stride(0),
+            x.stride(1),
+            fc_weight.stride(0),
+            fc_weight.stride(1),
+            r.stride(0),
+            r.stride(1),
+            z.stride(0),
+            z.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
         )
 
         # Second linear + residual via fused addmm (cuBLAS): y = residual + r @ W_proj.T
@@ -481,23 +546,27 @@ class NormMLPReluSquare(torch.autograd.Function):
         # Recompute r = relu(z)² to avoid saving M*N_fc floats in ctx.
         relu_z = z.clamp(min=0)
         r = relu_z * relu_z
-        dr = dy @ W_proj         # (M, N_fc)
-        dW_proj = dy.t() @ r     # (K_out, N_fc)
+        dr = dy @ W_proj  # (M, N_fc)
+        dW_proj = dy.t() @ r  # (K_out, N_fc)
 
         # Step B: relu²-backward (Triton). dz = 2 * relu(z) * dr.
         dz = torch.empty_like(z)
         BLOCK_SIZE = 1024
         grid_rs = (triton.cdiv(M * N_fc, BLOCK_SIZE),)
         _relu_square_bwd_kernel[grid_rs](
-            z, dr, dz, M * N_fc, BLOCK_SIZE=BLOCK_SIZE,
+            z,
+            dr,
+            dz,
+            M * N_fc,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
 
         # Step C: c_fc backward (cuBLAS).
         # z = x_hat @ W_fc.T → dx_hat = dz @ W_fc ; dW_fc = dz.T @ x_hat.
         # Recompute x_hat = x * rms_inv * norm_w (cheap elementwise).
         x_hat = x * rms_inv.unsqueeze(1) * norm_w
-        dx_hat = dz @ W_fc       # (M, K)
-        dW_fc = dz.t() @ x_hat   # (N_fc, K)
+        dx_hat = dz @ W_fc  # (M, K)
+        dW_fc = dz.t() @ x_hat  # (N_fc, K)
 
         # Step D: RMSNorm backward (Triton) — dx + per-m-tile partial dnw.
         # Block sizes chosen so 2×(BLOCK_M, BLOCK_K) fp32 tiles fit in 3090
@@ -506,18 +575,28 @@ class NormMLPReluSquare(torch.autograd.Function):
         num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
         dx = torch.empty_like(x)
         dnw_partials = torch.empty(
-            (num_m_tiles, K), dtype=norm_w.dtype, device=x.device,
+            (num_m_tiles, K),
+            dtype=norm_w.dtype,
+            device=x.device,
         )
         grid_bwd = (num_m_tiles, triton.cdiv(K, BLOCK_K_BWD))
         _rms_norm_bwd_kernel[grid_bwd](
-            x, rms_inv, norm_w,
+            x,
+            rms_inv,
+            norm_w,
             dx_hat,
-            dx, dnw_partials,
-            M, K,
-            x.stride(0), x.stride(1),
-            dx_hat.stride(0), dx_hat.stride(1),
-            dx.stride(0), dx.stride(1),
-            BLOCK_M=BLOCK_M_BWD, BLOCK_K=BLOCK_K_BWD,
+            dx,
+            dnw_partials,
+            M,
+            K,
+            x.stride(0),
+            x.stride(1),
+            dx_hat.stride(0),
+            dx_hat.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            BLOCK_M=BLOCK_M_BWD,
+            BLOCK_K=BLOCK_K_BWD,
         )
         dnw = dnw_partials.sum(dim=0)
 
@@ -548,7 +627,9 @@ def norm_mlp_relu_square(
     the surrounding `x = x + ...` residual add in one call:
         x = norm_mlp_relu_square(x, norm_w, W_fc, W_proj, residual=x)
     """
-    return NormMLPReluSquare.apply(x, norm_weight, fc_weight, proj_weight, residual, eps)
+    return NormMLPReluSquare.apply(
+        x, norm_weight, fc_weight, proj_weight, residual, eps
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -576,14 +657,24 @@ if _HAS_TRITON:
 
     @triton.jit
     def _norm_qkv_fwd_kernel(
-        x_ptr, norm_w_ptr, qkv_w_ptr,
-        out_ptr, rms_inv_ptr,
-        M, N_qkv, K,
+        x_ptr,
+        norm_w_ptr,
+        qkv_w_ptr,
+        out_ptr,
+        rms_inv_ptr,
+        M,
+        N_qkv,
+        K,
         eps,
-        stride_xm, stride_xk,
-        stride_wn, stride_wk,
-        stride_om, stride_on,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        stride_xm,
+        stride_xk,
+        stride_wn,
+        stride_wk,
+        stride_om,
+        stride_on,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         """Computes one (BLOCK_M, BLOCK_N) tile of out = RMSNorm(x) @ W_qkv.T,
         where W_qkv = concat([c_q.weight, c_k.weight, c_v.weight], dim=0)
@@ -605,7 +696,8 @@ if _HAS_TRITON:
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
                 x_ptrs,
-                mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
@@ -621,18 +713,16 @@ if _HAS_TRITON:
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
                 x_ptrs,
-                mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
             x_hat = x * rms_inv[:, None] * nw[None, :]
-            w_ptrs = (
-                qkv_w_ptr
-                + cols[:, None] * stride_wn
-                + ks[None, :] * stride_wk
-            )
+            w_ptrs = qkv_w_ptr + cols[:, None] * stride_wn + ks[None, :] * stride_wk
             w = tl.load(
                 w_ptrs,
-                mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+                mask=col_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             acc += tl.dot(x_hat, tl.trans(w), input_precision="ieee")
 
@@ -668,13 +758,24 @@ class NormQKVProjection(torch.autograd.Function):
         rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_qkv, BLOCK_N))
         _norm_qkv_fwd_kernel[grid](
-            x, norm_weight, qkv_weight,
-            out, rms_inv,
-            M, N_qkv, K, eps,
-            x.stride(0), x.stride(1),
-            qkv_weight.stride(0), qkv_weight.stride(1),
-            out.stride(0), out.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            x,
+            norm_weight,
+            qkv_weight,
+            out,
+            rms_inv,
+            M,
+            N_qkv,
+            K,
+            eps,
+            x.stride(0),
+            x.stride(1),
+            qkv_weight.stride(0),
+            qkv_weight.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
         )
 
         ctx.save_for_backward(x, norm_weight, qkv_weight, rms_inv)
@@ -691,26 +792,36 @@ class NormQKVProjection(torch.autograd.Function):
         #   dx_hat = d_out @ qkv_w
         #   d_qkv_w = d_out.T @ x_hat
         x_hat = x * rms_inv.unsqueeze(1) * norm_w
-        dx_hat = d_out @ qkv_w        # (M, K)
-        d_qkv_w = d_out.t() @ x_hat   # (N_qkv, K)
+        dx_hat = d_out @ qkv_w  # (M, K)
+        d_qkv_w = d_out.t() @ x_hat  # (N_qkv, K)
 
         # RMSNorm backward (Triton — reuses _rms_norm_bwd_kernel)
         BLOCK_M_BWD, BLOCK_K_BWD = 32, 64
         num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
         dx = torch.empty_like(x)
         dnw_partials = torch.empty(
-            (num_m_tiles, K), dtype=norm_w.dtype, device=x.device,
+            (num_m_tiles, K),
+            dtype=norm_w.dtype,
+            device=x.device,
         )
         grid_bwd = (num_m_tiles, triton.cdiv(K, BLOCK_K_BWD))
         _rms_norm_bwd_kernel[grid_bwd](
-            x, rms_inv, norm_w,
+            x,
+            rms_inv,
+            norm_w,
             dx_hat,
-            dx, dnw_partials,
-            M, K,
-            x.stride(0), x.stride(1),
-            dx_hat.stride(0), dx_hat.stride(1),
-            dx.stride(0), dx.stride(1),
-            BLOCK_M=BLOCK_M_BWD, BLOCK_K=BLOCK_K_BWD,
+            dx,
+            dnw_partials,
+            M,
+            K,
+            x.stride(0),
+            x.stride(1),
+            dx_hat.stride(0),
+            dx_hat.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            BLOCK_M=BLOCK_M_BWD,
+            BLOCK_K=BLOCK_K_BWD,
         )
         dnw = dnw_partials.sum(dim=0)
 
@@ -762,16 +873,38 @@ if _HAS_TRITON:
 
     @triton.jit
     def _flash_attn_fwd_kernel(
-        Q, K, V, sm_scale,
-        LSE, O,
-        stride_qb, stride_qh, stride_qm, stride_qd,
-        stride_kb, stride_kh, stride_kn, stride_kd,
-        stride_vb, stride_vh, stride_vn, stride_vd,
-        stride_ob, stride_oh, stride_om, stride_od,
-        stride_lb, stride_lh, stride_lm,
-        B, H, M, N,
+        Q,
+        K,
+        V,
+        sm_scale,
+        LSE,
+        O,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_vd,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_od,
+        stride_lb,
+        stride_lh,
+        stride_lm,
+        B,
+        H,
+        M,
+        N,
         WINDOW: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,
     ):
         """Forward: one program per (batch × head × Q-tile-of-BLOCK_M-rows)."""
@@ -814,8 +947,12 @@ if _HAS_TRITON:
             n_mask = offs_n < N
 
             # Load K, V tiles
-            k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-            v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            k_ptrs = (
+                K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+            )
+            v_ptrs = (
+                V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            )
             k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
             v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
 
@@ -826,7 +963,9 @@ if _HAS_TRITON:
             #   keep if  j ≤ i  AND  j ≥ i - W + 1
             j = offs_n[None, :]
             i = offs_m[:, None]
-            mask_keep = (j <= i) & (j >= i - WINDOW + 1) & m_mask[:, None] & n_mask[None, :]
+            mask_keep = (
+                (j <= i) & (j >= i - WINDOW + 1) & m_mask[:, None] & n_mask[None, :]
+            )
             s = tl.where(mask_keep, s, -float("inf"))
 
             # Online softmax update. CRITICAL: when an entire row's scores
@@ -843,7 +982,8 @@ if _HAS_TRITON:
             l_i = l_i * alpha + tl.sum(p_unscaled, axis=1)
             acc = acc * alpha[:, None] + tl.dot(
                 p_unscaled.to(v_tile.dtype),
-                v_tile, input_precision="ieee",
+                v_tile,
+                input_precision="ieee",
             )
             m_i = m_new
 
@@ -857,14 +997,23 @@ if _HAS_TRITON:
         lse_ptrs = LSE + lse_off + offs_m * stride_lm
         tl.store(lse_ptrs, lse, mask=m_mask)
 
-
     @triton.jit
     def _flash_attn_bwd_preprocess_kernel(
-        O, dO, D,
-        stride_ob, stride_oh, stride_om, stride_od,
-        stride_db, stride_dh, stride_dm,
-        B, H, M,
-        BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+        O,
+        dO,
+        D,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_od,
+        stride_db,
+        stride_dh,
+        stride_dm,
+        B,
+        H,
+        M,
+        BLOCK_M: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
     ):
         """Precompute D[i] = sum_j o[i, j] * dO[i, j] — used in bwd to skip
         the inner softmax-bwd reduction. This is the classic Flash trick."""
@@ -886,21 +1035,47 @@ if _HAS_TRITON:
         d_ptrs = D + bid * stride_db + hid * stride_dh + offs_m * stride_dm
         tl.store(d_ptrs, d_row, mask=m_mask)
 
-
     @triton.jit
     def _flash_attn_bwd_kernel(
-        Q, K, V, sm_scale,
-        LSE, D, dO,
-        dQ, dK, dV,
-        stride_qb, stride_qh, stride_qm, stride_qd,
-        stride_kb, stride_kh, stride_kn, stride_kd,
-        stride_vb, stride_vh, stride_vn, stride_vd,
-        stride_ob, stride_oh, stride_om, stride_od,
-        stride_lb, stride_lh, stride_lm,
-        stride_db, stride_dh, stride_dm,
-        B, H, M, N,
+        Q,
+        K,
+        V,
+        sm_scale,
+        LSE,
+        D,
+        dO,
+        dQ,
+        dK,
+        dV,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_vd,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_od,
+        stride_lb,
+        stride_lh,
+        stride_lm,
+        stride_db,
+        stride_dh,
+        stride_dm,
+        B,
+        H,
+        M,
+        N,
         WINDOW: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,
     ):
         """Backward: iterate Q tiles, stream K/V tiles within the sliding band.
@@ -921,7 +1096,13 @@ if _HAS_TRITON:
 
         # Load Q tile, dO tile, LSE, D for this Q range
         q_ptrs = Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        do_ptrs = dO + bid * stride_ob + hid * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        do_ptrs = (
+            dO
+            + bid * stride_ob
+            + hid * stride_oh
+            + offs_m[:, None] * stride_om
+            + offs_d[None, :] * stride_od
+        )
         lse_ptrs = LSE + bid * stride_lb + hid * stride_lh + offs_m * stride_lm
         d_ptrs = D + bid * stride_db + hid * stride_dh + offs_m * stride_dm
         q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
@@ -939,8 +1120,12 @@ if _HAS_TRITON:
             offs_n = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
             n_mask = offs_n < N
 
-            k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-            v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            k_ptrs = (
+                K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+            )
+            v_ptrs = (
+                V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            )
             k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
             v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
 
@@ -948,7 +1133,9 @@ if _HAS_TRITON:
             s = tl.dot(q, tl.trans(k_tile), input_precision="ieee") * sm_scale
             j = offs_n[None, :]
             i = offs_m[:, None]
-            mask_keep = (j <= i) & (j >= i - WINDOW + 1) & m_mask[:, None] & n_mask[None, :]
+            mask_keep = (
+                (j <= i) & (j >= i - WINDOW + 1) & m_mask[:, None] & n_mask[None, :]
+            )
             s = tl.where(mask_keep, s, -float("inf"))
             p = tl.exp(s - lse[:, None])
 
@@ -964,8 +1151,12 @@ if _HAS_TRITON:
             dk = tl.dot(tl.trans(ds).to(q.dtype), q, input_precision="ieee")
 
             # Atomic-add dK, dV (overlapping Q tiles touch same K rows)
-            dk_ptrs = dK + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-            dv_ptrs = dV + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            dk_ptrs = (
+                dK + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+            )
+            dv_ptrs = (
+                dV + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+            )
             tl.atomic_add(dk_ptrs, dk.to(dK.dtype.element_ty), mask=n_mask[:, None])
             tl.atomic_add(dv_ptrs, dv.to(dV.dtype.element_ty), mask=n_mask[:, None])
 
@@ -995,7 +1186,7 @@ class FlashSDPA(torch.autograd.Function):
         )
         B, H, M, D = q.shape
         N = k.shape[2]
-        sm_scale = D ** -0.5
+        sm_scale = D**-0.5
 
         o = torch.empty_like(q)
         lse = torch.empty((B, H, M), dtype=torch.float32, device=q.device)
@@ -1003,16 +1194,39 @@ class FlashSDPA(torch.autograd.Function):
         BLOCK_M, BLOCK_N = 64, 64
         grid = (B * H, triton.cdiv(M, BLOCK_M))
         _flash_attn_fwd_kernel[grid](
-            q, k, v, sm_scale,
-            lse, o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            lse.stride(0), lse.stride(1), lse.stride(2),
-            B, H, M, N,
+            q,
+            k,
+            v,
+            sm_scale,
+            lse,
+            o,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            lse.stride(0),
+            lse.stride(1),
+            lse.stride(2),
+            B,
+            H,
+            M,
+            N,
             WINDOW=window_size,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=D,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=D,
         )
 
         ctx.save_for_backward(q, k, v, o, lse)
@@ -1037,11 +1251,21 @@ class FlashSDPA(torch.autograd.Function):
         BLOCK_M_PRE = 64
         grid_pre = (B * H, triton.cdiv(M, BLOCK_M_PRE))
         _flash_attn_bwd_preprocess_kernel[grid_pre](
-            o, do, d,
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            d.stride(0), d.stride(1), d.stride(2),
-            B, H, M,
-            BLOCK_M=BLOCK_M_PRE, BLOCK_DMODEL=D,
+            o,
+            do,
+            d,
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            d.stride(0),
+            d.stride(1),
+            d.stride(2),
+            B,
+            H,
+            M,
+            BLOCK_M=BLOCK_M_PRE,
+            BLOCK_DMODEL=D,
         )
 
         # dQ, dK, dV allocated as zero (dK, dV need accumulation via atomic).
@@ -1050,25 +1274,56 @@ class FlashSDPA(torch.autograd.Function):
         dv = torch.zeros_like(v)
         grid_bwd = (B * H, triton.cdiv(M, BLOCK_M))
         _flash_attn_bwd_kernel[grid_bwd](
-            q, k, v, sm_scale,
-            lse, d, do,
-            dq, dk, dv,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            lse.stride(0), lse.stride(1), lse.stride(2),
-            d.stride(0), d.stride(1), d.stride(2),
-            B, H, M, N,
+            q,
+            k,
+            v,
+            sm_scale,
+            lse,
+            d,
+            do,
+            dq,
+            dk,
+            dv,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            lse.stride(0),
+            lse.stride(1),
+            lse.stride(2),
+            d.stride(0),
+            d.stride(1),
+            d.stride(2),
+            B,
+            H,
+            M,
+            N,
             WINDOW=window_size,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=D,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=D,
         )
 
         return dq, dk, dv, None
 
 
 def flash_sdpa(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window_size: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_size: int,
 ) -> torch.Tensor:
     """Flash-style sliding-causal SDPA. q, k, v: (B, H, L, D), H_q == H_kv.
 
@@ -1090,15 +1345,28 @@ if _HAS_TRITON:
 
     @triton.jit
     def _value_gate_kernel(
-        v_ptr, ve_ptr, x_ptr, gate_w_ptr,
+        v_ptr,
+        ve_ptr,
+        x_ptr,
+        gate_w_ptr,
         out_ptr,
-        M, D_x, D_v, ve_gate_ch,
-        stride_vm, stride_vd,
-        stride_vem, stride_ved,
-        stride_xm, stride_xd,
-        stride_gw_d_out, stride_gw_d_in,
-        stride_om, stride_od,
-        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_K: tl.constexpr,
+        M,
+        D_x,
+        D_v,
+        ve_gate_ch,
+        stride_vm,
+        stride_vd,
+        stride_vem,
+        stride_ved,
+        stride_xm,
+        stride_xd,
+        stride_gw_d_out,
+        stride_gw_d_in,
+        stride_om,
+        stride_od,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         """Fused value-residual gate (ResFormer):
             gate = 3 * sigmoid(x[..., :ch] @ gate_w.T)       # (M, D_v_head_dim)
@@ -1127,7 +1395,9 @@ if _HAS_TRITON:
             k_mask = ks < ve_gate_ch
             x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xd
             x_chunk = tl.load(
-                x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                x_ptrs,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             gw_ptrs = (
                 gate_w_ptr
@@ -1135,7 +1405,9 @@ if _HAS_TRITON:
                 + ks[None, :] * stride_gw_d_in
             )
             gw = tl.load(
-                gw_ptrs, mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+                gw_ptrs,
+                mask=col_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             gate_acc += tl.dot(x_chunk, tl.trans(gw), input_precision="ieee")
         gate = 3.0 * tl.sigmoid(gate_acc)
@@ -1143,8 +1415,12 @@ if _HAS_TRITON:
         # Load v, ve, compute out = v + gate * ve
         v_ptrs = v_ptr + rows[:, None] * stride_vm + cols[None, :] * stride_vd
         ve_ptrs = ve_ptr + rows[:, None] * stride_vem + cols[None, :] * stride_ved
-        v = tl.load(v_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
-        ve = tl.load(ve_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(
+            tl.float32
+        )
+        ve = tl.load(ve_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(
+            tl.float32
+        )
         out = v + gate * ve
 
         o_ptrs = out_ptr + rows[:, None] * stride_om + cols[None, :] * stride_od
@@ -1154,17 +1430,23 @@ if _HAS_TRITON:
             mask=row_mask[:, None] & col_mask[None, :],
         )
 
-
     @triton.jit
     def _rotary_qk_norm_scale_kernel(
-        qk_ptr, cos_ptr, sin_ptr,
-        out_ptr, rms_inv_ptr,
-        M, D,
+        qk_ptr,
+        cos_ptr,
+        sin_ptr,
+        out_ptr,
+        rms_inv_ptr,
+        M,
+        D,
         scale,
         eps,
-        stride_qm, stride_qd,
-        stride_om, stride_od,
-        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+        stride_qm,
+        stride_qd,
+        stride_om,
+        stride_od,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
     ):
         """Fused rotary + RMSNorm + ×scale for Q or K:
             x1, x2 = qk[..., :d], qk[..., d:]
@@ -1185,16 +1467,20 @@ if _HAS_TRITON:
 
         # Load lo + hi halves of qk and cos/sin (which are half-D wide)
         ptrs_lo = qk_ptr + rows[:, None] * stride_qm + cs_cols[None, :] * stride_qd
-        ptrs_hi = qk_ptr + rows[:, None] * stride_qm + (cs_cols[None, :] + half) * stride_qd
+        ptrs_hi = (
+            qk_ptr + rows[:, None] * stride_qm + (cs_cols[None, :] + half) * stride_qd
+        )
         x1 = tl.load(ptrs_lo, mask=row_mask[:, None], other=0.0).to(tl.float32)
         x2 = tl.load(ptrs_hi, mask=row_mask[:, None], other=0.0).to(tl.float32)
         cos = tl.load(
             cos_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
-            mask=row_mask[:, None], other=0.0,
+            mask=row_mask[:, None],
+            other=0.0,
         ).to(tl.float32)
         sin = tl.load(
             sin_ptr + rows[:, None] * (BLOCK_D // 2) + cs_cols[None, :],
-            mask=row_mask[:, None], other=0.0,
+            mask=row_mask[:, None],
+            other=0.0,
         ).to(tl.float32)
 
         # Rotary: y1 = x1·cos + x2·sin ;  y2 = -x1·sin + x2·cos
@@ -1210,23 +1496,38 @@ if _HAS_TRITON:
         y1_out = y1 * norm_scale[:, None]
         y2_out = y2 * norm_scale[:, None]
         out_ptrs_lo = out_ptr + rows[:, None] * stride_om + cs_cols[None, :] * stride_od
-        out_ptrs_hi = out_ptr + rows[:, None] * stride_om + (cs_cols[None, :] + half) * stride_od
-        tl.store(out_ptrs_lo, y1_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None])
-        tl.store(out_ptrs_hi, y2_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None])
+        out_ptrs_hi = (
+            out_ptr + rows[:, None] * stride_om + (cs_cols[None, :] + half) * stride_od
+        )
+        tl.store(
+            out_ptrs_lo, y1_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None]
+        )
+        tl.store(
+            out_ptrs_hi, y2_out.to(out_ptr.dtype.element_ty), mask=row_mask[:, None]
+        )
         # rms_inv saved for backward
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
-
     @triton.jit
     def _output_proj_residual_kernel(
-        attn_out_ptr, proj_w_ptr, residual_ptr,
+        attn_out_ptr,
+        proj_w_ptr,
+        residual_ptr,
         y_ptr,
-        M, D_out, D_in,
-        stride_am, stride_ad,
-        stride_pw_dout, stride_pw_din,
-        stride_rm, stride_rd,
-        stride_ym, stride_yd,
-        BLOCK_M: tl.constexpr, BLOCK_DOUT: tl.constexpr, BLOCK_DIN: tl.constexpr,
+        M,
+        D_out,
+        D_in,
+        stride_am,
+        stride_ad,
+        stride_pw_dout,
+        stride_pw_din,
+        stride_rm,
+        stride_rd,
+        stride_ym,
+        stride_yd,
+        BLOCK_M: tl.constexpr,
+        BLOCK_DOUT: tl.constexpr,
+        BLOCK_DIN: tl.constexpr,
     ):
         """Fused y = residual + attn_out @ W_proj.T.
 
@@ -1244,7 +1545,9 @@ if _HAS_TRITON:
         # Start accumulator with residual (the "bias" in addmm)
         res_ptrs = residual_ptr + rows[:, None] * stride_rm + cols[None, :] * stride_rd
         acc = tl.load(
-            res_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0,
+            res_ptrs,
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
 
         # Matmul-accumulate
@@ -1253,7 +1556,9 @@ if _HAS_TRITON:
             k_mask = ks < D_in
             a_ptrs = attn_out_ptr + rows[:, None] * stride_am + ks[None, :] * stride_ad
             a = tl.load(
-                a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+                a_ptrs,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             pw_ptrs = (
                 proj_w_ptr
@@ -1261,7 +1566,9 @@ if _HAS_TRITON:
                 + ks[None, :] * stride_pw_din
             )
             pw = tl.load(
-                pw_ptrs, mask=col_mask[:, None] & k_mask[None, :], other=0.0,
+                pw_ptrs,
+                mask=col_mask[:, None] & k_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             acc += tl.dot(a, tl.trans(pw), input_precision="ieee")
 
@@ -1291,13 +1598,24 @@ class OutputProjResidual(torch.autograd.Function):
         BLOCK_M, BLOCK_DOUT, BLOCK_DIN = 32, 64, 32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_out, BLOCK_DOUT))
         _output_proj_residual_kernel[grid](
-            attn_out, proj_weight, residual, y,
-            M, D_out, D_in,
-            attn_out.stride(0), attn_out.stride(1),
-            proj_weight.stride(0), proj_weight.stride(1),
-            residual.stride(0), residual.stride(1),
-            y.stride(0), y.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_DOUT=BLOCK_DOUT, BLOCK_DIN=BLOCK_DIN,
+            attn_out,
+            proj_weight,
+            residual,
+            y,
+            M,
+            D_out,
+            D_in,
+            attn_out.stride(0),
+            attn_out.stride(1),
+            proj_weight.stride(0),
+            proj_weight.stride(1),
+            residual.stride(0),
+            residual.stride(1),
+            y.stride(0),
+            y.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_DOUT=BLOCK_DOUT,
+            BLOCK_DIN=BLOCK_DIN,
         )
         ctx.save_for_backward(attn_out, proj_weight)
         return y
@@ -1332,6 +1650,7 @@ def output_proj_residual(
 # we just use torch ops for simplicity (it's only 3-4 elementwise ops).
 # ─────────────────────────────────────────────────────────────────────
 
+
 class ValueGate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, v, ve, x, gate_w):
@@ -1352,15 +1671,28 @@ class ValueGate(torch.autograd.Function):
         BLOCK_M, BLOCK_D, BLOCK_K = 32, 64, 32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D_v, BLOCK_D))
         _value_gate_kernel[grid](
-            v, ve, x_in, gate_w,
+            v,
+            ve,
+            x_in,
+            gate_w,
             out,
-            M, x.shape[1], D_v, ve_gate_ch,
-            v.stride(0), v.stride(1),
-            ve.stride(0), ve.stride(1),
-            x_in.stride(0), x_in.stride(1),
-            gate_w.stride(0), gate_w.stride(1),
-            out.stride(0), out.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_K=BLOCK_K,
+            M,
+            x.shape[1],
+            D_v,
+            ve_gate_ch,
+            v.stride(0),
+            v.stride(1),
+            ve.stride(0),
+            ve.stride(1),
+            x_in.stride(0),
+            x_in.stride(1),
+            gate_w.stride(0),
+            gate_w.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_D=BLOCK_D,
+            BLOCK_K=BLOCK_K,
         )
         ctx.save_for_backward(v, ve, x_in, gate_w)
         ctx.ve_gate_ch = ve_gate_ch
@@ -1397,7 +1729,10 @@ class ValueGate(torch.autograd.Function):
 
 
 def value_gate(
-    v: torch.Tensor, ve: torch.Tensor, x: torch.Tensor, gate_w: torch.Tensor,
+    v: torch.Tensor,
+    ve: torch.Tensor,
+    x: torch.Tensor,
+    gate_w: torch.Tensor,
 ) -> torch.Tensor:
     """Fused ResFormer value gate: out = v + 3·sigmoid(x[:, :ch] @ gate_w.T) · ve."""
     return ValueGate.apply(v, ve, x, gate_w)
@@ -1413,6 +1748,7 @@ def value_gate(
 # clarity (each op is small elementwise).
 # ─────────────────────────────────────────────────────────────────────
 
+
 class RotaryQKNormScale(torch.autograd.Function):
     @staticmethod
     def forward(ctx, qk, cos, sin, scale, eps=1e-6):
@@ -1426,12 +1762,21 @@ class RotaryQKNormScale(torch.autograd.Function):
         BLOCK_M = 32
         grid = (triton.cdiv(M, BLOCK_M),)
         _rotary_qk_norm_scale_kernel[grid](
-            qk, cos, sin,
-            out, rms_inv,
-            M, D, scale, eps,
-            qk.stride(0), qk.stride(1),
-            out.stride(0), out.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_D=D,
+            qk,
+            cos,
+            sin,
+            out,
+            rms_inv,
+            M,
+            D,
+            scale,
+            eps,
+            qk.stride(0),
+            qk.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_D=D,
         )
         ctx.save_for_backward(qk, cos, sin, rms_inv)
         ctx.scale = scale
@@ -1500,65 +1845,96 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fused_add_norm_fwd_kernel(
-        x_ptr, res_ptr, nw_ptr,
-        y_ptr, summed_ptr, rms_inv_ptr,
-        M, D,
+        x_ptr,
+        res_ptr,
+        nw_ptr,
+        y_ptr,
+        summed_ptr,
+        rms_inv_ptr,
+        M,
+        D,
         eps,
-        BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
     ):
         """y = norm(x + residual) — per-row RMSNorm of the elementwise sum.
         Stores `summed = x + residual` (for the caller's residual stream;
-        also reused by backward to reconstruct y_norm on the fly via
-        `summed * rms_inv`, avoiding the 2·M·D extra HBM write that
-        materializing y_norm would cost).
+        also reused by backward to reconstruct y_norm via `summed * rms_inv`).
 
-        Assumes all (M, D) tensors are contiguous and D == BLOCK_D (asserted
-        at the autograd-Function boundary), so row stride = D and col
-        stride = 1 — no per-tensor stride params needed.
+        Layout assumptions (asserted at autograd boundary):
+          - all (M, D) tensors contiguous → row stride = D, col stride = 1
+          - BLOCK_D is the smallest power of 2 ≥ D; cols beyond D are
+            masked (load contributes 0, store skipped). So D can be e.g.
+            1536 with BLOCK_D=2048.
+
+        Register strategy: x / r / summed / y stay in the input dtype
+        (bf16 typically). Only the per-row reduction promotes to fp32
+        briefly to avoid compound rounding error in sum(summed²) over
+        large D. This roughly halves register pressure vs full fp32
+        internal — critical to avoid spills at BLOCK_M=32, D≥1024.
+
+        Matches `F.rms_norm` numerical behavior (nanchat's default RMSNorm
+        runs in bf16 throughout per gpt.py:43); rms_inv kept in fp32 to
+        match the fp32 rms_inv_ptr buffer used in backward.
 
         HAS_NW=False ⇒ no per-channel affine weight; output is plain
-        `summed / RMS(summed)`. nw_ptr is then not dereferenced (caller
-        may pass any valid pointer as a placeholder)."""
+        `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
         pid_m = tl.program_id(0)
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.arange(0, BLOCK_D)
         row_mask = rows < M
+        col_mask = cols < D
+        mask_2d = row_mask[:, None] & col_mask[None, :]
 
         offs = rows[:, None] * D + cols[None, :]
-        x = tl.load(x_ptr + offs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        r = tl.load(res_ptr + offs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        # Load in input dtype, no promotion. Masked-off elements get 0,
+        # which is the additive/multiplicative identity for sum_sq.
+        x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0)
+        r = tl.load(res_ptr + offs, mask=mask_2d, other=0.0)
         summed = x + r
 
         # Save summed back to HBM — dual purpose: (1) caller uses it as
         # the next block's residual stream (no re-add), (2) backward
         # loads it to reconstruct y_norm via one multiply per element.
-        tl.store(summed_ptr + offs, summed.to(summed_ptr.dtype.element_ty), mask=row_mask[:, None])
+        tl.store(summed_ptr + offs, summed, mask=mask_2d)
 
-        # RMSNorm: rsqrt(mean(summed²) + eps)
-        sum_sq = tl.sum(summed * summed, axis=1)
+        # RMSNorm reduction + y multiply in fp32 to match F.rms_norm
+        # exactly (PyTorch's F.rms_norm internally promotes bf16 input
+        # to fp32 throughout, then casts the result back — verified by
+        # bit-equality on bf16 inputs). We do the same:
+        # the bf16 `summed` is kept in registers for HBM store, but
+        # the compute pipeline (square / sum / rsqrt / multiply / nw scale)
+        # all runs in fp32 for numerical agreement.
+        summed_f32 = summed.to(tl.float32)
+        sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
-        # y = (summed * rms_inv) * nw (final scaled output). The y_norm
-        # intermediate stays in registers — not written to HBM.
-        y = summed * rms_inv[:, None]
+        y_f32 = summed_f32 * rms_inv[:, None]
         if HAS_NW:
-            nw = tl.load(nw_ptr + cols).to(tl.float32)
-            y = y * nw[None, :]
-        tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=row_mask[:, None])
-
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            y_f32 = y_f32 * nw[None, :]
+        tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
 
     @triton.jit
     def _rms_norm_bwd_with_summed_kernel(
-        ynorm_src_ptr, rms_inv_ptr, nw_ptr,
+        ynorm_src_ptr,
+        rms_inv_ptr,
+        nw_ptr,
         dxhat_ptr,
-        dx_ptr, dnw_partial_ptr,
-        M, K,
-        stride_sm, stride_sk,
-        stride_dxhat_m, stride_dxhat_k,
-        stride_dx_m, stride_dx_k,
-        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+        dx_ptr,
+        dnw_partial_ptr,
+        M,
+        K,
+        stride_sm,
+        stride_sk,
+        stride_dxhat_m,
+        stride_dxhat_k,
+        stride_dx_m,
+        stride_dx_k,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
         HAS_NW: tl.constexpr,
     ):
         """RMSNorm backward variant. The `ynorm_src_ptr` tensor is
@@ -1600,12 +1976,12 @@ if _HAS_TRITON:
             ks2 = k2_start + tl.arange(0, BLOCK_K)
             k2_mask = ks2 < K
             s_ptrs = (
-                ynorm_src_ptr
-                + rows[:, None] * stride_sm
-                + ks2[None, :] * stride_sk
+                ynorm_src_ptr + rows[:, None] * stride_sm + ks2[None, :] * stride_sk
             )
             src2 = tl.load(
-                s_ptrs, mask=row_mask[:, None] & k2_mask[None, :], other=0.0,
+                s_ptrs,
+                mask=row_mask[:, None] & k2_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             if HAS_NW:
                 y_norm2 = src2 * rms_inv[:, None]  # src is summed
@@ -1617,7 +1993,9 @@ if _HAS_TRITON:
                 + ks2[None, :] * stride_dxhat_k
             )
             dxh = tl.load(
-                dxh_ptrs, mask=row_mask[:, None] & k2_mask[None, :], other=0.0,
+                dxh_ptrs,
+                mask=row_mask[:, None] & k2_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
             if HAS_NW:
                 nw2 = tl.load(nw_ptr + ks2, mask=k2_mask, other=0.0).to(tl.float32)
@@ -1630,19 +2008,21 @@ if _HAS_TRITON:
         # Pass 2: compute dx for this k-tile
         s_ptrs = ynorm_src_ptr + rows[:, None] * stride_sm + ks[None, :] * stride_sk
         src = tl.load(
-            s_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            s_ptrs,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         if HAS_NW:
             y_norm = src * rms_inv[:, None]
         else:
             y_norm = src
         dxh_ptrs = (
-            dxhat_ptr
-            + rows[:, None] * stride_dxhat_m
-            + ks[None, :] * stride_dxhat_k
+            dxhat_ptr + rows[:, None] * stride_dxhat_m + ks[None, :] * stride_dxhat_k
         )
         dxh = tl.load(
-            dxh_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0,
+            dxh_ptrs,
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         if HAS_NW:
             g_eff = dxh * nw[None, :]
@@ -1661,11 +2041,30 @@ if _HAS_TRITON:
         if HAS_NW:
             dnw_partial = tl.sum(dxh * y_norm, axis=0)
             dnw_p_ptrs = dnw_partial_ptr + pid_m * K + ks
-            tl.store(dnw_p_ptrs, dnw_partial.to(dnw_partial_ptr.dtype.element_ty), mask=k_mask)
+            tl.store(
+                dnw_p_ptrs,
+                dnw_partial.to(dnw_partial_ptr.dtype.element_ty),
+                mask=k_mask,
+            )
 
 
 class FusedAddNorm(torch.autograd.Function):
     """y = norm(x + residual), also returns summed = x + residual.
+
+    NOTE: Demo / learning kernel — NOT used in nanchat's hot path.
+    Benchmarked ~2× slower than native `x + r; F.rms_norm(...)` at
+    d24 shape (D=1536, M=2048): ~184 μs vs ~91 μs per call. The
+    autograd.Function wrapping alone adds ~100 μs of fixed overhead
+    (torch.empty_like × 3, save_for_backward, ctx attribute setup);
+    Triton's per-launch cost negates the theoretical ~6 μs HBM saving
+    from fusion. Production path uses NormMLPReluSquare /
+    NormQKVProjection where norm is folded into the adjacent matmul
+    so there's no standalone add+norm call to optimize.
+
+    Kept here as the first Triton kernel for learning purposes — it
+    covers the core patterns: 2D tile loading, power-of-2-rounded
+    BLOCK_D with col masking, fp32-promoted reduction, HAS_NW
+    constexpr branch, and on-the-fly y_norm reconstruction in bwd.
 
     Forward: one Triton kernel does add + RMSNorm + writes y and summed
     (no separate y_norm tensor — it stays in registers during fwd).
@@ -1698,17 +2097,81 @@ class FusedAddNorm(torch.autograd.Function):
         y = torch.empty_like(x)
         summed = torch.empty_like(x)
         rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-        BLOCK_M = 32
+
+        # Triton's tl.arange requires power-of-2 BLOCK_D; non-pow2 D
+        # (e.g. d24's 1536) gets padded and the kernel's col_mask zeroes
+        # the trailing lanes so they don't affect the reduction.
+        BLOCK_D = triton.next_power_of_2(D)
+
+        # Tile sizing under Ampere's 255-reg/thread spill cap.
+        #
+        # Per-thread reg usage in this kernel:
+        #     real_regs/thread ≈ 2 × (BLOCK_M × BLOCK_D) / (nw × 32)
+        # (each fp32 element = 1 reg, ~2× factor for live intermediates).
+        # Setting ≤ 255 gives: tile ≤ 255 × 16 × nw ≈ 4080 × nw. We round
+        # to 4096 (= 2^12) for pow-of-2-aligned arithmetic — since our
+        # tile is always pow-of-2, tile / 4096 is then always integer, no
+        # ceil/floor edge case. The 16-element slack per warp is absorbed
+        # by compiler's actual reg use (verified: tile=16384 at nw=4
+        # measures n_regs=255, 0 spills).
+        #
+        # Design target nw=4 (Triton stock default): ~5-13% slower than
+        # aggressive nw=8 (tile=32K) on benchmarks but more blocks/SM and
+        # simpler — this is a learning kernel; production hot path doesn't
+        # use it (see class docstring). The initial nw=4 here sizes
+        # BLOCK_M below; final nw gets recomputed from the resulting tile
+        # so unusually large D auto-scales instead of silently spilling.
+        num_warps = 4
+
+        # BLOCK_M = min(reg-budget cap, M-saturation cap), both rounded
+        # to pow-of-2 (kernel requires pow-of-2 BLOCK_M):
+        #   - reg budget cap = 4096 × nw / BLOCK_D  (from inequality above)
+        #   - M-saturation cap = M // 64: keeps grid ≳ 64 programs ≈
+        #     filling the 3090's 82 SMs in one wave for any M. For nanchat
+        #     M=2048 this evaluates to 32 (matching the previous hardcoded
+        #     value); larger M auto-grows BLOCK_M to avoid extra waves of
+        #     launch overhead, smaller M shrinks it to keep enough programs
+        #     in the grid. (Per-row reduction doesn't benefit from bigger
+        #     BLOCK_M anyway — rows are independent, no cross-row reuse.)
+        # Outer max(1, ...) handles small-M case where M // 64 = 0.
+        BLOCK_M = max(
+            1,
+            min(
+                triton.next_power_of_2(M // 64),
+                triton.next_power_of_2(4096 * num_warps // BLOCK_D),
+            ),
+        )
+
+        # Final nw: solve reg-cap inequality for nw given the tile.
+        # Nanchat shapes (tile ≤ 16K) all yield nw=4. For D > 16K (where
+        # BLOCK_M=1 floored forces tile = BLOCK_D > 16K), nw auto-scales
+        # to 8 (D ≤ 32K) or 16 (D ≤ 64K) — safety net so the kernel
+        # degrades gracefully instead of silently spilling on unexpected D.
+        # Cap at 16: nw=32 → 1024 threads/block → only 1 block/SM (32/48
+        # warp slots, 67% occupancy); nw=16 keeps 3 blocks/SM (full 48-
+        # warp occupancy). max(1, tile // 4096) guards next_pow2 against
+        # the tile < 4096 case where the floor div yields 0.
+        tile = BLOCK_M * BLOCK_D
+        num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // 4096))))
+
+        # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
+        # valid placeholder pointer (Triton still requires the arg).
         grid = (triton.cdiv(M, BLOCK_M),)
-        # When has_nw=False the kernel doesn't dereference nw_ptr, but
-        # Triton still wants a valid pointer arg — reuse `x` as filler.
         nw_arg = norm_weight if has_nw else x
         _fused_add_norm_fwd_kernel[grid](
-            x, residual, nw_arg,
-            y, summed, rms_inv,
-            M, D, eps,
-            BLOCK_M=BLOCK_M, BLOCK_D=D,
+            x,
+            residual,
+            nw_arg,
+            y,
+            summed,
+            rms_inv,
+            M,
+            D,
+            eps,
+            BLOCK_M=BLOCK_M,
+            BLOCK_D=BLOCK_D,
             HAS_NW=has_nw,
+            num_warps=num_warps,
         )
         # ctx stash strategy depends on HAS_NW:
         #  - HAS_NW=True : save `summed`; bwd recomputes y_norm = summed * rms_inv.
@@ -1738,7 +2201,9 @@ class FusedAddNorm(torch.autograd.Function):
         d_summed_from_norm = torch.empty_like(ynorm_src)
         if has_nw:
             dnw_partials = torch.empty(
-                (num_m_tiles, D), dtype=nw.dtype, device=ynorm_src.device,
+                (num_m_tiles, D),
+                dtype=nw.dtype,
+                device=ynorm_src.device,
             )
             nw_arg = nw
             dnw_arg = dnw_partials
@@ -1748,14 +2213,22 @@ class FusedAddNorm(torch.autograd.Function):
             dnw_arg = ynorm_src
         grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_K_BWD))
         _rms_norm_bwd_with_summed_kernel[grid_bwd](
-            ynorm_src, rms_inv, nw_arg,
+            ynorm_src,
+            rms_inv,
+            nw_arg,
             dy,
-            d_summed_from_norm, dnw_arg,
-            M, D,
-            ynorm_src.stride(0), ynorm_src.stride(1),
-            dy.stride(0), dy.stride(1),
-            d_summed_from_norm.stride(0), d_summed_from_norm.stride(1),
-            BLOCK_M=BLOCK_M_BWD, BLOCK_K=BLOCK_K_BWD,
+            d_summed_from_norm,
+            dnw_arg,
+            M,
+            D,
+            ynorm_src.stride(0),
+            ynorm_src.stride(1),
+            dy.stride(0),
+            dy.stride(1),
+            d_summed_from_norm.stride(0),
+            d_summed_from_norm.stride(1),
+            BLOCK_M=BLOCK_M_BWD,
+            BLOCK_K=BLOCK_K_BWD,
             HAS_NW=has_nw,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
