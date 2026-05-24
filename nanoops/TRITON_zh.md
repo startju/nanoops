@@ -496,23 +496,30 @@ Stage 2 里原来跨整 D 的 pass 1 缩成「每行一个标量 load」。总 H
 流量跟单 kernel 版本相同（`summed`/`dy` 在 inner 读一次、在 stage 2
 读一次），但 compute 上不再有跨 program 的 per-row reduction 重复。
 
-#### 为什么「1D over M 配 BLOCK_M=32」不行
+#### 为什么不无脑「切 D」
 
-听起来还有个中间方案：「不切 D，只把 BLOCK_M 缩小」。早期原型用
-的 BLOCK_M=32 在这条路上*失败*——`D=1536, BLOCK_M=32,
-num_warps=4`（128 thread）：
+这个 kernel 的早期版本 bwd 路径**只有**切 D 的 2-kernel——当时
+的论证是「1D over M 必 spill，必须切 D」。但这个论证有个 bug：
+它假设了 `BLOCK_M` 固定 32。`D=1536, BLOCK_M=32, num_warps=4`
+（128 thread）下：
 
 ```
    5 tile × BLOCK_M=32 × D=1536  ≈  245K fp32 / program
    245K / 128 thread             ≈  1900 fp32 reg / thread
 ```
 
-**1900 vs 255 cap → 惨烈 spill**。inline 路径之所以行得通，是
-*缩 BLOCK_M 而不是缩 D*——register budget 给出
-`BLOCK_M ≤ 768·nw / BLOCK_D`，所以 D=1536 时 BLOCK_M 自动降到 4
-（D=4096 时降到 1），舒舒服服塞进 cap。本质思路跟切 D fallback
-一样（哪根 axis 缩了能让 tile 留 register，就缩哪根），只是 inline
-缩的是 M 这根——每行独立，没有跨行 reduction 要操心。
+**1900 vs 255 cap → 惨烈 spill**。BLOCK_M=32 + 整 D 确实 spill。
+但 inline 路径意识到 `BLOCK_M` 也是个自由参数——
+`_pick_tile_config(M, BLOCK_D, n_live_tiles=5)` 推导出
+`BLOCK_M ≤ 1638·nw / BLOCK_D`（= 256 reg/thread 上限 / 5 tile，
+再摊到 nw·32 thread 上），向上取整到 pow-of-2。D=1536 时
+BLOCK_M 落到 4（regs ≈ 160），D=4096 时落到 1（也 ≈ 160），
+舒舒服服塞进 cap，不 spill。
+
+本质思路跟切 D fallback 一样（哪根 axis 缩了能让 tile 留 register
+就缩哪根），只是 inline 缩的是 M 这根——每行独立，没有跨行
+reduction 要操心。fallback 只在 BLOCK_M 缩到 1 *仍然*装不下时
+触发——也就是 BLOCK_D 单独（= 整 D）就爆预算的情况。
 
 ### 2.3 d_summed_external 折进 bwd kernel
 
@@ -537,33 +544,56 @@ tl.store(d_summed_ptr + offs, d_summed_tile.to(...), mask=mask)
 
 ### 2.4 Sizing —— 套用第 1 章的预算公式
 
-Forward kernel 用第 1 章「what this means for our kernels」给的公式：
+所有按 tile 切的 kernel（fwd、bwd inline、fallback 的 inner）共享同
+一个 sizing 决策 helper：
 
 ```python
-BLOCK_D = triton.next_power_of_2(D)                              # tl.arange 要求 pow-of-2
-num_warps = 4                                                    # 目标值（Triton 默认）
-BLOCK_M = max(1, min(
-    triton.next_power_of_2(M // 64),                             # M-saturation：grid ≳ 64
-    triton.next_power_of_2(4096 * num_warps // BLOCK_D),         # reg budget：tile ≤ 16K
-))
-tile = BLOCK_M * BLOCK_D
-num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // 4096))))   # tile 超 budget 时升 nw
+def _pick_tile_config(M, BLOCK_D, n_live_tiles) -> TileConfig:
+    # Register-budget 模型（Ampere 255 fp32 reg/thread spill cap）：
+    #     regs/thread ≈ n_live_tiles × (BLOCK_M × BLOCK_D) / (nw × 32)
+    # 按 256-reg 上限算：tile ≤ (8192 / n_live_tiles) × nw
+    tile_per_nw = 8192 // n_live_tiles                    # n=2 时 4096, n=5 时 1638
+    base_nw = 4                                           # 初始 guess
+    BLOCK_M = max(1, min(
+        triton.next_power_of_2(max(1, M // 64)),          # M-saturation：grid ≳ 64
+        triton.next_power_of_2(max(1, tile_per_nw * base_nw // BLOCK_D)),
+    ))
+    tile = BLOCK_M * BLOCK_D
+    num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // tile_per_nw))))
+    est_regs = n_live_tiles * tile // (num_warps * 32)
+    return TileConfig(BLOCK_M, num_warps, est_regs)
 ```
 
-d24 shape (M=2048, D=1536) 走一遍：
-- `BLOCK_D = next_pow_of_2(1536) = 2048`
-- `M // 64 = 32 → next_pow_of_2 = 32`
-- `4096 × 4 // 2048 = 8 → next_pow_of_2 = 8`
-- `BLOCK_M = min(32, 8) = 8`
-- `tile = 8 × 2048 = 16K → nw 保持 4`
-- Grid：`cdiv(2048, 8) = 256` programs
+`n_live_tiles` 是 per-kernel 的旋钮——hot path 同时 alive 的 fp32
+tile 数：
 
-Backward kernel 用**固定 config**（BLOCK_M=32, BLOCK_D=64, nw=4），
-**不**走 autotune。原因不是性能（autotune 选的也差不多），而是
-Triton autotune 的 dispatch 保留了一些不能 CUDA Graph stream
-capture 的操作。写死 config 让 bwd 路径对 graph 友好。
+| Kernel | n_live_tiles | 原因 |
+|---|---|---|
+| fwd | 2 | `summed_f32` + `y_f32` |
+| inner 预算（fallback） | 2 | `y_norm` + `g_eff` 短暂 |
+| bwd inline (HAS_NW=True) | 5 | `y_norm`、`g_eff`、`dy_t`、`d_ext`、`d_summed` |
+| bwd inline (HAS_NW=False) | 4 | 同上，但 `y_norm`/`g_eff` 别名 `src`/`dy_t` |
 
-inner kernel（1D over M，结构跟 fwd 同构）用跟 fwd 一样的公式。
+`TileConfig.fits_reg_budget` 属性（`est_regs ≤ 256`）就是
+`FusedAddNorm.backward` 用来选 inline vs 2-kernel fallback 的依据。
+
+d24 shape (M=2048, D=1536, BLOCK_D=2048) 走一遍：
+
+**fwd (n=2)**：`tile_per_nw = 4096`。BLOCK_M = min(next_pow2(32),
+next_pow2(4096·4/2048)) = min(32, 8) = 8。tile = 16K。
+nw = next_pow2(16K/4096) = 4。→ `BLOCK_M=8, nw=4`，~256 reg/thread。
+Grid = cdiv(2048, 8) = 256 programs。
+
+**bwd inline (n=5)**：`tile_per_nw = 1638`。BLOCK_M = min(32,
+next_pow2(1638·4/2048)) = min(32, 4) = 4。tile = 8K。
+nw = next_pow2(8K/1638) = 8。→ `BLOCK_M=4, nw=8`，~160 reg/thread。
+Grid = cdiv(2048, 4) = 512。
+
+**2-kernel bwd fallback**：用**固定 config** `BLOCK_M=32, BLOCK_D=64,
+num_warps=4`，不走 `_pick_tile_config`。原因不是性能（autotune 选的
+也差不多），而是 Triton autotune 的 dispatch 保留了一些不能 CUDA
+Graph stream capture 的操作。写死 config 让 fallback 路径对 graph
+友好。只有 inner 预算 kernel 用 `_pick_tile_config`（n_live=2）。
 
 ### 2.5 数值精度
 
@@ -581,16 +611,17 @@ inner kernel（1D over M，结构跟 fwd 同构）用跟 fwd 一样的公式。
 bf16 形态的 `summed` **只在 store 那一刻短暂需要**——下游 fp32
 pipeline 一直用 `summed_f32` 在 register 里，直到最后 y store 再 cast。
 
-**净 register 压力跟「全 fp32 internal」实现一样**（tile=16384, nw=4
-实测 n_regs=255）。bf16 路径是为了 **HBM dtype 兼容**，不是 register
-省钱。这里有个反直觉的点：「低精度省 register」的直觉在 reduction
-kernel 上是错的——一旦某处需要 fp32 精度，编译器会把 fp32 版本一直
-保留在剩下的 kernel 里。
+**净 register 压力跟「全 fp32 internal」实现一样**（fwd kernel：
+tile=16384, nw=4 实测 n_regs=255）。bf16 路径是为了 **HBM dtype
+兼容**，不是 register 省钱。这里有个反直觉的点：「低精度省 register」
+的直觉在 reduction kernel 上是错的——一旦某处需要 fp32 精度，编译器
+会把 fp32 版本一直保留在剩下的 kernel 里。
 
 ### 2.6 预期收益 —— HBM 和 launch 账本
 
-实测之前先算账。一句话总结：**前向真省 HBM round-trip；后向省的是
-launch 和中间 buffer，HBM 字节数没省**。
+实测之前先算账。一句话总结：**前向真省 HBM round-trip；后向 inline
+（主路径）也省字节；后向 2-kernel（fallback）只省 launch 和中间
+buffer**。
 
 #### Forward
 
@@ -628,6 +659,18 @@ HBM 时间，再加上避免的 ~10-30 μs launch overhead。
 
 #### Backward
 
+bwd 有两条 kernel 路径（dispatch 见 §2.2）。常见情况是 **inline
+单 pass kernel**；**2-kernel D-split fallback** 只在 inline tile
+会超 255 reg/thread cap 时触发（HAS_NW=True at D ≥ 24K）。下面
+两条都算一遍。
+
+下面所有账本都按 `HAS_NW=False`（没 learnable affine weight，
+对齐 nanchat 实际配置——见 `nanchat/gpt.py:9`）算。HAS_NW=True
+两条 fused 路径都要多一个 `dnw_partials` 写（~M·D fp32，inline
+里 BLOCK_M 小所以更大）+ `.sum(dim=0)` reduction（~M·D 读，~D 写），
+native 那边对应多一个 per-channel dW kernel（~2·M·D 读，~D 写）
+—— 大致互相抵消，所以相对收益保持不变。
+
 PyTorch 优化版 native（单 `F.rms_norm.backward` kernel + Python
 外加 external 梯度）。bwd 数学本身要两次 D 维 reduction
 （`inner[m] = mean_d(dy · y_norm)` 然后
@@ -638,7 +681,9 @@ reduce 完再回 shared mem 算 per-element `dx`。D=1536 fp32 +
 dy = 12 KB/行，3090 单 SM 100 KB shared mem 装得下。**字面意义
 的 naive 2-pass 实现**（把 `inner` 写回 HBM、第二个 pass 重读
 `summed`/`dy`）会让读字节数翻倍——如果你要跟那种 2-pass 实现
-比，记得照这里的数往上加：
+比，记得照这里的数往上加。
+
+Native（1-pass shared-mem + Python 外加 external 梯度）：
 ```
 F.rms_norm.backward (1-pass shared-mem):
   read summed              M·D
@@ -653,11 +698,41 @@ Python d_summed = d_summed_from_norm + d_summed_external:
 合计:                      6·M·D
 ```
 
-Fused（2-kernel split，d_summed_external 折进 bwd kernel）。注意我们
-**没法**用 PyTorch 那个 1-pass shared-mem 招——为了控制
-`(BLOCK_M, D)` 大的 dnw_partial 的 register 压力，bwd 必须切 D
-（见 §2.2），单个 program 拿不到整行做 shared-mem reduction。所以
-要显式跑一个 inner 预算 kernel：
+##### 路径 A —— Inline（主）：字节 + launch + buffer 三杀
+
+inline kernel 用 `BLOCK_D = next_pow_of_2(D)` 把整行塞进一个 tile，
+`inner` 在 register 里算——没有预算 kernel、没有 inner HBM buffer。
+`d_summed_external` 通过 register 加法折进 d_summed store，跟
+2-kernel 路径同样的招：
+
+```
+_fused_add_norm_bwd_inline_kernel:
+  read summed/y            M·D
+  read dy                  M·D
+  read d_summed_external   M·D
+  write d_summed           M·D
+─────────────────────────────────────────
+合计:                      4·M·D
+```
+
+inline 路径相对 native 净收益：
+- **HBM：省 2·M·D 字节** —— 没有 `d_summed_from_norm` 中间 buffer
+  流过 HBM（kernel 在同一行的 register 里算 norm 梯度 + 折进 `d_ext`）。
+- **Kernel launch：省 1 次**（1 个 Triton kernel vs PyTorch 的
+  `rms_norm.backward` + Python add）。
+- **中间 buffer：省 1 个**（没 `d_summed_from_norm` 分配）。
+
+对 d24（M=2048, D=1536, bf16）：2·M·D = 12.6 MB / 936 GB/s ≈ 13 μs
+HBM 时间省下来，再加上避免的 ~10-30 μs launch overhead。这就让
+fwd 和 bwd 主路径有了对称的「三杀」收益。
+
+##### 路径 B —— 2-kernel fallback：字节打平，launch 还省
+
+inline 会 spill 时（HAS_NW=True at D ≥ 24K，见 §2.2），dispatch
+fallback 到 2-kernel 对。切 D 的结构**没法**用 1-pass shared-mem
+招——没有 program 拿到完整一行—— 所以 `summed`/`dy` 要读两次
+（inner 一次，bwd 一次）：
+
 ```
 _fused_add_norm_inner_kernel:
   read summed/y            M·D
@@ -671,60 +746,50 @@ _fused_add_norm_bwd_kernel:                                  │
   read inner_buf           ~0
   write d_summed           M·D                              ─┘ subtotal 4·M·D
 ─────────────────────────────────────────
-合计:                      6·M·D
+合计:                      6·M·D    (= native)
 ```
 
-HBM 总字节数一样——但注意收益从哪里来。Fused 读 `summed` 和 `dy`
-**各两次**（2·M·D each），PyTorch 各读一次（1·M·D each）。补回这个
-差的是：PyTorch 必须把 `d_summed_from_norm` 写回 HBM 当中转，然后
-另起一个 elementwise-add kernel 读回它 + 读 `d_summed_external`、
-写出合并后的 `d_summed`，那一段 3·M·D 的 round-trip（外加单独 launch）
-正好被「`+ d_ext` 折进 fused bwd kernel」抵消。所以 fusion 到底省了
-什么？
-
-- **省 1 个 intermediate buffer**：native 要给
-  `d_summed_from_norm`（M·D 字节）分配一个中转 buffer，挂在 norm
-  bwd kernel 和 Python `+` 之间。fused 跳过这个分配。
-- **省 1 次 kernel launch**：native 用一个 torch elementwise add
-  kernel 做 `d_summed_from_norm + d_summed_external` 的合并（~10-30
-  μs launch）。fused 把它折进 bwd kernel 的 `dx` store——`+ d_ext`
-  在 register 里 store 前完成。
-- **省 1 个 autograd 图节点**：native 走 `AccumulateGrad` 步骤；
-  fused 直接交出已合并梯度。
-
-但 fused 这边也加了 inner 预算 kernel 一次 launch，**正好抵消了
-省下来的那次 add launch**——**净 launch 数跟 native 一样**。真正
-的赢点是 intermediate buffer + Python `+` op + cache locality：
-
-- 两个 fused kernel 间的 L2 复用：第二个 kernel 重读第一个 kernel
-  刚读过的 `summed` 和 `dy`，3090 的 6 MB L2 吸收掉这些「重复」。
-- vs native 的中间 buffer 真的流过 HBM，fused 路径让梯度各部分更
-  靠近 register / cache。
+**字节跟 native 打平** —— fused 读 `summed`/`dy` 各两次（2·M·D
+each），native 各一次，但 native 单独的 `+` kernel 又加上了 3·M·D
+的 `d_summed_from_norm` round-trip。净：持平。收益缩水成：
+- **省 1 个中间 buffer**：没 `d_summed_from_norm`（跟 inline 一样）。
+- **省 1 次 kernel launch**：拿 native 的 Python add 跟 inner 预算
+  kernel 互换——净 launch 数跟 native 持平，但 fused 两次 launch
+  靠得近（bwd kernel 的重复读 L2 复用更好）。
 
 #### Takeaway
 
-**Forward fusion 省字节 + launch + buffer**——干净的三合一。
-**Backward fusion 只省 launch + buffer**（字节数同）。这种不对称
-到处都出现：Flash Attention 的 forward 加速比 backward 大、kernel
-fusion 项目通常宣传「forward 快 N 倍」但 backward 接近持平，都是
-这个原因。教训：**只要能在 register 里复用上一步的值、而不是从
-HBM 来回搬，就是真实的带宽节省；其它（launch overhead、buffer
-allocation）都是次级的打磨**。
+| 路径 | bytes | launches | buffer |
+|---|---|---|---|
+| Forward fused | ✓ 省 1·M·D | ✓ 省 1 | ✓ 省 1 |
+| Backward inline（主） | ✓ 省 2·M·D | ✓ 省 1 | ✓ 省 1 |
+| Backward 2-kernel（fallback） | — 打平 | ~ 打平（互换） | ✓ 省 1 |
+
+教训：**只要能在 register 里复用上一步的值、而不是从 HBM 来回搬，
+就是真实的带宽节省**。inline 路径在 fwd 和 bwd 上都做到了这点。
+2-kernel fallback 被迫重读 `summed`/`dy` 是因为 per-program tile
+装不下整行——但 fallback 只在替代方案（catastrophic register
+spill）更糟时才触发。
 
 ### 2.7 性能现实
 
-kernel 本身跟 native 持平甚至赢一点：
+d24 fwd-only（M=2048, D=1536, bf16, HAS_NW=False）在 RTX 3090
+上实测：
 
 | 测量方式 | fused | native | 对比 |
 |---|---|---|---|
-| Kernel-only timing（CUDA event 包 kernel launch） | ~88 μs | ~91 μs | fused 持平 / 略胜 |
-| **CUDA Graph fwd replay** | **~76 μs** | ~90 μs | **fused 快 15%** |
-| 普通 eager `fused_add_norm(...)` call | ~184 μs | ~91 μs | fused 慢 2× |
+| Kernel-only timing（直接 launch kernel，绕过 autograd） | **~72 μs** | ~88 μs | **fused 快 1.22×** |
+| 普通 eager `fused_add_norm(...)` call（仅 fwd） | ~163 μs | ~88 μs | fused 慢 1.85× |
+| 普通 eager `fused_add_norm(...) + backward` | ~1075 μs | ~618 μs | fused 慢 1.74× |
 
-eager 模式下慢 2× **不是 kernel 慢**——是 `autograd.Function` +
-Triton dispatch 的 per-call 固定开销（~100 μs：3× `torch.empty_like`、
-`save_for_backward`、ctx 属性设置、kernel launch arg 打包）。这些
-overhead 在 compile / graph 捕获的大 pipeline 里会消失。
+eager 模式下慢 **不是 kernel 慢**——是 `autograd.Function` +
+Triton dispatch 的 per-call 固定开销（每次 fwd ~90 μs：tensor 分配、
+`save_for_backward`、ctx 设置、kernel launch arg 打包）。这些 overhead
+在 CUDA Graph 捕获或 `torch.compile` 包大 pipeline 里会消失。
+
+大 shape 反过来：`M=2048, D=4096`（fwd+bwd, HAS_NW=False）下 fused
+端到端**赢 1.21×**。crossover 在 kernel 实际 GPU 工作量超过 ~90 μs
+framework overhead 的地方。
 
 核心教训：**kernel 这么短的时候，Python 框架开销很容易超过 kernel
 本身的 GPU 工作量**。对单个 op `torch.compile(fused_add_norm)` 反而
