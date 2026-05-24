@@ -1965,29 +1965,18 @@ if _HAS_TRITON:
         inner = tl.sum(g_eff * y_norm, axis=1) / D
         tl.store(inner_ptr + rows, inner, mask=row_mask)
 
-    # Autotune over BLOCK_M / BLOCK_D / num_warps / num_stages.
-    # Cache key = (M, D): same input shape reuses the tuned config.
-    # HAS_NW is a constexpr so True/False branches already compile to
-    # separate binaries and tune separately. First call per (M, D) pays
-    # one-time compile + benchmark cost of all 48 configs (~3 s).
+    # Fixed-config kernel (no @triton.autotune) for CUDA Graph compatibility.
+    # Triton autotune's dispatch path retains some non-capture-friendly
+    # operations even with cache hit, so wrapping this kernel inside
+    # `torch.cuda.make_graphed_callables` for fwd+bwd fails with
+    # `cudaErrorStreamCaptureInvalidated`. Using a fixed config makes
+    # the call path purely capture-friendly.
     #
-    # IMPORTANT: caller allocates dnw_partials with shape
-    # (M / MIN_BLOCK_M, D) using `torch.zeros` so that whichever BLOCK_M
-    # autotune picks, the unused tail rows stay zero and don't pollute
-    # the final `dnw_partials.sum(dim=0)`. MIN_BLOCK_M must match the
-    # smallest BLOCK_M in the configs below.
-    @triton.autotune(
-        configs=[
-            triton.Config(
-                {"BLOCK_M": bm, "BLOCK_D": bd}, num_warps=nw, num_stages=ns
-            )
-            for bm in [16, 32, 64]
-            for bd in [32, 64, 128, 256]
-            for nw in [4, 8]
-            for ns in [2, 3]
-        ],
-        key=["M", "D"],
-    )
+    # Config (BLOCK_M=32, BLOCK_D=64, num_warps=4, num_stages=2) is a
+    # conservative middle-ground from the autotune sweep that worked
+    # across all nanchat shapes (D ≤ 4096). Caller must pass these as
+    # kwargs to keep them visible at the call site rather than buried
+    # in autotune state.
     @triton.jit
     def _fused_add_norm_bwd_kernel(
         ynorm_src_ptr,
@@ -2243,19 +2232,13 @@ class FusedAddNorm(torch.autograd.Function):
         dy = dy.contiguous()
         d_summed_external = d_summed_external.contiguous()
 
-        # RMSNorm backward — when has_nw, kernel reads `summed` and
-        # reconstructs y_norm = summed * rms_inv on the fly. When not
-        # has_nw, kernel reads `y` directly (it already equals y_norm),
-        # saving the per-tile multiply.
-        # BLOCK_M / BLOCK_D / num_warps / num_stages are all autotuned
-        # — see @triton.autotune above the kernel definition.
-        # dnw_partials is sized for the worst case (smallest BLOCK_M in
-        # the sweep), with torch.zeros so any unused tail rows under a
-        # larger chosen BLOCK_M stay at 0 and don't pollute the final
-        # `dnw_partials.sum(dim=0)`. MIN_BLOCK_M_BWD must match the
-        # smallest BLOCK_M in the autotune configs.
-        MIN_BLOCK_M_BWD = 16
-        num_m_tiles_max = triton.cdiv(M, MIN_BLOCK_M_BWD)
+        # Fixed-config bwd kernel (no autotune) for CUDA Graph
+        # capturability. Config chosen as a sweep-tested middle-ground.
+        BLOCK_M_BWD = 32
+        BLOCK_D_BWD = 64
+        NUM_WARPS_BWD = 4
+        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+
         # Single output buffer holds the FULL d_summed (bwd kernel fuses
         # in d_summed_external — see kernel docstring).
         d_summed = torch.empty_like(ynorm_src)
@@ -2264,8 +2247,10 @@ class FusedAddNorm(torch.autograd.Function):
         # reduction inside bwd.
         inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
         if has_nw:
-            dnw_partials = torch.zeros(
-                (num_m_tiles_max, D),
+            # Exact (num_m_tiles, D) since BLOCK_M is fixed — no more
+            # worst-case zero-padding hack needed.
+            dnw_partials = torch.empty(
+                (num_m_tiles, D),
                 dtype=nw.dtype,
                 device=ynorm_src.device,
             )
@@ -2303,14 +2288,8 @@ class FusedAddNorm(torch.autograd.Function):
         )
 
         # Stage 2: bwd kernel reads pre-computed inner, computes d_summed
-        # and dnw_partials. Grid is 2D, autotuned over BLOCK_M / BLOCK_D
-        # / num_warps / num_stages.
-        def grid_bwd(meta):
-            return (
-                triton.cdiv(M, meta["BLOCK_M"]),
-                triton.cdiv(D, meta["BLOCK_D"]),
-            )
-
+        # and dnw_partials. 2D grid with fixed BLOCK_M / BLOCK_D.
+        grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))
         _fused_add_norm_bwd_kernel[grid_bwd](
             ynorm_src,
             rms_inv,
@@ -2322,7 +2301,10 @@ class FusedAddNorm(torch.autograd.Function):
             dnw_arg,
             M,
             D,
+            BLOCK_M=BLOCK_M_BWD,
+            BLOCK_D=BLOCK_D_BWD,
             HAS_NW=has_nw,
+            num_warps=NUM_WARPS_BWD,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
 
