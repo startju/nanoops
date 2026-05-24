@@ -400,7 +400,7 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
 
     summed_f32 = summed.to(tl.float32)                    # 从这里开始 fp32，对齐 F.rms_norm 精度
     sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
-    rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+    rms_inv = tl.rsqrt(sum_sq / D + eps)               # rsqrt.approx.f32 单指令
     tl.store(rms_inv_ptr + rows, rms_inv, mask=rows < M)  # ← bwd 用
 
     y = summed_f32 * rms_inv[:, None]
@@ -431,13 +431,21 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
 ——register 装不下：
 
 1D-over-M 的 bwd 每 program 要同时 alive `summed`、`dy`、`y_norm`、
-`g_eff`、`dx`、加上 per-channel 的 `dnw` 累加器。`D=1536` 时
-~5 × 32 × 1536 = 245K fp32 元素 / 128 thread ≈ **1900 regs/thread**
-——惨烈 spill。
+`g_eff`、`dx`、加上 per-channel 的 `dnw` 累加器。代入当前实际配置
+（`BLOCK_M=32`、`num_warps=4` → 128 thread/program），`D=1536`：
+
+```
+   5 个 tile  ×  BLOCK_M=32  ×  D=1536   ≈  245K fp32 元素 / program
+   245K 元素  /  128 thread              ≈  1900 fp32 reg / thread
+```
+
+——**1900 reg/thread vs 255 硬上限 → 惨烈 spill** 到 local memory。
 
 修法：**bwd grid 同时切 D 维度**。每 program 只处理一个
-`(BLOCK_M, BLOCK_D)` 的 `dx` 输出切片。单 program 的 tile 从 245K
-缩到 10K 量级，register 压力下来了。
+`(BLOCK_M, BLOCK_D)` 的 `dx` 输出切片（当前配置
+`BLOCK_M=32, BLOCK_D=64`）。单个 tensor 的 tile 从
+`32 × 1536 ≈ 49K` 缩到 `32 × 64 = 2K`，总量从 ~245K 降到
+~10K，128 thread 摊下来 ~80 reg/thread——舒服了。
 
 但切 D 引入新问题——bwd 数学里那个 per-row reduction：
 
@@ -586,9 +594,19 @@ HBM 时间，再加上避免的 ~10-30 μs launch overhead。
 
 #### Backward
 
-Naive native（单 `F.rms_norm.backward` kernel + Python 外加 external 梯度）：
+PyTorch 优化版 native（单 `F.rms_norm.backward` kernel + Python
+外加 external 梯度）。bwd 数学本身要两次 D 维 reduction
+（`inner[m] = mean_d(dy · y_norm)` 然后
+`dx = rms_inv · (dy − y_norm · inner)`），所以下面写「读 1 次」
+是按 PyTorch 实际走的 **1-pass shared-memory 模式**算：一个 CUDA
+block 处理一行，把 `summed` 和 `dy` 一次性 load 进 shared mem，
+reduce 完再回 shared mem 算 per-element `dx`。D=1536 fp32 +
+dy = 12 KB/行，3090 单 SM 100 KB shared mem 装得下。**字面意义
+的 naive 2-pass 实现**（把 `inner` 写回 HBM、第二个 pass 重读
+`summed`/`dy`）会让读字节数翻倍——如果你要跟那种 2-pass 实现
+比，记得照这里的数往上加：
 ```
-F.rms_norm.backward:
+F.rms_norm.backward (1-pass shared-mem):
   read summed              M·D
   read dy                  M·D
   write d_summed_from_norm M·D                              ─┐
@@ -601,7 +619,11 @@ Python d_summed = d_summed_from_norm + d_summed_external:
 合计:                      6·M·D
 ```
 
-Fused（2-kernel split，d_summed_external 折进 bwd kernel）：
+Fused（2-kernel split，d_summed_external 折进 bwd kernel）。注意我们
+**没法**用 PyTorch 那个 1-pass shared-mem 招——为了控制
+`(BLOCK_M, D)` 大的 dnw_partial 的 register 压力，bwd 必须切 D
+（见 §2.2），单个 program 拿不到整行做 shared-mem reduction。所以
+要显式跑一个 inner 预算 kernel：
 ```
 _fused_add_norm_inner_kernel:
   read summed/y            M·D
@@ -618,7 +640,13 @@ _fused_add_norm_bwd_kernel:                                  │
 合计:                      6·M·D
 ```
 
-HBM 总字节数一样。那 bwd fusion 到底省了什么？
+HBM 总字节数一样——但注意收益从哪里来。Fused 读 `summed` 和 `dy`
+**各两次**（2·M·D each），PyTorch 各读一次（1·M·D each）。补回这个
+差的是：PyTorch 必须把 `d_summed_from_norm` 写回 HBM 当中转，然后
+另起一个 elementwise-add kernel 读回它 + 读 `d_summed_external`、
+写出合并后的 `d_summed`，那一段 3·M·D 的 round-trip（外加单独 launch）
+正好被「`+ d_ext` 折进 fused bwd kernel」抵消。所以 fusion 到底省了
+什么？
 
 - **省 1 个 intermediate buffer**：native 要给
   `d_summed_from_norm`（M·D 字节）分配一个中转 buffer，挂在 norm

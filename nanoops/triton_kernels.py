@@ -32,6 +32,8 @@ Parity tests live in tests/test_triton_*.py — 14 tests, all green.
 from __future__ import annotations
 
 import os
+from typing import NamedTuple
+
 import torch
 
 try:
@@ -72,6 +74,78 @@ NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"
 # Cheap, useful at the seam between attn-block output and mlp-block
 # norm-input. See FusedAddNorm class docstring + TRITON.md Chapter 2.
 # ─────────────────────────────────────────────────────────────────────
+
+
+class TileConfig(NamedTuple):
+    """Output of `_pick_tile_config`. The `fits_reg_budget` property is
+    what callers query to decide whether to use this kernel at the
+    chosen tile or fall back to a different shape (e.g. a 2-kernel
+    D-split path that uses less register space per program)."""
+
+    block_m: int
+    num_warps: int
+    est_regs_per_thread: int  # n_live_tiles × tile / (nw × 32)
+
+    @property
+    def fits_reg_budget(self) -> bool:
+        """True if the estimated reg/thread fits within Ampere's
+        register file budget. False means the caller should pick a
+        different kernel shape instead — the spill cliff is real
+        (~10× slowdown verified at regs≈320 in bench).
+
+        Threshold (256) sits 1 above Ampere's 255 hard cap so configs
+        whose analytic estimate lands exactly on 256 still pass.
+        Justified empirically: the n_live_tiles model slightly
+        overestimates real peak register use (Triton's lifetime
+        analysis drops tiles after their last consumer), so the
+        cluster of common shapes that hit regs=256 in the model
+        actually compile without spill (verified: HAS_NW=False up to
+        D=32768 — 1.13× win over 2-kernel fallback). The true spill
+        cliff sits much higher (~320 regs)."""
+        return self.est_regs_per_thread <= 256
+
+
+def _pick_tile_config(M: int, BLOCK_D: int, n_live_tiles: int) -> TileConfig:
+    """Pick (BLOCK_M, num_warps) for a (BLOCK_M × BLOCK_D)-tiled kernel.
+
+    Register-budget model (Ampere, 255 fp32 regs/thread spill cap):
+
+        regs/thread ≈ n_live_tiles × (BLOCK_M × BLOCK_D) / (num_warps × 32)
+
+    Targeting the 256-reg cap:
+        tile ≤ 256 × 32 × num_warps / n_live_tiles
+             = (8192 / n_live_tiles) × num_warps
+
+    Args:
+      M: row count. Caps BLOCK_M so the grid stays ≳ 64 programs
+        (saturates RTX 3090's 82 SMs in one wave).
+      BLOCK_D: column tile size, typically next_power_of_2(D).
+      n_live_tiles: peak number of (BLOCK_M × BLOCK_D) fp32 tiles alive
+        simultaneously in the kernel hot path. Examples:
+          fwd ≈ 2 (summed_f32, y_f32)
+          bwd inline ≈ 5 with affine weight (y_norm, g_eff, dy_t, d_ext,
+            d_summed), ≈ 4 without (y_norm/src and g_eff/dy_t alias)
+          inner pre-compute ≈ 2 (y_norm, g_eff)
+
+    Returns a `TileConfig`. The caller should inspect `fits_reg_budget`
+    when the kernel is known to spill catastrophically at large tiles
+    (e.g. the bwd inline kernel at D > 16K with HAS_NW=True) — and
+    pick a different code path if it returns False. nw is capped at 16
+    regardless of tile size, so for very large BLOCK_D the budget can
+    be exceeded even with maxed-out nw.
+    """
+    tile_per_nw = max(1, 8192 // n_live_tiles)  # 4096 @ n=2, 1638 @ n=5
+    base_nw = 4  # initial guess for sizing BLOCK_M; finalized after
+    BLOCK_M = max(1, min(
+        triton.next_power_of_2(max(1, M // 64)),
+        triton.next_power_of_2(max(1, tile_per_nw * base_nw // BLOCK_D)),
+    ))
+    tile = BLOCK_M * BLOCK_D
+    # Final nw scales up if tile overshoots single-warp budget; cap at 16
+    # (above that → ≤1 block/SM, occupancy collapses).
+    num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // tile_per_nw))))
+    est_regs = n_live_tiles * tile // (num_warps * 32)
+    return TileConfig(BLOCK_M, num_warps, est_regs)
 
 
 if _HAS_TRITON:
@@ -140,7 +214,7 @@ if _HAS_TRITON:
         # write above.
         summed_f32 = summed.to(tl.float32)
         sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
-        rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+        rms_inv = tl.rsqrt(sum_sq / D + eps)
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
         y_f32 = summed_f32 * rms_inv[:, None]
@@ -148,6 +222,81 @@ if _HAS_TRITON:
             nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
             y_f32 = y_f32 * nw[None, :]
         tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
+
+    # Primary bwd path: single-kernel, inline inner reduction (no
+    # precompute, no D-split). Used when the (BLOCK_M × full-D) tile
+    # fits in registers — covers HAS_NW=False at any D and HAS_NW=True
+    # up to the size where the (M / BLOCK_M, D) dnw_partials buffer
+    # becomes the HBM bottleneck. Above that, FusedAddNorm.backward
+    # dispatches to the inner + 2D-tile fallback pair below.
+    @triton.jit
+    def _fused_add_norm_bwd_inline_kernel(
+        ynorm_src_ptr,
+        rms_inv_ptr,
+        nw_ptr,
+        dy_ptr,
+        d_ext_ptr,
+        d_summed_ptr,
+        dnw_partial_ptr,
+        M,
+        D,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_NW: tl.constexpr,
+    ):
+        """Single-kernel RMSNorm bwd. `BLOCK_D = next_power_of_2(D)` so
+        the full row lives in one tile and `inner = mean_d(g_eff * y_norm)`
+        is computed inline (no precompute kernel, no inner HBM buffer).
+
+        Same `ynorm_src_ptr` / `d_ext_ptr` semantics as the 2D-tile
+        `_fused_add_norm_bwd_kernel` (below).
+
+        BLOCK_M / num_warps come from `_pick_tile_config(M, BLOCK_D,
+        n_live_tiles=5)` — 5 fp32 tiles alive at peak (y_norm, g_eff,
+        dy_t, d_ext, d_summed).
+
+        dnw_partial layout: `(ceil(M / BLOCK_M), D)` — per-m-tile sum
+        of `(dy * y_norm)`; caller does `.sum(dim=0)` to (D,)."""
+        pid_m = tl.program_id(0)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        col_mask = cols < D
+        mask_2d = row_mask[:, None] & col_mask[None, :]
+        offs = rows[:, None] * D + cols[None, :]
+
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        if HAS_NW:
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            y_norm = src * rms_inv[:, None]
+            g_eff = dy_t * nw[None, :]
+        else:
+            y_norm = src
+            g_eff = dy_t
+
+        # Inner reduction over the full D (BLOCK_D ≥ D, masked elements
+        # contributed 0). Result is (BLOCK_M,) — one scalar per row.
+        inner = tl.sum(g_eff * y_norm, axis=1) / D
+
+        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        d_summed = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
+        tl.store(
+            d_summed_ptr + offs,
+            d_summed.to(d_summed_ptr.dtype.element_ty),
+            mask=mask_2d,
+        )
+
+        if HAS_NW:
+            dnw_partial = tl.sum(dy_t * y_norm, axis=0)
+            dnw_p_ptrs = dnw_partial_ptr + pid_m * D + cols
+            tl.store(
+                dnw_p_ptrs,
+                dnw_partial.to(dnw_partial_ptr.dtype.element_ty),
+                mask=col_mask,
+            )
 
     @triton.jit
     def _fused_add_norm_inner_kernel(
@@ -320,7 +469,6 @@ if _HAS_TRITON:
                 mask=d_mask,
             )
 
-
 class FusedAddNorm(torch.autograd.Function):
     """y = norm(x + residual), also returns summed = x + residual.
 
@@ -388,56 +536,14 @@ class FusedAddNorm(torch.autograd.Function):
         # the trailing lanes so they don't affect the reduction.
         BLOCK_D = triton.next_power_of_2(D)
 
-        # Tile sizing under Ampere's 255-reg/thread spill cap.
-        #
-        # Per-thread reg usage in this kernel:
-        #     real_regs/thread ≈ 2 × (BLOCK_M × BLOCK_D) / (nw × 32)
-        # (each fp32 element = 1 reg, ~2× factor for live intermediates).
-        # Setting ≤ 255 gives: tile ≤ 255 × 16 × nw ≈ 4080 × nw. We round
-        # to 4096 (= 2^12) for pow-of-2-aligned arithmetic — since our
-        # tile is always pow-of-2, tile / 4096 is then always integer, no
-        # ceil/floor edge case. The 16-element slack per warp is absorbed
-        # by compiler's actual reg use (verified: tile=16384 at nw=4
-        # measures n_regs=255, 0 spills).
-        #
-        # Design target nw=4 (Triton stock default): ~5-13% slower than
-        # aggressive nw=8 (tile=32K) on benchmarks but more blocks/SM and
-        # simpler — this is a learning kernel; production hot path doesn't
-        # use it (see class docstring). The initial nw=4 here sizes
-        # BLOCK_M below; final nw gets recomputed from the resulting tile
-        # so unusually large D auto-scales instead of silently spilling.
-        num_warps = 4
-
-        # BLOCK_M = min(reg-budget cap, M-saturation cap), both rounded
-        # to pow-of-2 (kernel requires pow-of-2 BLOCK_M):
-        #   - reg budget cap = 4096 × nw / BLOCK_D  (from inequality above)
-        #   - M-saturation cap = M // 64: keeps grid ≳ 64 programs ≈
-        #     filling the 3090's 82 SMs in one wave for any M. For nanchat
-        #     M=2048 this evaluates to 32 (matching the previous hardcoded
-        #     value); larger M auto-grows BLOCK_M to avoid extra waves of
-        #     launch overhead, smaller M shrinks it to keep enough programs
-        #     in the grid. (Per-row reduction doesn't benefit from bigger
-        #     BLOCK_M anyway — rows are independent, no cross-row reuse.)
-        # Outer max(1, ...) handles small-M case where M // 64 = 0.
-        BLOCK_M = max(
-            1,
-            min(
-                triton.next_power_of_2(M // 64),
-                triton.next_power_of_2(4096 * num_warps // BLOCK_D),
-            ),
-        )
-
-        # Final nw: solve reg-cap inequality for nw given the tile.
-        # Nanchat shapes (tile ≤ 16K) all yield nw=4. For D > 16K (where
-        # BLOCK_M=1 floored forces tile = BLOCK_D > 16K), nw auto-scales
-        # to 8 (D ≤ 32K) or 16 (D ≤ 64K) — safety net so the kernel
-        # degrades gracefully instead of silently spilling on unexpected D.
-        # Cap at 16: nw=32 → 1024 threads/block → only 1 block/SM (32/48
-        # warp slots, 67% occupancy); nw=16 keeps 3 blocks/SM (full 48-
-        # warp occupancy). max(1, tile // 4096) guards next_pow2 against
-        # the tile < 4096 case where the floor div yields 0.
-        tile = BLOCK_M * BLOCK_D
-        num_warps = max(4, min(16, triton.next_power_of_2(max(1, tile // 4096))))
+        # Tile sizing via the shared _pick_tile_config helper. fwd's
+        # hot path holds ~2 fp32 tiles alive simultaneously (summed_f32
+        # through the reduction; y_f32 during the final multiply). The
+        # helper translates that to BLOCK_M and num_warps under the
+        # Ampere 255 fp32 reg/thread spill cap (see helper docstring
+        # for the formula).
+        cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=2)
+        BLOCK_M, num_warps = cfg.block_m, cfg.num_warps
 
         # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
         # valid placeholder pointer (Triton still requires the arg).
@@ -480,81 +586,85 @@ class FusedAddNorm(torch.autograd.Function):
         has_nw = ctx.has_nw
         dy = dy.contiguous()
         d_summed_external = d_summed_external.contiguous()
-
-        # Fixed-config bwd kernel (no autotune) for CUDA Graph
-        # capturability. Config chosen as a sweep-tested middle-ground.
-        BLOCK_M_BWD = 32
-        BLOCK_D_BWD = 64
-        NUM_WARPS_BWD = 4
-        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
-
-        # Single output buffer holds the FULL d_summed (bwd kernel fuses
-        # in d_summed_external — see kernel docstring).
         d_summed = torch.empty_like(ynorm_src)
-        # inner[m] buffer — written by inner kernel, read by bwd kernel.
-        # Eliminates redundant per-d-tile recomputation of the per-row
-        # reduction inside bwd.
-        inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
-        if has_nw:
-            # Exact (num_m_tiles, D) since BLOCK_M is fixed — no more
-            # worst-case zero-padding hack needed.
-            dnw_partials = torch.empty(
-                (num_m_tiles, D),
-                dtype=nw.dtype,
-                device=ynorm_src.device,
+
+        # Dispatch between two bwd paths:
+        #   (A) inline single-kernel: full D in one tile, inner reduction
+        #       computed in registers, no precompute kernel. Wins
+        #       1.5–2.4× on most shapes (kernel-only); ties or slightly
+        #       wins even at large M·D where dnw_partials is huge.
+        #   (B) 2-kernel + 2D-tile fallback: splits D across programs.
+        #       Needed when HAS_NW=True and BLOCK_D is large enough
+        #       that the inline kernel's per-program tile exceeds the
+        #       255 fp32 reg/thread spill cap (measured: D > 16K
+        #       triggers ~10× slowdown from local-memory spill).
+        #
+        # n_live_tiles=5 for HAS_NW=True (y_norm, g_eff, dy_t, d_ext,
+        # d_summed alive at peak), 4 for HAS_NW=False (y_norm and g_eff
+        # alias src and dy_t respectively when there's no per-channel
+        # weight). The `fits_reg_budget` check on the inline TileConfig
+        # tells us whether the chosen (BLOCK_M, num_warps) would spill
+        # past Ampere's 255 fp32 reg/thread hard cap — if so, fall
+        # back to the 2-kernel D-split path which uses a much smaller
+        # fixed tile.
+        BLOCK_D = triton.next_power_of_2(D)
+        inline_n_live = 5 if has_nw else 4
+        inline_cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=inline_n_live)
+        use_inline = inline_cfg.fits_reg_budget
+
+        if use_inline:
+            BLOCK_M, num_warps = inline_cfg.block_m, inline_cfg.num_warps
+            num_m_tiles = triton.cdiv(M, BLOCK_M)
+
+            if has_nw:
+                dnw_partials = torch.empty(
+                    (num_m_tiles, D), dtype=nw.dtype, device=ynorm_src.device
+                )
+                nw_arg, dnw_arg = nw, dnw_partials
+            else:
+                nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
+
+            _fused_add_norm_bwd_inline_kernel[(num_m_tiles,)](
+                ynorm_src, rms_inv, nw_arg, dy, d_summed_external,
+                d_summed, dnw_arg,
+                M, D,
+                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
+                HAS_NW=has_nw, num_warps=num_warps,
             )
-            nw_arg = nw
-            dnw_arg = dnw_partials
         else:
-            # Dummy pointers when HAS_NW=False — kernel won't dereference.
-            nw_arg = ynorm_src
-            dnw_arg = ynorm_src
+            # 2-kernel path (inline would spill). Fixed config for
+            # CUDA Graph capturability.
+            BLOCK_M_BWD, BLOCK_D_BWD, NUM_WARPS_BWD = 32, 64, 4
+            num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+            inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
+            if has_nw:
+                dnw_partials = torch.empty(
+                    (num_m_tiles, D), dtype=nw.dtype, device=ynorm_src.device
+                )
+                nw_arg, dnw_arg = nw, dnw_partials
+            else:
+                nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
 
-        # Stage 1: pre-compute inner[m] (one 1D-grid kernel, full-D per
-        # program — fwd-style sizing, no D-split, no redundancy).
-        INNER_BLOCK_D = triton.next_power_of_2(D)
-        INNER_NUM_WARPS = 4
-        INNER_BLOCK_M = max(
-            1,
-            min(
-                triton.next_power_of_2(M // 64),
-                triton.next_power_of_2(4096 * INNER_NUM_WARPS // INNER_BLOCK_D),
-            ),
-        )
-        inner_grid = (triton.cdiv(M, INNER_BLOCK_M),)
-        _fused_add_norm_inner_kernel[inner_grid](
-            ynorm_src,
-            rms_inv,
-            nw_arg,
-            dy,
-            inner_buf,
-            M,
-            D,
-            BLOCK_M=INNER_BLOCK_M,
-            BLOCK_D=INNER_BLOCK_D,
-            HAS_NW=has_nw,
-            num_warps=INNER_NUM_WARPS,
-        )
+            # Stage 1: pre-compute inner[m]. fwd-style sizing
+            # (n_live_tiles=2: y_norm and g_eff alive together briefly).
+            INNER_BLOCK_D = triton.next_power_of_2(D)
+            inner_cfg = _pick_tile_config(M, INNER_BLOCK_D, n_live_tiles=2)
+            _fused_add_norm_inner_kernel[(triton.cdiv(M, inner_cfg.block_m),)](
+                ynorm_src, rms_inv, nw_arg, dy, inner_buf,
+                M, D,
+                BLOCK_M=inner_cfg.block_m, BLOCK_D=INNER_BLOCK_D,
+                HAS_NW=has_nw, num_warps=inner_cfg.num_warps,
+            )
 
-        # Stage 2: bwd kernel reads pre-computed inner, computes d_summed
-        # and dnw_partials. 2D grid with fixed BLOCK_M / BLOCK_D.
-        grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))
-        _fused_add_norm_bwd_kernel[grid_bwd](
-            ynorm_src,
-            rms_inv,
-            nw_arg,
-            dy,
-            d_summed_external,
-            inner_buf,
-            d_summed,
-            dnw_arg,
-            M,
-            D,
-            BLOCK_M=BLOCK_M_BWD,
-            BLOCK_D=BLOCK_D_BWD,
-            HAS_NW=has_nw,
-            num_warps=NUM_WARPS_BWD,
-        )
+            # Stage 2: bwd reads pre-computed inner; 2D grid splits D.
+            _fused_add_norm_bwd_kernel[(num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))](
+                ynorm_src, rms_inv, nw_arg, dy, d_summed_external, inner_buf,
+                d_summed, dnw_arg,
+                M, D,
+                BLOCK_M=BLOCK_M_BWD, BLOCK_D=BLOCK_D_BWD,
+                HAS_NW=has_nw, num_warps=NUM_WARPS_BWD,
+            )
+
         dnw = dnw_partials.sum(dim=0) if has_nw else None
 
         # x + residual: d_x = d_residual = d_summed
@@ -676,7 +786,7 @@ if _HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
-        rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
+        rms_inv = tl.rsqrt(sum_sq / K + eps)
 
         # Only the p=0 tile writes rms_inv (it doesn't depend on p)
         if pid_p == 0:
@@ -810,7 +920,7 @@ if _HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
-        rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
+        rms_inv = tl.rsqrt(sum_sq / K + eps)
 
         # Only the n=0 tile writes rms_inv (it doesn't depend on n) —
         # avoid redundant writes by checking pid_n.
@@ -1236,7 +1346,7 @@ if _HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
-        rms_inv = 1.0 / tl.sqrt(sum_sq / K + eps)
+        rms_inv = tl.rsqrt(sum_sq / K + eps)
 
         if pid_n == 0:
             tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
@@ -2025,7 +2135,7 @@ if _HAS_TRITON:
 
         # RMSNorm + scale: compute mean(y²) over full D using y1, y2 in registers
         sum_sq = tl.sum(y1 * y1, axis=1) + tl.sum(y2 * y2, axis=1)
-        rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+        rms_inv = tl.rsqrt(sum_sq / D + eps)
         norm_scale = rms_inv * scale
 
         # Apply norm·scale, write halves back

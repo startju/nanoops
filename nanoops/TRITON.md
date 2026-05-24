@@ -442,7 +442,7 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
 
     summed_f32 = summed.to(tl.float32)                    # fp32 from here for numerical match
     sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
-    rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
+    rms_inv = tl.rsqrt(sum_sq / D + eps)               # rsqrt.approx.f32 单指令
     tl.store(rms_inv_ptr + rows, rms_inv, mask=rows < M)  # ← needed by bwd
 
     y = summed_f32 * rms_inv[:, None]
@@ -476,14 +476,24 @@ That doesn't work because of register pressure:
 
 A 1D-over-M bwd kernel would need every program to hold a full
 `(BLOCK_M, D)` tile of *each* of: `summed`, `dy`, `y_norm`, `g_eff`,
-`dx`, plus a per-channel `dnw` accumulator. At `D=1536` that's
-~5 × 32 × 1536 = 245K fp32 elements / 128 threads ≈ **1900 regs/thread**
-— catastrophic spill.
+`dx`, plus a per-channel `dnw` accumulator. Plugging in the actual
+config (`BLOCK_M=32`, `num_warps=4` → 128 threads/program) at
+`D=1536`:
+
+```
+   5 tiles  ×  BLOCK_M=32  ×  D=1536   ≈  245K fp32 elements / program
+   245K elements  /  128 threads       ≈  1900 fp32 regs / thread
+```
+
+— **1900 regs/thread vs the 255 hard cap → catastrophic spill** to
+local memory.
 
 The fix: **split the bwd grid along D too**. Each program now only
-handles a `(BLOCK_M, BLOCK_D)` output tile of `dx`. Per-program tile
-shrinks from ~245K elements to ~10K, register pressure becomes
-manageable.
+handles a `(BLOCK_M, BLOCK_D)` output tile of `dx` (current config:
+`BLOCK_M=32, BLOCK_D=64`). Per-program tile shrinks from
+`32 × 1536 ≈ 49K` per-tensor down to `32 × 64 = 2K`, total
+~245K → ~10K elements → ~80 regs/thread on 128 threads — fits
+comfortably.
 
 But splitting along D introduces a new problem. The per-row reduction
 needed for the math —
@@ -645,10 +655,19 @@ of HBM time, plus ~10-30 μs of avoided launch overhead.
 
 #### Backward
 
-Naive native (single `F.rms_norm.backward` kernel + Python
-accumulation of the external gradient):
+PyTorch-optimized native (single `F.rms_norm.backward` kernel +
+Python accumulation of the external gradient). The math itself needs
+two reductions over D (`inner[m] = mean_d(dy · y_norm)` and then
+`dx = rms_inv · (dy − y_norm · inner)`), so "1 read" below assumes
+the **1-pass shared-memory pattern** PyTorch ships: one CUDA block
+per row, load `summed` and `dy` into shared mem once, reduce there,
+then revisit shared mem for the per-element `dx`. D=1536 fp32 +
+dy = 12 KB / row, easily fits in 3090's 100 KB / SM shared-mem
+budget. A literally-naive 2-pass implementation (write `inner` to
+HBM, re-load `summed`/`dy` for the second pass) would double the
+read bytes — call it out below if you ever benchmark against one:
 ```
-F.rms_norm.backward:
+F.rms_norm.backward (1-pass shared-mem):
   read summed              M·D
   read dy                  M·D
   write d_summed_from_norm M·D                              ─┐
@@ -661,7 +680,12 @@ Python d_summed = d_summed_from_norm + d_summed_external:
 Total:                     6·M·D
 ```
 
-Fused (2-kernel split, d_summed_external folded into bwd kernel):
+Fused (2-kernel split, d_summed_external folded into bwd kernel).
+Note we **can't** use PyTorch's 1-pass shared-mem trick: we split
+D across programs (to bound register pressure for the
+`(BLOCK_M, D)` dnw_partial — see §2.2), so no single program owns
+a full row to reduce in shared memory. Hence the explicit
+inner-pre-compute kernel:
 ```
 _fused_add_norm_inner_kernel:
   read summed/y            M·D
@@ -678,7 +702,14 @@ _fused_add_norm_bwd_kernel:                                  │
 Total:                     6·M·D
 ```
 
-Same total HBM bytes. So what does the bwd fusion actually save?
+Same total HBM bytes — but note where the wins come from. Fused
+*reads* `summed` and `dy` twice (2·M·D each), PyTorch reads them
+once (1·M·D each). What buys back the deficit: PyTorch has to write
+`d_summed_from_norm` to HBM as an intermediate, then a separate
+elementwise-add kernel reads it back and reads `d_summed_external`,
+and writes the combined `d_summed`. That extra 3·M·D round-trip
+(plus its own kernel launch) is exactly what folding `+ d_ext` into
+the fused bwd kernel cancels out. So what does fusion save?
 
 - **1 intermediate buffer**: native has to allocate
   `d_summed_from_norm` (M·D bytes) as a holding tank between the norm
