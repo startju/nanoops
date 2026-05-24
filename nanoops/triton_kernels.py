@@ -1916,6 +1916,55 @@ if _HAS_TRITON:
             y_f32 = y_f32 * nw[None, :]
         tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
 
+    @triton.jit
+    def _fused_add_norm_inner_kernel(
+        ynorm_src_ptr,
+        rms_inv_ptr,
+        nw_ptr,
+        dy_ptr,
+        inner_ptr,
+        M,
+        D,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_NW: tl.constexpr,
+    ):
+        """Pre-computes inner[m] = mean_d(g_eff * y_norm) for the bwd kernel,
+        so the bwd kernel doesn't redundantly recompute this per d_tile
+        (D/BLOCK_D times per m_tile).
+
+        Same `ynorm_src_ptr` semantics as the bwd kernel:
+          - HAS_NW=True : ynorm_src is `summed`, reconstruct y_norm = summed * rms_inv
+          - HAS_NW=False: ynorm_src is `y` itself which equals y_norm directly
+
+        Grid is 1D over m_tiles — each program does one (BLOCK_M, D)
+        row tile reduction. BLOCK_D = next_power_of_2(D) so the whole D
+        fits in a single tile column-wise (same pattern as fwd kernel).
+
+        Writes one fp32 per row to `inner_ptr` (shape (M,))."""
+        pid_m = tl.program_id(0)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_D)
+        row_mask = rows < M
+        col_mask = cols < D
+        mask_2d = row_mask[:, None] & col_mask[None, :]
+        offs = rows[:, None] * D + cols[None, :]
+
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        if HAS_NW:
+            y_norm = src * rms_inv[:, None]
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            g_eff = dy_t * nw[None, :]
+        else:
+            y_norm = src
+            g_eff = dy_t
+
+        inner = tl.sum(g_eff * y_norm, axis=1) / D
+        tl.store(inner_ptr + rows, inner, mask=row_mask)
+
     # Autotune over BLOCK_M / BLOCK_D / num_warps / num_stages.
     # Cache key = (M, D): same input shape reuses the tuned config.
     # HAS_NW is a constexpr so True/False branches already compile to
@@ -1940,27 +1989,25 @@ if _HAS_TRITON:
         key=["M", "D"],
     )
     @triton.jit
-    def _rms_norm_bwd_with_summed_kernel(
+    def _fused_add_norm_bwd_kernel(
         ynorm_src_ptr,
         rms_inv_ptr,
         nw_ptr,
-        dxhat_ptr,
-        dx_ptr,
+        dy_ptr,
+        d_ext_ptr,
+        inner_ptr,
+        d_summed_ptr,
         dnw_partial_ptr,
         M,
         D,
-        stride_sm,
-        stride_sd,
-        stride_dxhat_m,
-        stride_dxhat_d,
-        stride_dx_m,
-        stride_dx_d,
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
     ):
-        """RMSNorm backward variant. The `ynorm_src_ptr` tensor is
-        interpreted based on HAS_NW:
+        """RMSNorm backward second-stage kernel (paired with
+        `_fused_add_norm_inner_kernel` which pre-computes inner[m]).
+
+        The `ynorm_src_ptr` tensor is interpreted based on HAS_NW:
           - HAS_NW=True : pointer is to `summed`; kernel reconstructs
             y_norm = summed * rms_inv inline (one multiply per loaded
             tile, runs on idle FP32 cores). Used so fwd doesn't need a
@@ -1970,21 +2017,31 @@ if _HAS_TRITON:
             affine). Kernel uses it directly — saves the multiply.
 
         Grid is 2D (M_tile × D_tile): each program produces one
-        (BLOCK_M × BLOCK_D) slice of dx and writes one (BLOCK_M × BLOCK_D)
-        partial of dnw. The per-row reduction `inner[m] = mean_d(...)`
-        requires data across the whole D axis, so pass 1 loops over all
-        D in chunks of BLOCK_D before pass 2 produces this program's
-        own (M, D) output tile.
+        (BLOCK_M × BLOCK_D) slice of d_summed and writes one
+        (BLOCK_M × BLOCK_D) partial of dnw. Splitting along D keeps
+        per-program register pressure manageable (vs a 1D-over-M grid
+        which would force the whole D into a single tile and spill).
 
-        Math (when HAS_NW=True):
-          y_norm[m, d] = summed[m, d] * rms_inv[m]
-          g_eff[m, d]  = dx_hat[m, d] * nw[d]
-          inner[m]     = mean_d(g_eff * y_norm)
-          dx[m, d]     = rms_inv[m] * (g_eff - y_norm * inner[m])
-          dnw_partial[m_tile, d] = sum_{m in tile} (dx_hat * y_norm)
+        `inner_ptr` is the per-row reduction `inner[m] = mean_d(g_eff *
+        y_norm)`, pre-computed by `_fused_add_norm_inner_kernel`. This
+        avoids each d_tile program recomputing the same full-D reduction
+        (would be D/BLOCK_D × redundant otherwise).
+
+        `d_ext_ptr` is the gradient w.r.t. `summed` coming from outside
+        (caller's direct consumption of summed as residual stream). The
+        kernel adds it to the RMSNorm-bwd-computed gradient in pass 2
+        so the final `d_summed` already contains the total — saves an
+        extra Python torch elementwise add + its HBM round-trip
+        (~50 μs/call at d24 shape).
+
+        Math (when HAS_NW=True; `dy` is gradient of the fwd-output `y`):
+          y_norm[m, d]   = summed[m, d] * rms_inv[m]
+          g_eff[m, d]    = dy[m, d] * nw[d]
+          d_summed[m, d] = rms_inv[m] * (g_eff - y_norm * inner[m]) + d_ext[m, d]
+          dnw_partial[m_tile, d] = sum_{m in tile} (dy * y_norm)
 
         When HAS_NW=False: y_norm[m, d] = ynorm_src[m, d] directly,
-        g_eff collapses to dx_hat, dnw_partial is not produced; nw_ptr
+        g_eff collapses to dy, dnw_partial is not produced; nw_ptr
         and dnw_partial_ptr are not dereferenced.
         """
         pid_m = tl.program_id(0)
@@ -1998,79 +2055,42 @@ if _HAS_TRITON:
         rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
         if HAS_NW:
             nw = tl.load(nw_ptr + ds, mask=d_mask, other=0.0).to(tl.float32)
+        # Pre-computed per-row inner — replaces the previous pass-1
+        # full-D reduction loop. One scalar load per row, not redone
+        # per d_tile program.
+        inner = tl.load(inner_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
 
-        # Pass 1: inner[m] = mean over d of g_eff * y_norm
-        # Loops over all D chunks (each program independently does this
-        # full reduction so it has the per-row `inner` it needs for pass 2).
-        inner = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        for d2_start in range(0, D, BLOCK_D):
-            ds2 = d2_start + tl.arange(0, BLOCK_D)
-            d2_mask = ds2 < D
-            s_ptrs = (
-                ynorm_src_ptr + rows[:, None] * stride_sm + ds2[None, :] * stride_sd
-            )
-            src2 = tl.load(
-                s_ptrs,
-                mask=row_mask[:, None] & d2_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            if HAS_NW:
-                y_norm2 = src2 * rms_inv[:, None]  # src is summed
-            else:
-                y_norm2 = src2  # src is y, which == y_norm directly
-            dxh_ptrs = (
-                dxhat_ptr
-                + rows[:, None] * stride_dxhat_m
-                + ds2[None, :] * stride_dxhat_d
-            )
-            dxh = tl.load(
-                dxh_ptrs,
-                mask=row_mask[:, None] & d2_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            if HAS_NW:
-                nw2 = tl.load(nw_ptr + ds2, mask=d2_mask, other=0.0).to(tl.float32)
-                g_eff2 = dxh * nw2[None, :]
-            else:
-                g_eff2 = dxh
-            inner += tl.sum(g_eff2 * y_norm2, axis=1)
-        inner = inner / D
-
-        # Pass 2: compute dx for this (m_tile, d_tile) slice
-        s_ptrs = ynorm_src_ptr + rows[:, None] * stride_sm + ds[None, :] * stride_sd
-        src = tl.load(
-            s_ptrs,
-            mask=row_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        # Compute d_summed for this (m_tile, d_tile) slice.
+        # All (M, D) tensors are contiguous (autograd boundary ensures
+        # this), so row stride = D, col stride = 1 — no per-tensor
+        # stride params needed.
+        offs = rows[:, None] * D + ds[None, :]
+        mask_2d = row_mask[:, None] & d_mask[None, :]
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
         if HAS_NW:
             y_norm = src * rms_inv[:, None]
         else:
             y_norm = src
-        dxh_ptrs = (
-            dxhat_ptr + rows[:, None] * stride_dxhat_m + ds[None, :] * stride_dxhat_d
-        )
-        dxh = tl.load(
-            dxh_ptrs,
-            mask=row_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
         if HAS_NW:
-            g_eff = dxh * nw[None, :]
+            g_eff = dy_t * nw[None, :]
         else:
-            g_eff = dxh
-        dx_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None])
-        dx_ptrs = dx_ptr + rows[:, None] * stride_dx_m + ds[None, :] * stride_dx_d
+            g_eff = dy_t
+        # Fold external d_summed (caller's direct consumption of summed)
+        # into d_summed in-kernel — saves an extra Python `+` op + its
+        # HBM round-trip outside.
+        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        d_summed_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
         tl.store(
-            dx_ptrs,
-            dx_tile.to(dx_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & d_mask[None, :],
+            d_summed_ptr + offs,
+            d_summed_tile.to(d_summed_ptr.dtype.element_ty),
+            mask=mask_2d,
         )
 
-        # Per-m-tile partial dnw[d] = sum over tile rows of (dx_hat * y_norm)
+        # Per-m-tile partial dnw[d] = sum over tile rows of (dy * y_norm)
         # — only when affine weight exists.
         if HAS_NW:
-            dnw_partial = tl.sum(dxh * y_norm, axis=0)
+            dnw_partial = tl.sum(dy_t * y_norm, axis=0)
             dnw_p_ptrs = dnw_partial_ptr + pid_m * D + ds
             tl.store(
                 dnw_p_ptrs,
@@ -2100,7 +2120,7 @@ class FusedAddNorm(torch.autograd.Function):
     Forward: one Triton kernel does add + RMSNorm + writes y and summed
     (no separate y_norm tensor — it stays in registers during fwd).
 
-    Backward uses `_rms_norm_bwd_with_summed_kernel`, which loads summed
+    Backward uses `_fused_add_norm_bwd_kernel`, which loads summed
     and reconstructs y_norm = summed * rms_inv on the fly. The extra
     multiply runs on otherwise-idle FP32 cores (bwd is bandwidth-bound),
     so the net win is saving the 2·M·D fwd HBM write of y_norm. summed
@@ -2236,7 +2256,13 @@ class FusedAddNorm(torch.autograd.Function):
         # smallest BLOCK_M in the autotune configs.
         MIN_BLOCK_M_BWD = 16
         num_m_tiles_max = triton.cdiv(M, MIN_BLOCK_M_BWD)
-        d_summed_from_norm = torch.empty_like(ynorm_src)
+        # Single output buffer holds the FULL d_summed (bwd kernel fuses
+        # in d_summed_external — see kernel docstring).
+        d_summed = torch.empty_like(ynorm_src)
+        # inner[m] buffer — written by inner kernel, read by bwd kernel.
+        # Eliminates redundant per-d-tile recomputation of the per-row
+        # reduction inside bwd.
+        inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
         if has_nw:
             dnw_partials = torch.zeros(
                 (num_m_tiles_max, D),
@@ -2249,37 +2275,61 @@ class FusedAddNorm(torch.autograd.Function):
             # Dummy pointers when HAS_NW=False — kernel won't dereference.
             nw_arg = ynorm_src
             dnw_arg = ynorm_src
-        # Grid as a lambda over autotuned meta — both axes depend on
-        # the autotune-chosen BLOCK_M / BLOCK_D.
-        grid_bwd = lambda meta: (
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(D, meta["BLOCK_D"]),
+
+        # Stage 1: pre-compute inner[m] (one 1D-grid kernel, full-D per
+        # program — fwd-style sizing, no D-split, no redundancy).
+        INNER_BLOCK_D = triton.next_power_of_2(D)
+        INNER_NUM_WARPS = 4
+        INNER_BLOCK_M = max(
+            1,
+            min(
+                triton.next_power_of_2(M // 64),
+                triton.next_power_of_2(4096 * INNER_NUM_WARPS // INNER_BLOCK_D),
+            ),
         )
-        _rms_norm_bwd_with_summed_kernel[grid_bwd](
+        inner_grid = (triton.cdiv(M, INNER_BLOCK_M),)
+        _fused_add_norm_inner_kernel[inner_grid](
             ynorm_src,
             rms_inv,
             nw_arg,
             dy,
-            d_summed_from_norm,
+            inner_buf,
+            M,
+            D,
+            BLOCK_M=INNER_BLOCK_M,
+            BLOCK_D=INNER_BLOCK_D,
+            HAS_NW=has_nw,
+            num_warps=INNER_NUM_WARPS,
+        )
+
+        # Stage 2: bwd kernel reads pre-computed inner, computes d_summed
+        # and dnw_partials. Grid is 2D, autotuned over BLOCK_M / BLOCK_D
+        # / num_warps / num_stages.
+        def grid_bwd(meta):
+            return (
+                triton.cdiv(M, meta["BLOCK_M"]),
+                triton.cdiv(D, meta["BLOCK_D"]),
+            )
+
+        _fused_add_norm_bwd_kernel[grid_bwd](
+            ynorm_src,
+            rms_inv,
+            nw_arg,
+            dy,
+            d_summed_external,
+            inner_buf,
+            d_summed,
             dnw_arg,
             M,
             D,
-            ynorm_src.stride(0),
-            ynorm_src.stride(1),
-            dy.stride(0),
-            dy.stride(1),
-            d_summed_from_norm.stride(0),
-            d_summed_from_norm.stride(1),
             HAS_NW=has_nw,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
 
-        # Sum passthrough: d_summed = d_summed_from_norm + d_summed_external
-        # (downstream may consume `summed` directly as next-block residual)
-        d_summed_total = d_summed_from_norm + d_summed_external
-        # x + residual: d_x = d_residual = d_summed_total
-        d_x = d_summed_total
-        d_residual = d_summed_total
+        # x + residual: d_x = d_residual = d_summed
+        # (d_summed already includes d_summed_external — fused in kernel).
+        d_x = d_summed
+        d_residual = d_summed
         return d_x, d_residual, dnw, None
 
 
