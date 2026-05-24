@@ -1868,15 +1868,17 @@ if _HAS_TRITON:
             masked (load contributes 0, store skipped). So D can be e.g.
             1536 with BLOCK_D=2048.
 
-        Register strategy: x / r / summed / y stay in the input dtype
-        (bf16 typically). Only the per-row reduction promotes to fp32
-        briefly to avoid compound rounding error in sum(summed²) over
-        large D. This roughly halves register pressure vs full fp32
-        internal — critical to avoid spills at BLOCK_M=32, D≥1024.
-
-        Matches `F.rms_norm` numerical behavior (nanchat's default RMSNorm
-        runs in bf16 throughout per gpt.py:43); rms_inv kept in fp32 to
-        match the fp32 rms_inv_ptr buffer used in backward.
+        Precision: computation runs in fp32 throughout to match F.rms_norm
+        bit-for-bit on bf16 inputs (PyTorch's F.rms_norm internally promotes
+        bf16 → fp32 for the reduction and elementwise scale, then casts back
+        — verified empirically). The bf16 form of `summed` is needed only
+        briefly to write the caller's residual-stream buffer; everything
+        downstream of that store lives in fp32 registers until the final
+        y cast at store time. Net register pressure is the same as a
+        full-fp32-internal implementation (n_regs=255 at tile=16384,
+        nw=4) — bf16 is for HBM/caller dtype compatibility, not for
+        register savings. See FusedAddNorm class docstring for the
+        spill-aware tile sizing that keeps this within budget.
 
         HAS_NW=False ⇒ no per-channel affine weight; output is plain
         `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
@@ -1888,24 +1890,21 @@ if _HAS_TRITON:
         mask_2d = row_mask[:, None] & col_mask[None, :]
 
         offs = rows[:, None] * D + cols[None, :]
-        # Load in input dtype, no promotion. Masked-off elements get 0,
-        # which is the additive/multiplicative identity for sum_sq.
+        # Load in input dtype; masked-off elements get 0 (additive /
+        # multiplicative identity for the downstream sum_sq).
         x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0)
         r = tl.load(res_ptr + offs, mask=mask_2d, other=0.0)
         summed = x + r
 
-        # Save summed back to HBM — dual purpose: (1) caller uses it as
-        # the next block's residual stream (no re-add), (2) backward
-        # loads it to reconstruct y_norm via one multiply per element.
+        # Save summed back to HBM (input dtype) — dual purpose: caller's
+        # next-block residual stream + backward reconstruction of y_norm.
         tl.store(summed_ptr + offs, summed, mask=mask_2d)
 
-        # RMSNorm reduction + y multiply in fp32 to match F.rms_norm
-        # exactly (PyTorch's F.rms_norm internally promotes bf16 input
-        # to fp32 throughout, then casts the result back — verified by
-        # bit-equality on bf16 inputs). We do the same:
-        # the bf16 `summed` is kept in registers for HBM store, but
-        # the compute pipeline (square / sum / rsqrt / multiply / nw scale)
-        # all runs in fp32 for numerical agreement.
+        # Compute pipeline runs in fp32 (matches F.rms_norm bit-for-bit;
+        # see kernel docstring). summed_f32 stays live in registers from
+        # here through the y store, so register pressure is fp32-internal
+        # in effect — the bf16 `summed` was only kept around for the HBM
+        # write above.
         summed_f32 = summed.to(tl.float32)
         sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
         rms_inv = 1.0 / tl.sqrt(sum_sq / D + eps)
@@ -1917,6 +1916,29 @@ if _HAS_TRITON:
             y_f32 = y_f32 * nw[None, :]
         tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
 
+    # Autotune over BLOCK_M / BLOCK_D / num_warps / num_stages.
+    # Cache key = (M, D): same input shape reuses the tuned config.
+    # HAS_NW is a constexpr so True/False branches already compile to
+    # separate binaries and tune separately. First call per (M, D) pays
+    # one-time compile + benchmark cost of all 48 configs (~3 s).
+    #
+    # IMPORTANT: caller allocates dnw_partials with shape
+    # (M / MIN_BLOCK_M, D) using `torch.zeros` so that whichever BLOCK_M
+    # autotune picks, the unused tail rows stay zero and don't pollute
+    # the final `dnw_partials.sum(dim=0)`. MIN_BLOCK_M must match the
+    # smallest BLOCK_M in the configs below.
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {"BLOCK_M": bm, "BLOCK_D": bd}, num_warps=nw, num_stages=ns
+            )
+            for bm in [16, 32, 64]
+            for bd in [32, 64, 128, 256]
+            for nw in [4, 8]
+            for ns in [2, 3]
+        ],
+        key=["M", "D"],
+    )
     @triton.jit
     def _rms_norm_bwd_with_summed_kernel(
         ynorm_src_ptr,
@@ -1926,15 +1948,15 @@ if _HAS_TRITON:
         dx_ptr,
         dnw_partial_ptr,
         M,
-        K,
+        D,
         stride_sm,
-        stride_sk,
+        stride_sd,
         stride_dxhat_m,
-        stride_dxhat_k,
+        stride_dxhat_d,
         stride_dx_m,
-        stride_dx_k,
+        stride_dx_d,
         BLOCK_M: tl.constexpr,
-        BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
     ):
         """RMSNorm backward variant. The `ynorm_src_ptr` tensor is
@@ -1947,40 +1969,49 @@ if _HAS_TRITON:
             (since `y = summed * rms_inv * 1` when there's no per-channel
             affine). Kernel uses it directly — saves the multiply.
 
-        Math (when HAS_NW=True):
-          y_norm[m, k] = summed[m, k] * rms_inv[m]
-          g_eff[m, k]  = dx_hat[m, k] * nw[k]
-          inner[m]     = mean_k(g_eff * y_norm)
-          dx[m, k]     = rms_inv[m] * (g_eff - y_norm * inner[m])
-          dnw_partial[m_tile, k] = sum_{m in tile} (dx_hat * y_norm)
+        Grid is 2D (M_tile × D_tile): each program produces one
+        (BLOCK_M × BLOCK_D) slice of dx and writes one (BLOCK_M × BLOCK_D)
+        partial of dnw. The per-row reduction `inner[m] = mean_d(...)`
+        requires data across the whole D axis, so pass 1 loops over all
+        D in chunks of BLOCK_D before pass 2 produces this program's
+        own (M, D) output tile.
 
-        When HAS_NW=False: y_norm[m, k] = ynorm_src[m, k] directly,
+        Math (when HAS_NW=True):
+          y_norm[m, d] = summed[m, d] * rms_inv[m]
+          g_eff[m, d]  = dx_hat[m, d] * nw[d]
+          inner[m]     = mean_d(g_eff * y_norm)
+          dx[m, d]     = rms_inv[m] * (g_eff - y_norm * inner[m])
+          dnw_partial[m_tile, d] = sum_{m in tile} (dx_hat * y_norm)
+
+        When HAS_NW=False: y_norm[m, d] = ynorm_src[m, d] directly,
         g_eff collapses to dx_hat, dnw_partial is not produced; nw_ptr
         and dnw_partial_ptr are not dereferenced.
         """
         pid_m = tl.program_id(0)
-        pid_k = tl.program_id(1)
+        pid_d = tl.program_id(1)
 
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        ks = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        ds = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
         row_mask = rows < M
-        k_mask = ks < K
+        d_mask = ds < D
 
         rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
         if HAS_NW:
-            nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + ds, mask=d_mask, other=0.0).to(tl.float32)
 
-        # Pass 1: inner[m] = mean over k of g_eff * y_norm
+        # Pass 1: inner[m] = mean over d of g_eff * y_norm
+        # Loops over all D chunks (each program independently does this
+        # full reduction so it has the per-row `inner` it needs for pass 2).
         inner = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        for k2_start in range(0, K, BLOCK_K):
-            ks2 = k2_start + tl.arange(0, BLOCK_K)
-            k2_mask = ks2 < K
+        for d2_start in range(0, D, BLOCK_D):
+            ds2 = d2_start + tl.arange(0, BLOCK_D)
+            d2_mask = ds2 < D
             s_ptrs = (
-                ynorm_src_ptr + rows[:, None] * stride_sm + ks2[None, :] * stride_sk
+                ynorm_src_ptr + rows[:, None] * stride_sm + ds2[None, :] * stride_sd
             )
             src2 = tl.load(
                 s_ptrs,
-                mask=row_mask[:, None] & k2_mask[None, :],
+                mask=row_mask[:, None] & d2_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
             if HAS_NW:
@@ -1990,26 +2021,26 @@ if _HAS_TRITON:
             dxh_ptrs = (
                 dxhat_ptr
                 + rows[:, None] * stride_dxhat_m
-                + ks2[None, :] * stride_dxhat_k
+                + ds2[None, :] * stride_dxhat_d
             )
             dxh = tl.load(
                 dxh_ptrs,
-                mask=row_mask[:, None] & k2_mask[None, :],
+                mask=row_mask[:, None] & d2_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
             if HAS_NW:
-                nw2 = tl.load(nw_ptr + ks2, mask=k2_mask, other=0.0).to(tl.float32)
+                nw2 = tl.load(nw_ptr + ds2, mask=d2_mask, other=0.0).to(tl.float32)
                 g_eff2 = dxh * nw2[None, :]
             else:
                 g_eff2 = dxh
             inner += tl.sum(g_eff2 * y_norm2, axis=1)
-        inner = inner / K
+        inner = inner / D
 
-        # Pass 2: compute dx for this k-tile
-        s_ptrs = ynorm_src_ptr + rows[:, None] * stride_sm + ks[None, :] * stride_sk
+        # Pass 2: compute dx for this (m_tile, d_tile) slice
+        s_ptrs = ynorm_src_ptr + rows[:, None] * stride_sm + ds[None, :] * stride_sd
         src = tl.load(
             s_ptrs,
-            mask=row_mask[:, None] & k_mask[None, :],
+            mask=row_mask[:, None] & d_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         if HAS_NW:
@@ -2017,11 +2048,11 @@ if _HAS_TRITON:
         else:
             y_norm = src
         dxh_ptrs = (
-            dxhat_ptr + rows[:, None] * stride_dxhat_m + ks[None, :] * stride_dxhat_k
+            dxhat_ptr + rows[:, None] * stride_dxhat_m + ds[None, :] * stride_dxhat_d
         )
         dxh = tl.load(
             dxh_ptrs,
-            mask=row_mask[:, None] & k_mask[None, :],
+            mask=row_mask[:, None] & d_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         if HAS_NW:
@@ -2029,22 +2060,22 @@ if _HAS_TRITON:
         else:
             g_eff = dxh
         dx_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None])
-        dx_ptrs = dx_ptr + rows[:, None] * stride_dx_m + ks[None, :] * stride_dx_k
+        dx_ptrs = dx_ptr + rows[:, None] * stride_dx_m + ds[None, :] * stride_dx_d
         tl.store(
             dx_ptrs,
             dx_tile.to(dx_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & k_mask[None, :],
+            mask=row_mask[:, None] & d_mask[None, :],
         )
 
-        # Per-m-tile partial dnw[k] = sum over tile rows of (dx_hat * y_norm)
+        # Per-m-tile partial dnw[d] = sum over tile rows of (dx_hat * y_norm)
         # — only when affine weight exists.
         if HAS_NW:
             dnw_partial = tl.sum(dxh * y_norm, axis=0)
-            dnw_p_ptrs = dnw_partial_ptr + pid_m * K + ks
+            dnw_p_ptrs = dnw_partial_ptr + pid_m * D + ds
             tl.store(
                 dnw_p_ptrs,
                 dnw_partial.to(dnw_partial_ptr.dtype.element_ty),
-                mask=k_mask,
+                mask=d_mask,
             )
 
 
@@ -2196,12 +2227,19 @@ class FusedAddNorm(torch.autograd.Function):
         # reconstructs y_norm = summed * rms_inv on the fly. When not
         # has_nw, kernel reads `y` directly (it already equals y_norm),
         # saving the per-tile multiply.
-        BLOCK_M_BWD, BLOCK_K_BWD = 32, 64
-        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+        # BLOCK_M / BLOCK_D / num_warps / num_stages are all autotuned
+        # — see @triton.autotune above the kernel definition.
+        # dnw_partials is sized for the worst case (smallest BLOCK_M in
+        # the sweep), with torch.zeros so any unused tail rows under a
+        # larger chosen BLOCK_M stay at 0 and don't pollute the final
+        # `dnw_partials.sum(dim=0)`. MIN_BLOCK_M_BWD must match the
+        # smallest BLOCK_M in the autotune configs.
+        MIN_BLOCK_M_BWD = 16
+        num_m_tiles_max = triton.cdiv(M, MIN_BLOCK_M_BWD)
         d_summed_from_norm = torch.empty_like(ynorm_src)
         if has_nw:
-            dnw_partials = torch.empty(
-                (num_m_tiles, D),
+            dnw_partials = torch.zeros(
+                (num_m_tiles_max, D),
                 dtype=nw.dtype,
                 device=ynorm_src.device,
             )
@@ -2211,7 +2249,12 @@ class FusedAddNorm(torch.autograd.Function):
             # Dummy pointers when HAS_NW=False — kernel won't dereference.
             nw_arg = ynorm_src
             dnw_arg = ynorm_src
-        grid_bwd = (num_m_tiles, triton.cdiv(D, BLOCK_K_BWD))
+        # Grid as a lambda over autotuned meta — both axes depend on
+        # the autotune-chosen BLOCK_M / BLOCK_D.
+        grid_bwd = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(D, meta["BLOCK_D"]),
+        )
         _rms_norm_bwd_with_summed_kernel[grid_bwd](
             ynorm_src,
             rms_inv,
@@ -2227,8 +2270,6 @@ class FusedAddNorm(torch.autograd.Function):
             dy.stride(1),
             d_summed_from_norm.stride(0),
             d_summed_from_norm.stride(1),
-            BLOCK_M=BLOCK_M_BWD,
-            BLOCK_K=BLOCK_K_BWD,
             HAS_NW=has_nw,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
