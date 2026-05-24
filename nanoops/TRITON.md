@@ -145,8 +145,12 @@ nailing down what each means first.
   product of a 16×16 matrix and a 16×16 matrix, accumulating into a
   16×16 result)
 - 1 such MMA = 16 × 16 × 16 = **4,096 multiply-adds = 8,192 FLOPs**
-- Issued as a single `mma.sync` PTX instruction; takes ~1 cycle
-  (pipelined across multiple cycles internally but throughput is 1/cycle)
+- Issued as a single warp-level `mma.sync` PTX instruction. The 4,096
+  multiply-adds are pipelined across multiple cycles per Tensor core —
+  per-SM sustained throughput is **1,024 BF16 FLOPs/cycle** (see peak
+  compute table below), i.e. each Tensor core does 256 BF16 FLOPs/cycle,
+  so one 16×16×16 MMA's work (8,192 FLOPs) amortizes over **~32 cycles**
+  per Tensor core.
 
 So one MMA does **the same work as 4,096 FMAs**. That's the asymmetry
 that justifies the architectural split: a few Tensor cores running
@@ -161,17 +165,7 @@ Boost clock 1695 MHz, 82 SMs.
 | FP32 (CUDA cores)                | 128 cores × 2 FLOPs/cycle  | **35.6 TFLOPS**     |
 | TF32 (Tensor cores)              | 512 FLOPs/cycle            | **71 TFLOPS**       |
 | **FP16 / BF16 (Tensor cores)**   | 1024 FLOPs/cycle           | **142 TFLOPS**      |
-| FP16 / BF16 (Tensor) with 2:4 sparsity | 2048 FLOPs/cycle  | 284 TFLOPS          |
 | INT8 (Tensor cores)              | 2048 ops/cycle             | 284 TOPS            |
-| INT8 (Tensor) with 2:4 sparsity  | 4096 ops/cycle             | 568 TOPS            |
-
-(**2:4 sparsity** = a hardware-accelerated weight format where every
-4 consecutive elements have at most 2 non-zero (the other 2 are
-exactly zero). The Tensor core skips the zero multiplies, doubling
-throughput. Supported on all of Ampere's Tensor-core dtypes
-(FP16 / BF16 / TF32 / INT8) via the `mma.sp.sync` PTX instruction.
-Requires the weight tensor to be pre-pruned to this pattern —
-typically applied to inference weights, not used in nanoops.)
 
 **Memory side**: 936 GB/s HBM bandwidth. Compute-to-bandwidth ratio at
 bf16 = 142 TFLOPS / 936 GB/s = **152 FLOPs per byte**. Any op below
@@ -218,7 +212,7 @@ Summary table (training-shape scale):
 | Op                          | AI (FLOPs/byte) | Bound      |
 | --------------------------- | --------------- | ---------- |
 | MLP / QKV matmul            | 558 – 770       | compute    |
-| SDPA `Q@K^T` (B=1, L=2048)  | ~50 – 100       | mixed      |
+| SDPA (B=1, L=2048)          | ~114 naive / ~1024 Flash (see SDPA section below) | bandwidth → compute |
 | **RMSNorm**                 | **~1**          | bandwidth  |
 | Elementwise (add, relu)     | ~0.5            | bandwidth  |
 | Memcpy H2D / D2H            | 0               | bandwidth  |
@@ -227,26 +221,28 @@ Summary table (training-shape scale):
 does ~4·M·D bytes of HBM traffic for ~0 compute return. Fusing norm
 into the adjacent matmul kernel (`NormMLPReluSquare`,
 `NormQKVProjection`) keeps the normalized intermediate in registers,
-saving the 2·M·D round-trip — pure bandwidth win on a bandwidth-bound
-op, no downside. Same idea for fused_add_norm at block boundaries.
+saving **4·M·D bytes** of HBM traffic (norm output write + matmul
+input re-read) — pure bandwidth win on a bandwidth-bound op, no
+downside. Same idea for fused_add_norm at block boundaries.
 
 **SDPA: why Flash Attention exists.** Same AI lens shows the SDPA
 case has *two* numbers depending on whether the `(L, L)` P matrix
 gets materialized.
 
-For nanchat d24 (B=1, H=12, L=2048, D_head=128), full attention
-(Q@K^T + softmax + @V, both passes):
+For nanchat d24 (B=1, H=12, L=2048, D_head=128), forward attention
+(both matmuls: `Q@K^T` and `attn@V`, plus softmax):
 
 | Implementation                          | Total FLOPs | Total bytes | AI                |
 | --------------------------------------- | ----------- | ----------- | ----------------- |
 | Naive SDPA (materialize P to HBM)       | 25.8 G      | ~226 MB     | **~114 FLOPs/byte** (bandwidth-ish) |
 | Flash SDPA (P stays in registers)       | 25.8 G      | ~25 MB      | **~1024 FLOPs/byte** (compute-bound) |
 
-The P matrix is `B·H·L·L = 100 MB` at this scale and dominates the
-naive byte count. Flash's online softmax + tile streaming keeps P in
-registers so the HBM traffic shrinks to just `Q + K + V + O` (~25 MB),
-flipping SDPA from bandwidth-bound (~114 < 152 break-even) to
-compute-bound (~1024 >> break-even).
+Byte breakdown: at this scale `Q + K + V + O ≈ 25 MB` (4 tensors of
+`B·H·L·D = 12·2048·128` bf16 each). The P matrix is `B·H·L·L = 100 MB`,
+and naive SDPA writes P then reads it back from HBM (~200 MB), so the
+naive total is ~225 MB vs Flash's ~25 MB. Flash's online softmax +
+tile streaming keeps P in registers, flipping SDPA from bandwidth-
+bound (~114 < 152 break-even) to compute-bound (~1024 >> break-even).
 
 This is why Flash Attention is 2-4× faster than naive SDPA — bytes drop
 ~9× while FLOPs change only slightly:
@@ -270,13 +266,14 @@ These are **different physical units**, optimized for different work
 patterns. Understanding the split changes how you reason about kernel
 throughput.
 
-| Unit              | Per SM | What each does per cycle                | SM throughput               |
+| Unit              | Per SM | What each does (sustained)              | SM throughput               |
 | ----------------- | ------ | --------------------------------------- | --------------------------- |
-| **FP32 cores**    | 128    | 1 scalar fp32 multiply-add              | 256 fp32 FMA/cycle          |
-| **Tensor cores**  | 4      | 1 small matrix `mma` (e.g. 16×16×16 bf16) — 256 multiply-adds per instruction | **1024 bf16 FMA/cycle**     |
+| **FP32 cores**    | 128    | 1 scalar FMA/cycle each = 2 FLOPs/cycle each | **256 FP32 FLOPs/cycle**    |
+| **Tensor cores**  | 4      | sustained 256 BF16 FLOPs/cycle each (one 16×16×16 MMA amortized over ~32 cycles) | **1024 BF16 FLOPs/cycle**   |
 
 So 4 Tensor cores deliver ~4× the bf16 throughput that 128 FP32 cores
-deliver in fp32. Going bf16/fp16 and using `tl.dot` unlocks that 4×.
+deliver in fp32 (1024 / 256). Going bf16/fp16 and using `tl.dot`
+unlocks that 4×.
 
 **Why only 4 Tensor cores per SM:**
 
@@ -286,10 +283,11 @@ deliver in fp32. Going bf16/fp16 and using `tl.dot` unlocks that 4×.
    each cycle, each scheduler issues one `mma.sync` to one Tensor
    core. 4 schedulers × 4 Tensor cores = perfect 1:1 — adding a fifth
    Tensor core would just sit idle.
-3. **Data bandwidth.** Each Tensor core consumes a (16, 16) tile of
-   fp16 per instruction (512 B). Four together demand ~2 KB/cycle out
-   of shared memory — that's already close to the shared-memory port
-   bandwidth ceiling.
+3. **Data bandwidth.** At peak (1024 BF16 FLOPs/cycle = 512
+   multiply-adds/cycle per SM), even with full tile reuse from
+   registers the 4 Tensor cores together still need operand data
+   on the order of ~1 KB/cycle out of shared memory — already a
+   substantial fraction of the per-SM SMEM port bandwidth.
 
 ### Warps, warp schedulers, and which cores actually run
 
@@ -373,11 +371,16 @@ A **warp** = 32 threads. The fundamental scheduling unit.
   via `wgmma`) aren't usable on Ampere. Our Flash SDPA kernel is the
   classic Triton tutorial pattern, not the FA3 pattern.
 
-- **Tensor cores are the FLOP/s budget.** Anything not using
-  `tl.dot` (i.e. plain elementwise) runs on the FP32 cores and gets
-  ~1/10 of the peak FLOP/s. Fusion that lets us replace a separate
-  elementwise launch with an epilogue inside a `tl.dot`-using kernel
-  is almost always a win.
+- **Fuse elementwise into `tl.dot` epilogues.** Standalone elementwise
+  kernels are bandwidth-bound (see RMSNorm / add / relu rows in the AI
+  table, all ≪ 152 break-even) — the real cost is HBM round-trip plus
+  kernel-launch overhead, not FLOPs. The FP32 cores are mostly idle
+  during a `tl.dot`-dominated kernel anyway (a separate elementwise
+  pass on them would still cap at ~1/4 of BF16 Tensor peak, 35.6 / 142
+  TFLOPS), so folding the elementwise op into the matmul epilogue is a
+  free side-channel: it saves the elementwise's HBM round-trip (matmul's
+  HBM cost is unchanged), no extra launch, no FLOP/s contention with
+  the Tensor cores.
 
 ---
 

@@ -130,8 +130,11 @@ occupancy      = resident_warps / 48
 - Ampere 3rd-gen Tensor core 形状是 **16×16×16**（一次 MMA 做一个 16×16
   矩阵 × 16×16 矩阵，累加到 16×16 结果上）
 - 这样 1 个 MMA = 16 × 16 × 16 = **4,096 个 multiply-add = 8,192 FLOPs**
-- 通过一条 `mma.sync` PTX 指令发射，吞吐 1/cycle（内部 pipeline 多周期
-  完成但每周期可以发新的一条）
+- 通过一条 warp 级 `mma.sync` PTX 指令发射。这 4,096 个 multiply-add 在
+  Tensor core 上 pipeline 跨多周期完成——**每 SM 持续吞吐 1,024 BF16
+  FLOPs/cycle**（见下面峰值算力表），即每个 Tensor core 持续 256 BF16
+  FLOPs/cycle，所以一条 16×16×16 MMA（8,192 FLOPs）在一个 Tensor core
+  上摊销 **~32 周期**。
 
 也就是说**一次 MMA 等于 4,096 次 FMA 的工作量**。这就是为什么架构要拆开
 ：少数几个 Tensor core 跑 MMA >> 多个 CUDA core 跑 FMA。
@@ -145,15 +148,7 @@ Boost clock 1695 MHz，82 个 SM。
 | FP32 (CUDA cores)              | 128 cores × 2 FLOPs/cycle  | **35.6 TFLOPS**     |
 | TF32 (Tensor cores)            | 512 FLOPs/cycle             | **71 TFLOPS**       |
 | **FP16 / BF16 (Tensor cores)** | 1024 FLOPs/cycle            | **142 TFLOPS**      |
-| FP16 / BF16 (Tensor) + 2:4 稀疏 | 2048 FLOPs/cycle           | 284 TFLOPS          |
 | INT8 (Tensor cores)            | 2048 ops/cycle              | 284 TOPS            |
-| INT8 (Tensor) + 2:4 稀疏        | 4096 ops/cycle              | 568 TOPS            |
-
-（**2:4 稀疏** = 一种硬件加速的 weight 格式：**每 4 个连续元素里最多 2
-个非零**（另 2 个**必须**是 0）。Tensor core 跳过零乘法，吞吐翻倍。
-Ampere 所有 Tensor-core dtype（FP16 / BF16 / TF32 / INT8）都支持，
-PTX 指令 `mma.sp.sync`。需要 weight 预先 prune 到这个 pattern——通常用
-于 inference weight，nanoops 不用。）
 
 **Memory 侧**：HBM 带宽 936 GB/s。bf16 算力 / 带宽 = 142 TFLOPS / 936
 GB/s = **每 byte 152 FLOPs**。一个 op 的 arithmetic intensity（每 byte
@@ -195,7 +190,7 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 | Op                          | AI (FLOPs/byte) | 性质        |
 | --------------------------- | --------------- | ----------- |
 | MLP / QKV matmul            | 558 – 770       | 算力 bound  |
-| SDPA `Q@K^T` (B=1, L=2048)  | ~50 – 100       | 中间        |
+| SDPA (B=1, L=2048)          | ~114 naive / ~1024 Flash（见下方 SDPA 段） | 带宽 → 算力 |
 | **RMSNorm**                 | **~1**          | 带宽 bound  |
 | Elementwise (add, relu)     | ~0.5            | 带宽 bound  |
 | Memcpy H2D / D2H            | 0               | 带宽 bound  |
@@ -203,24 +198,27 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 **这就是 fusion 设计的根源**：独立的 RMSNorm kernel 做 ~4·M·D 字节 HBM
 流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
 （`NormMLPReluSquare`、`NormQKVProjection`），让归一化的中间值留在
-register 里，**省下 2·M·D 的 HBM round-trip**——带宽 bound 的 op 上**纯
-赚**，没副作用。`fused_add_norm` 在 block 边界也是一样的道理。
+register 里，**省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入
+再读）——带宽 bound 的 op 上**纯赚**，没副作用。`fused_add_norm` 在
+block 边界也是一样的道理。
 
 **SDPA：为什么 Flash Attention 存在。** 同样的 AI 视角下，SDPA 有
 **两个** AI 数字，取决于 `(L, L)` 的 P 矩阵是否物化到 HBM。
 
-nanchat d24 (B=1, H=12, L=2048, D_head=128) 完整 attention
-(Q@K^T + softmax + @V，两步合计)：
+nanchat d24 (B=1, H=12, L=2048, D_head=128) forward attention
+（两个 matmul：`Q@K^T` 和 `attn@V`，加 softmax）：
 
 | 实现                                    | 总 FLOPs | 总 Bytes | AI                |
 | --------------------------------------- | -------- | -------- | ----------------- |
 | Naive SDPA（物化 P 到 HBM）             | 25.8 G   | ~226 MB  | **~114 FLOPs/byte** (偏带宽)  |
 | Flash SDPA（P 留 register）             | 25.8 G   | ~25 MB   | **~1024 FLOPs/byte** (算力 bound) |
 
-P 矩阵在这个 scale 下是 `B·H·L·L = 100 MB`，naive 字节数被它主导。
-Flash 用 online softmax + tile streaming 让 P 留 register，HBM 流量
-缩到只剩 `Q + K + V + O` (~25 MB)，把 SDPA 从带宽 bound (~114 < 152
-break-even) **翻成算力 bound** (~1024 >> break-even)。
+字节拆解：这个 scale 下 `Q + K + V + O ≈ 25 MB`（4 个 `B·H·L·D =
+12·2048·128` bf16 tensor）。P 矩阵是 `B·H·L·L = 100 MB`，naive SDPA
+**写 P 然后再从 HBM 读回**（~200 MB），所以 naive 合计 ~225 MB，而
+Flash 只 ~25 MB。Flash 用 online softmax + tile streaming 让 P 留
+register，把 SDPA 从带宽 bound (~114 < 152 break-even) **翻成算力
+bound** (~1024 >> break-even)。
 
 Flash Attention 比 naive SDPA 快 2-4× 的根源——bytes 少 ~9×，FLOPs 也
 有变化但幅度小：
@@ -240,13 +238,13 @@ naive 的比值不变。
 **完全不同的两套硬件单元**，做不同工作。理解切分方式决定你怎么算 kernel
 吞吐。
 
-| 单元              | 每 SM | 每周期做啥                                | 每 SM 总吞吐                |
-| ----------------- | ----- | ----------------------------------------- | --------------------------- |
-| **FP32 cores**    | 128   | 1 个 scalar fp32 multiply-add             | 256 fp32 FMA/cycle          |
-| **Tensor cores**  | 4     | 1 个小矩阵 `mma`（如 16×16×16 bf16）—— 一条指令 256 个 multiply-add | **1024 bf16 FMA/cycle**     |
+| 单元              | 每 SM | 每周期做啥（持续吞吐）                       | 每 SM 总吞吐                |
+| ----------------- | ----- | -------------------------------------------- | --------------------------- |
+| **FP32 cores**    | 128   | 每核 1 FMA/cycle = 2 FLOPs/cycle             | **256 FP32 FLOPs/cycle**    |
+| **Tensor cores**  | 4     | 每核持续 256 BF16 FLOPs/cycle（一条 16×16×16 MMA 摊销 ~32 周期） | **1024 BF16 FLOPs/cycle**   |
 
-**4 个 Tensor cores 的 bf16 算力大约是 128 FP32 cores 的 fp32 算力的 4×**。
-切 bf16/fp16 + 用 `tl.dot` 才能解锁那 4×。
+**4 个 Tensor cores 的 bf16 算力是 128 FP32 cores 的 fp32 算力的 4×**
+（1024 / 256）。切 bf16/fp16 + 用 `tl.dot` 才能解锁那 4×。
 
 **为什么每 SM 只有 4 个 Tensor cores：**
 
@@ -255,9 +253,10 @@ naive 的比值不变。
 2. **调度上 perfect 1:1**。Ampere SM 有 **4 个 warp scheduler**；
    每周期每个 scheduler 发 1 条 `mma.sync` 给 1 个 Tensor core。
    4 schedulers × 4 Tensor cores 完美对应——加第 5 个也没人发指令给它。
-3. **数据带宽喂不饱更多**。每个 Tensor core 一条指令吃 (16, 16) tile 的
-   fp16 = 512 B。4 个一起 ~2 KB/cycle 出 shared memory——已经接近
-   shared memory port 带宽上限。
+3. **数据带宽喂不饱更多**。peak 下（每 SM 1024 BF16 FLOPs/cycle = 512
+   multiply-adds/cycle），即便算上 register 里 tile 复用，4 个 Tensor
+   core 一起仍要从 shared memory 拉 ~1 KB/cycle 量级的 operand 数据
+   ——已经吃掉每 SM SMEM port 带宽的不小一块。
 
 ### Warps、warp schedulers 和 cores 的关系
 
@@ -333,10 +332,15 @@ naive 的比值不变。
   distributed shared memory、`wgmma` warp specialization）在 Ampere 上
   用不了。我们的 Flash SDPA 是**经典 Triton 教程版**，不是 FA3 版。
 
-- **Tensor cores 决定 FLOP/s 上限**。**不**用 `tl.dot` 的 op（普通
-  elementwise）跑在 FP32 cores 上，只有 peak FLOP/s 的 ~1/10。所以
-  能 fuse 进 `tl.dot` epilogue 把 elementwise launch 消化掉的，**几乎
-  总是值得做**。
+- **把 elementwise fuse 进 `tl.dot` epilogue**。独立 elementwise
+  kernel 是 **带宽 bound**（见上面 AI 表里 RMSNorm / add / relu，全都
+  ≪ 152 break-even）——真正的开销是 HBM round-trip + kernel launch
+  overhead，**不是 FLOPs**。`tl.dot` 主导的 kernel 里 FP32 cores 本来就
+  闲着（即便单独跑 elementwise，也只有 BF16 Tensor peak 的 ~1/4，
+  35.6 / 142 TFLOPS），所以把 elementwise 折进 matmul epilogue 是**白
+  捡的 side-channel**：省掉 elementwise 自己的 HBM round-trip
+  （matmul 的 HBM 开销不变）、不多一次 launch、也不抢 Tensor core 的
+  FLOP/s。
 
 ---
 
