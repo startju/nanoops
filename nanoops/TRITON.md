@@ -469,49 +469,60 @@ Patterns to notice:
   the fp32 compute pipeline downstream of the store keeps using
   `summed_f32` in registers without re-loading.
 
-### 2.2 Backward path: why 2 kernels
+### 2.2 Backward path: register budget chooses the kernel
 
-The naïve choice would be one bwd kernel mirroring the fwd's 1D grid.
-That doesn't work because of register pressure:
+There are two viable backward kernel shapes. Which one runs depends
+on whether the **inline** kernel's per-program tile fits the Ampere
+255 fp32 reg/thread spill cap. The dispatch lives in
+`FusedAddNorm.backward` and is driven by `TileConfig.fits_reg_budget`.
 
-A 1D-over-M bwd kernel would need every program to hold a full
-`(BLOCK_M, D)` tile of *each* of: `summed`, `dy`, `y_norm`, `g_eff`,
-`dx`, plus a per-channel `dnw` accumulator. Plugging in the actual
-config (`BLOCK_M=32`, `num_warps=4` → 128 threads/program) at
-`D=1536`:
+#### The simple thing first: one kernel, full row per program
+
+The primary path is `_fused_add_norm_bwd_inline_kernel`: a 1D grid
+over M with `BLOCK_D = next_pow_of_2(D)` so the **full row** lives in
+one tile. The per-row reduction `inner[m] = mean_d(g_eff · y_norm)`
+is then computed in registers — no precompute kernel, no inner HBM
+buffer, one kernel launch.
+
+This works because at typical nanchat shapes the tile is small:
 
 ```
-   5 tiles  ×  BLOCK_M=32  ×  D=1536   ≈  245K fp32 elements / program
-   245K elements  /  128 threads       ≈  1900 fp32 regs / thread
+   ~5 fp32 tiles  ×  BLOCK_M  ×  BLOCK_D   /   (num_warps × 32)
+                                                    ≤ 255 regs/thread
 ```
 
-— **1900 regs/thread vs the 255 hard cap → catastrophic spill** to
-local memory.
+`_pick_tile_config(M, BLOCK_D, n_live_tiles=5)` solves for the largest
+BLOCK_M that fits. At `D=1536` it picks `BLOCK_M=4, num_warps=8` →
+160 regs/thread. At `D=4096` it picks `BLOCK_M=1, num_warps=4` →
+also 160 regs/thread. Comfortably under the cap.
 
-The fix: **split the bwd grid along D too**. Each program now only
-handles a `(BLOCK_M, BLOCK_D)` output tile of `dx` (current config:
-`BLOCK_M=32, BLOCK_D=64`). Per-program tile shrinks from
-`32 × 1536 ≈ 49K` per-tensor down to `32 × 64 = 2K`, total
-~245K → ~10K elements → ~80 regs/thread on 128 threads — fits
-comfortably.
+#### The bigger gun: 2-kernel D-split fallback
+
+The inline path breaks once `BLOCK_D` is large enough that even
+`BLOCK_M=1, num_warps=16` (the cap) overflows. With 5 live tiles
+that crossover sits around `BLOCK_D > 16384` (i.e. `D > 16K` with
+HAS_NW=True) — model estimates ≥320 regs/thread, bench confirms
+~10× slowdown from local-memory spill.
+
+For those cases the dispatch falls back to a 2-kernel pair that
+**splits along D**, dropping the per-program tile back to manageable
+size. The same shape choice (`BLOCK_M=32, BLOCK_D=64`) that would
+spill at full-D works here because each program only owns a 64-column
+slice instead of the full 1536+ row:
+
+```
+   5 tiles × 32 × 64  ≈  10K fp32 / program
+   10K  /  128 threads ≈ 80 regs/thread       ← fits
+```
 
 But splitting along D introduces a new problem. The per-row reduction
-needed for the math —
+`inner[m] = mean_d(g_eff · y_norm)` spans the *whole* D axis — every
+d_tile program touching the same m_tile would need this same scalar.
+Naïvely each program would loop over all D in pass 1 to compute its
+own copy: at `D=1536, BLOCK_D=64` that's a 24× redundant computation.
 
-```
-inner[m] = mean_d(g_eff[m, *] · y_norm[m, *])
-```
-
-— spans the *whole* D axis. Every program working on the same `m_tile`
-would need this same scalar. The straightforward solution is for each
-program to loop over all D in pass 1 to compute its own copy of
-`inner[m]`. At `D=1536, BLOCK_D=64` that's a 24× redundant computation.
-
-L2 cache absorbs most of the *bytes* (neighboring d_tile programs
-share the same `summed` / `dy` rows, ~96 KB per m_tile, fits in 3090's
-6 MB L2), so the wall-time cost isn't 24×, but the FLOPs ARE wasted.
-Following Flash Attention's pre-compute-reduction pattern, we split
-the work into two kernels:
+Following Flash Attention's pre-compute-reduction pattern, the
+fallback is two kernels:
 
 **Stage 1 — `_fused_add_norm_inner_kernel`** (1D over M, one
 program per `BLOCK_M` rows, processes full D in one tile)
@@ -527,10 +538,29 @@ inner_m = tl.load(inner_ptr + rows)              # single scalar per row, prebui
 dx[m, d] = rms_inv[m] * (g_eff[m, d] - y_norm[m, d] * inner_m[m]) + d_ext[m, d]
 ```
 
-The bwd kernel's pass 1 (which used to loop over all D) collapses to
-a single scalar load per row. Same total HBM traffic as the
-single-kernel version (we read `summed`/`dy` once in inner, once in
-bwd), but no more redundant per-row reduction in compute.
+Pass 1 in stage 2 collapses from a full-D loop to a single scalar
+load per row. Same total HBM traffic as if we'd done it all in one
+kernel (we read `summed`/`dy` once in inner, once in stage 2), but
+no redundant per-row reduction.
+
+#### Why "1D over M with BLOCK_M=32" doesn't work
+
+A natural-sounding middle ground is "skip the D split, just shrink
+BLOCK_M". This *fails* for the BLOCK_M=32 case the early prototype
+used — at `D=1536`, `BLOCK_M=32`, `num_warps=4` (128 threads):
+
+```
+   5 tiles × BLOCK_M=32 × D=1536  ≈  245K fp32 / program
+   245K / 128 threads             ≈  1900 fp32 regs/thread
+```
+
+**1900 vs 255 cap → catastrophic spill.** The inline path makes this
+work by *shrinking BLOCK_M instead of D* — register budget says
+`BLOCK_M ≤ 768·nw / BLOCK_D`, so at D=1536 it auto-drops BLOCK_M to 4
+(or 1 at D=4096) and stays comfortably under the cap. Same key idea
+as the D-split fallback (cut whichever dimension keeps the tile in
+registers), just applied to the M axis where each row is independent
+and there's no cross-row reduction to worry about.
 
 ### 2.3 d_summed_external is fused into the bwd kernel
 

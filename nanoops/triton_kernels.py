@@ -60,16 +60,20 @@ NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"
 # summed = x + residual (which the next block needs anyway and the
 # backward kernel also consumes).
 #
-# Backward: split into two Triton kernels (Flash-Attention style
-# pre-computed reduction), since a single 1D-over-M bwd kernel would
-# spill registers on full-D tiles:
-#   1. _fused_add_norm_inner_kernel — 1D grid over M, computes the
-#      per-row reduction inner[m] = mean_d(g_eff * y_norm) once
-#   2. _fused_add_norm_bwd_kernel — 2D grid over (M, D), reads the
-#      pre-computed inner, writes d_summed and per-m-tile dnw_partial.
-#      d_summed_external (the caller's gradient w.r.t. summed used as
-#      a downstream residual) is folded in via a kernel-level add at
-#      the dx store, saving an extra Python + op.
+# Backward: two paths, dispatched in FusedAddNorm.backward based on
+# whether the inline kernel's per-program tile fits in the 255 fp32
+# reg/thread cap (checked via TileConfig.fits_reg_budget):
+#   Primary — _fused_add_norm_bwd_inline_kernel: single-pass, full
+#     row in one tile, inner reduction computed in registers. Used
+#     whenever it fits (covers all nanchat shapes). Wins 1.5–2.4× over
+#     the 2-kernel path on common D.
+#   Fallback — _fused_add_norm_inner_kernel + _fused_add_norm_bwd_kernel:
+#     Flash-Attention style 2-pass (pre-compute inner[m], then 2D-tile
+#     grid over (M, D) for d_summed + dnw_partial). Engages when inline
+#     would spill (HAS_NW=True at D ≥ 24K).
+#   Both paths fold d_summed_external (caller's direct gradient w.r.t.
+#   summed) into the kernel's d_summed store, saving an extra Python
+#   `+` op + its HBM round-trip.
 #
 # Cheap, useful at the seam between attn-block output and mlp-block
 # norm-input. See FusedAddNorm class docstring + TRITON.md Chapter 2.
@@ -496,9 +500,17 @@ class FusedAddNorm(torch.autograd.Function):
     Forward: one Triton kernel does add + RMSNorm + writes y and summed
     (no separate y_norm tensor — it stays in registers during fwd).
 
-    Backward uses `_fused_add_norm_bwd_kernel`, which loads summed
-    and reconstructs y_norm = summed * rms_inv on the fly. The extra
-    multiply runs on otherwise-idle FP32 cores (bwd is bandwidth-bound),
+    Backward dispatches between two kernel paths based on whether the
+    inline kernel's per-program tile fits the 255-reg/thread cap (see
+    `TileConfig.fits_reg_budget`):
+      Primary: `_fused_add_norm_bwd_inline_kernel` — single-pass, full
+        row in one tile, inner reduction in registers, no precompute
+        kernel. Wins 1.5–2.4× kernel-only at typical nanchat shapes.
+      Fallback: `_fused_add_norm_inner_kernel` + `_fused_add_norm_bwd_kernel`
+        — 2-kernel D-split path used when inline would spill (HAS_NW=True
+        at D ≥ 24K).
+    Both reconstruct y_norm = summed * rms_inv on the fly (the extra
+    multiply runs on otherwise-idle FP32 cores; bwd is bandwidth-bound),
     so the net win is saving the 2·M·D fwd HBM write of y_norm. summed
     is saved anyway for the caller's residual stream.
 
