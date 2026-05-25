@@ -849,6 +849,9 @@ if _HAS_TRITON:
         z_ptr,         # (M, N) bf16 — saved from fwd
         proj_w_ptr,    # (K_out, N) bf16 — W_proj
         dz_ptr,        # (M, N) bf16 — output (gradient w.r.t. z)
+        inner_buf_ptr, # (M,) fp32 — side-output: sum_n(dz·z) for downstream
+                       #             RMSNorm bwd (= K·inner). Caller MUST
+                       #             zero-init before launch (atomic_add).
         M, N, K_out,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -898,6 +901,14 @@ if _HAS_TRITON:
             dz.to(dz_ptr.dtype.element_ty),
             mask=row_mask[:, None] & n_mask[None, :],
         )
+
+        # Side-output: contribute partial inner = sum_n(dz · z) to inner_buf
+        # via atomic_add. Used downstream by the RMSNorm bwd kernel via the
+        # identity inner[m] = sum_n(dz · z) / K = sum_k(dx_hat · x_hat) / K
+        # — avoids needing dx_hat materialized for the inner reduction.
+        # dz and z are both already in registers, so this is ~free compute.
+        inner_partial = tl.sum(dz * z, axis=1)  # (BLOCK_M,) fp32
+        tl.atomic_add(inner_buf_ptr + rows, inner_partial, mask=row_mask)
 
     # dW_proj bwd matmul fused with on-the-fly r = relu²(z).
     # Pair with `_relu_sq_linear_residual_bwd_kernel` (dz output) to
@@ -964,6 +975,154 @@ if _HAS_TRITON:
             mask=k_out_mask[:, None] & n_mask[None, :],
         )
 
+    # Fused dW_fc with on-the-fly x_hat recompute. Replaces the eager
+    # chain `x_hat = (summed * rms_inv * nw); dW_fc = dz.T @ x_hat` —
+    # x_hat is reconstructed from (summed, rms_inv, nw) inside the GEMM
+    # inner loop, never materialized to HBM. Saves M·K HBM write + read
+    # plus one launch vs the cuBLAS chain.
+    # Config locked to d24 autotune winner (BM=64 BN=64 BK=128, warps=4,
+    # stages=2) — preserves CUDA Graph compatibility. Other shapes prefer
+    # BN=128 BK=64, within 2% on 3090.
+    @triton.jit
+    def _dW_fc_with_x_hat_recompute_kernel(
+        dz_ptr,      # (M, N_fc) bf16
+        summed_ptr,  # (M, K) bf16
+        rms_inv_ptr, # (M,) fp32
+        nw_ptr,      # (K,) bf16
+        dW_fc_ptr,   # (N_fc, K) bf16 — output
+        M, N_fc, K,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        IEEE_PRECISION: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        ns = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        ks = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        n_mask = ns < N_fc
+        k_mask = ks < K
+
+        nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+
+        acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+        for m_start in range(0, M, BLOCK_M):
+            ms = m_start + tl.arange(0, BLOCK_M)
+            m_mask = ms < M
+
+            # Reconstruct x_hat tile (BLOCK_M, BLOCK_K) in registers.
+            summed = tl.load(
+                summed_ptr + ms[:, None] * K + ks[None, :],
+                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            rms_inv = tl.load(rms_inv_ptr + ms, mask=m_mask, other=0.0).to(tl.float32)
+            x_hat = summed * rms_inv[:, None] * nw[None, :]
+
+            # dz tile (BLOCK_M, BLOCK_N)
+            dz_tile = tl.load(
+                dz_ptr + ms[:, None] * N_fc + ns[None, :],
+                mask=m_mask[:, None] & n_mask[None, :], other=0.0,
+            )
+
+            # dW_fc[n, k] += sum_m(dz[m, n] * x_hat[m, k])
+            # => acc[n, k] += dz.T[n, m] @ x_hat[m, k]
+            if IEEE_PRECISION:
+                acc += tl.dot(tl.trans(dz_tile).to(tl.float32), x_hat,
+                              input_precision="ieee")
+            else:
+                acc += tl.dot(tl.trans(dz_tile), x_hat.to(dz_tile.dtype))
+
+        tl.store(
+            dW_fc_ptr + ns[:, None] * K + ks[None, :],
+            acc.to(dW_fc_ptr.dtype.element_ty),
+            mask=n_mask[:, None] & k_mask[None, :],
+        )
+
+
+    # Fused (c_fc bwd dx_hat) + (RMSNorm bwd) for FusedMLPBlock.
+    # Per (m_tile, k_tile): inner-loops over N_fc to compute dx_hat tile
+    # via dz @ W_fc, then immediately applies the dx formula inline —
+    # dx_hat never hits HBM. dW_fc uses x_hat (not dx_hat) so this fusion
+    # is loss-free for that branch.
+    #
+    # The pre-computed `inner[m] = sum_n(dz · z) / K` (side-output from
+    # Step A — uses the `sum_k(dx_hat · x_hat) = sum_n(dz · z)` identity)
+    # turns the dx formula into pure elementwise math, removing the
+    # per-row K-reduction that would otherwise force BLOCK_M=4 and kill
+    # tensor-core utilization.
+    #
+    # Math (per element):
+    #   y_norm   = summed · rms_inv
+    #   g_eff    = dx_hat · nw
+    #   d_summed = rms_inv · (g_eff - y_norm · inner) + d_summed_external
+    #   dnw_partial[m_tile, k] = Σ_{m∈m_tile} (dx_hat · y_norm)  [if HAS_NW]
+    @triton.jit
+    def _c_fc_rms_norm_bwd_fused_kernel(
+        dz_ptr,          # (M, N_fc) bf16
+        W_fc_ptr,        # (N_fc, K) bf16
+        summed_ptr,      # (M, K) bf16
+        rms_inv_ptr,     # (M,) fp32
+        nw_ptr,          # (K,) bf16
+        d_ext_ptr,       # (M, K) bf16 — d_summed_external (= dy passthrough)
+        inner_ptr,       # (M,) fp32 — pre-computed by Step A
+        d_summed_ptr,    # (M, K) bf16 — output
+        dnw_partial_ptr, # (num_m_tiles, K) bf16 — output (only used if HAS_NW)
+        M, N_fc, K,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        IEEE_PRECISION: tl.constexpr,
+        HAS_NW: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        ks = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        row_mask = rows < M
+        k_mask = ks < K
+
+        # Matmul: dx_hat_tile = dz @ W_fc[:, k_tile], reduce over N_fc.
+        dx_hat = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        for n_start in range(0, N_fc, BLOCK_N):
+            ns = n_start + tl.arange(0, BLOCK_N)
+            n_mask = ns < N_fc
+            dz_tile = tl.load(
+                dz_ptr + rows[:, None] * N_fc + ns[None, :],
+                mask=row_mask[:, None] & n_mask[None, :], other=0.0,
+            )
+            W_fc_tile = tl.load(
+                W_fc_ptr + ns[:, None] * K + ks[None, :],
+                mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+            )
+            if IEEE_PRECISION:
+                dx_hat += tl.dot(dz_tile.to(tl.float32), W_fc_tile.to(tl.float32),
+                                 input_precision="ieee")
+            else:
+                dx_hat += tl.dot(dz_tile, W_fc_tile)
+
+        # Apply RMSNorm bwd inline using pre-computed inner.
+        offs = rows[:, None] * K + ks[None, :]
+        mask_2d = row_mask[:, None] & k_mask[None, :]
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        inner = tl.load(inner_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+        summed = tl.load(summed_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        y_norm = summed * rms_inv[:, None]
+        g_eff = dx_hat * nw[None, :]
+        d_summed = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
+
+        tl.store(d_summed_ptr + offs,
+                 d_summed.to(d_summed_ptr.dtype.element_ty), mask=mask_2d)
+
+        # dnw_partial per (m_tile, k_tile) — only when norm_w needs grad.
+        if HAS_NW:
+            dnw_partial = tl.sum(dx_hat * y_norm, axis=0)
+            tl.store(dnw_partial_ptr + pid_m * K + ks,
+                     dnw_partial.to(dnw_partial_ptr.dtype.element_ty), mask=k_mask)
+
 
 class FusedMLPBlock(torch.autograd.Function):
     """Full MLP sub-block + residual add, including the pre-norm step:
@@ -980,27 +1139,33 @@ class FusedMLPBlock(torch.autograd.Function):
     residual passthrough for the post-MLP add.
 
     Mixed-implementation strategy:
-      Forward (4 steps):
+      Forward (3 steps):
         0. `_fused_add_norm_fwd_kernel`: x + residual_in → summed,
            norm(summed)·norm_weight → x_hat, save rms_inv.
         1. cuBLAS: z = x_hat @ W_fc.T.
         2. `_relu_sq_linear_residual_fwd_kernel`: relu² + c_proj +
            residual_add(summed) → y in one Triton pass.
 
-      Backward (5 steps):
+      Backward (4 Triton kernels, no cuBLAS):
         A. `_relu_sq_linear_residual_bwd_kernel`: dr matmul + relu² bwd
-           → dz (fused).
-        B. `_dW_proj_with_relu_sq_kernel`: dW_proj with on-the-fly r
-           recomputation (fused).
-        C. cuBLAS: dx_hat = dz @ W_fc ; dW_fc = dz.T @ x_hat.
-        D. `_fused_add_norm_bwd_inline_kernel`: takes dx_hat (from C)
-           + dy (= d_summed_external for the final residual add) and
-           does the RMSNorm bwd → d_summed. Both d_x and d_residual_in
-           equal d_summed (sum's grad is identity on both inputs).
+           → dz. Side-output: `inner_buf[m] = Σ_n(dz · z)` via atomic_add,
+           free (dz and z already in registers). Used by C+D to skip its
+           own K-reduction via the `Σ_k(dx_hat · x_hat) = Σ_n(dz · z)`
+           identity.
+        B. `_dW_proj_with_relu_sq_kernel`: dW_proj = dy.T @ relu²(z),
+           with r = relu²(z) recomputed inline.
+        C. `_dW_fc_with_x_hat_recompute_kernel`: dW_fc = dz.T @ x_hat,
+           with x_hat reconstructed from (summed, rms_inv, norm_w)
+           inside the GEMM inner loop (no x_hat materialization).
+        D. `_c_fc_rms_norm_bwd_fused_kernel`: dx_hat = dz @ W_fc fused
+           with the RMSNorm bwd dx formula and dnw_partial — dx_hat
+           never hits HBM, dx is pure elementwise thanks to inner_buf
+           from A.
 
-    ctx saves (x, residual_in, norm_weight, fc_weight, proj_weight,
-    summed, rms_inv, z) — x_hat recomputed in bwd as x_hat = summed *
-    rms_inv * norm_weight (cheap elementwise, saves the 6 MB ctx slot)."""
+    ctx saves (norm_weight, fc_weight, proj_weight, summed, rms_inv, z).
+    x_hat is recomputed in bwd from (summed, rms_inv, norm_weight); x
+    and residual_in are not saved (summed = x + residual_in carries
+    everything bwd needs from them — same shape/dtype/device)."""
 
     @staticmethod
     def forward(ctx, x, residual_in, norm_weight, fc_weight, proj_weight, eps=1e-6):
@@ -1050,8 +1215,11 @@ class FusedMLPBlock(torch.autograd.Function):
             num_warps=4, num_stages=3,
         )
 
+        # x and residual_in are NOT saved — `summed` (= x + residual_in)
+        # has the same shape/dtype/device and that's all bwd needs from
+        # them (residual_in is never read; x only for empty_like/device).
         ctx.save_for_backward(
-            x, residual_in, norm_weight, fc_weight, proj_weight, summed, rms_inv, z,
+            norm_weight, fc_weight, proj_weight, summed, rms_inv, z,
         )
         ctx.M, ctx.N_fc, ctx.K = M, N_fc, K
         ctx.K_out = K_proj_out
@@ -1059,25 +1227,28 @@ class FusedMLPBlock(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
-        (x, residual_in, norm_w, W_fc, W_proj, summed, rms_inv, z) = ctx.saved_tensors
+        (norm_w, W_fc, W_proj, summed, rms_inv, z) = ctx.saved_tensors
         M, N_fc, K = ctx.M, ctx.N_fc, ctx.K
         K_out = ctx.K_out
         dy = dy.contiguous()
-        ieee = (x.dtype == torch.float32)
+        ieee = (summed.dtype == torch.float32)
 
-        # Step A: Triton fused matmul + relu² bwd → dz.
+        # A: dz = (dy @ W_proj) ⊙ 2·relu(z). Side-output: inner_buf[m] =
+        # Σ_n(dz · z) via atomic_add (free — dz and z are in registers).
+        # K·inner — caller divides by K downstream.
         BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 64, 128, 32
         dz = torch.empty_like(z)
+        inner_buf = torch.zeros((M,), dtype=torch.float32, device=z.device)
         grid = (triton.cdiv(M, BLOCK_M_A), triton.cdiv(N_fc, BLOCK_N_A))
         _relu_sq_linear_residual_bwd_kernel[grid](
-            dy, z, W_proj, dz,
+            dy, z, W_proj, dz, inner_buf,
             M, N_fc, K_out,
             BLOCK_M=BLOCK_M_A, BLOCK_N=BLOCK_N_A, BLOCK_K_OUT=BLOCK_K_OUT_A,
             IEEE_PRECISION=ieee,
             num_warps=8, num_stages=3,
         )
 
-        # Step B: Triton fused dW_proj with on-the-fly r = relu²(z).
+        # B: dW_proj = dy.T @ relu²(z), r recomputed inline.
         BLOCK_K_OUT_B, BLOCK_N_B, BLOCK_M_B = 64, 128, 32
         dW_proj = torch.empty((K_out, N_fc), dtype=z.dtype, device=z.device)
         grid_b = (triton.cdiv(K_out, BLOCK_K_OUT_B), triton.cdiv(N_fc, BLOCK_N_B))
@@ -1089,34 +1260,45 @@ class FusedMLPBlock(torch.autograd.Function):
             num_warps=4, num_stages=3,
         )
 
-        # Step C: c_fc bwd via cuBLAS. Recompute x_hat (cheap elementwise)
-        # to avoid saving it through ctx. Promote to fp32 for the
-        # multiplications, cast back to dz's dtype for the cuBLAS matmul.
-        x_hat = (summed.float() * rms_inv.unsqueeze(-1) * norm_w.float()).to(summed.dtype)
-        dx_hat = dz @ W_fc  # (M, K)
-        dW_fc = dz.t() @ x_hat  # (N_fc, K)
+        # needs_input_grad order = forward signature.
+        has_nw = ctx.needs_input_grad[2]  # norm_weight
 
-        # Step D: bare-kernel call to `_fused_add_norm_bwd_inline_kernel`.
-        # Tried fusing Step C's matmul + Step D into one Triton kernel
-        # (`_c_fc_rms_norm_bwd_fused_kernel`, kept above for reference) —
-        # bench showed 5× slowdown on d24 because BLOCK_M=4 (forced by
-        # shared-mem fit for full-K dx_hat cache on 3090) drops below
-        # tl.dot's tensor-core minimum of 16, falling back to fp32 ALU.
-        BLOCK_D_BWD = triton.next_power_of_2(K)
-        cfg_bwd = _pick_tile_config(M, BLOCK_D_BWD, n_live_tiles=5)
-        num_m_tiles = triton.cdiv(M, cfg_bwd.block_m)
-        d_summed = torch.empty_like(x)
-        dnw_partials = torch.empty(
-            (num_m_tiles, K), dtype=norm_w.dtype, device=x.device,
+        # C: dW_fc = dz.T @ x_hat, x_hat reconstructed in registers from
+        # (summed, rms_inv, norm_w) — no x_hat HBM materialization.
+        BLOCK_M_W, BLOCK_N_W, BLOCK_K_W = 64, 64, 128
+        dW_fc = torch.empty((N_fc, K), dtype=W_fc.dtype, device=summed.device)
+        grid_w = (triton.cdiv(N_fc, BLOCK_N_W), triton.cdiv(K, BLOCK_K_W))
+        _dW_fc_with_x_hat_recompute_kernel[grid_w](
+            dz, summed, rms_inv, norm_w, dW_fc,
+            M, N_fc, K,
+            BLOCK_M=BLOCK_M_W, BLOCK_N=BLOCK_N_W, BLOCK_K=BLOCK_K_W,
+            IEEE_PRECISION=ieee,
+            num_warps=4, num_stages=2,
         )
-        _fused_add_norm_bwd_inline_kernel[(num_m_tiles,)](
-            summed, rms_inv, norm_w, dx_hat, dy,
+
+        # D: dx_hat = dz @ W_fc fused with RMSNorm bwd. dx_hat never
+        # leaves the kernel. Elementwise dx unlocked by A's inner_buf.
+        inner = inner_buf / K
+        BLOCK_M_CD, BLOCK_K_CD, BLOCK_N_CD = 64, 64, 64
+        num_m_tiles = triton.cdiv(M, BLOCK_M_CD)
+        d_summed = torch.empty_like(summed)
+        if has_nw:
+            dnw_partials = torch.empty(
+                (num_m_tiles, K), dtype=norm_w.dtype, device=summed.device,
+            )
+        else:
+            dnw_partials = torch.empty(1, dtype=norm_w.dtype, device=summed.device)
+        grid_cd = (num_m_tiles, triton.cdiv(K, BLOCK_K_CD))
+        _c_fc_rms_norm_bwd_fused_kernel[grid_cd](
+            dz, W_fc, summed, rms_inv, norm_w, dy, inner,
             d_summed, dnw_partials,
-            M, K,
-            BLOCK_M=cfg_bwd.block_m, BLOCK_D=BLOCK_D_BWD,
-            HAS_NW=True, num_warps=cfg_bwd.num_warps,
+            M, N_fc, K,
+            BLOCK_M=BLOCK_M_CD, BLOCK_K=BLOCK_K_CD, BLOCK_N=BLOCK_N_CD,
+            IEEE_PRECISION=ieee,
+            HAS_NW=has_nw,
+            num_warps=4, num_stages=3,
         )
-        dnw = dnw_partials.sum(dim=0)
+        dnw = dnw_partials.sum(dim=0) if has_nw else None
 
         # d_x = d_residual_in = d_summed; both inputs of the
         # `summed = x + residual_in` add receive the same gradient.
@@ -1135,12 +1317,11 @@ def fused_mlp_block(
         x_hat  = norm(summed) * norm_weight
         y      = summed + relu²(x_hat @ W_fc.T) @ W_proj.T
 
-    Matches a transformer block's mlp side end-to-end (vs the previous
-    API which took already-normalized x_hat). The pre-add+norm boundary
-    uses `_fused_add_norm_fwd_kernel` internally — for the typical
-    nanchat call pattern `x = x + mlp(norm(x))`, set residual_in=zeros
-    (or use the API where `x` is the attn output and `residual_in` is
-    the prev residual stream)."""
+    End-to-end equivalent of a transformer block's mlp side. For the
+    typical pattern `x = x + mlp(norm(x))`, pass `residual_in=zeros`;
+    for `x = attn_out + mlp(norm(attn_out + prev_residual))`, pass
+    `x=attn_out`, `residual_in=prev_residual`. See `FusedMLPBlock` for
+    the kernel breakdown and ctx contents."""
     return FusedMLPBlock.apply(x, residual_in, norm_weight, fc_weight, proj_weight, eps)
 
 
