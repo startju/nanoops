@@ -15,9 +15,6 @@ If triton isn't installed or the env var isn't set, callers fall back
 to the eager Python implementation in `functional.py`.
 
 Known WIP items (do not block on these during review):
-  - `_norm_mlp_block_fwd_kernel`: full two-matmul-fused MLP forward,
-    written but not yet wrapped in an autograd.Function. Dead code
-    until that wiring lands.
   - `value_gate`: kernel implements per-element gate (out shape
     (M, D_v)), but nanchat's ResFormer uses per-head gate (out shape
     (M, n_kv_head)) broadcast across head_dim. Math doesn't match
@@ -482,7 +479,7 @@ class FusedAddNorm(torch.autograd.Function):
     Triton fusion (elementwise add + RMSNorm). NOT wired into nanchat's
     hot path for an architectural reason, not a perf one: nanchat's
     production blocks fold the RMSNorm directly into the adjacent
-    matmul kernel (see NormMLPReluSquare on the mlp side,
+    matmul kernel (see FusedMLPBlock on the mlp side,
     NormQKVProjection on the attn side), so a standalone
     `add → norm` op boundary doesn't exist as a call site to optimize.
 
@@ -709,210 +706,77 @@ def fused_add_norm(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Fused RMSNorm + Linear + ReluSquare
+# Fused MLP block + residual — nanchat's mlp side, end-to-end:
+#     y = residual + relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T
 #
-# Forward math (per row m of input x ∈ ℝ^(M, K)):
+# Per row m, in math:
 #     y_norm[m, k] = x[m, k] * rsqrt(mean_k(x[m, k]²) + eps)
-#     x_hat[m, k] = y_norm[m, k] * norm_weight[k]                     (RMSNorm)
-#     z[m, n] = sum_k x_hat[m, k] * lin_weight[n, k]                  (Linear)
-#     y[m, n] = max(z[m, n], 0)² = relu(z)²                           (ReluSquare)
+#     x_hat[m, k]  = y_norm[m, k] * norm_weight[k]                    (RMSNorm)
+#     z[m, n]      = sum_k x_hat[m, k] * W_fc[n, k]                   (Linear: c_fc)
+#     r[m, n]      = max(z[m, n], 0)²                                 (ReluSquare)
+#     mlp[m, p]    = sum_n r[m, n] * W_proj[p, n]                     (Linear: c_proj)
+#     y[m, p]      = residual[m, p] + mlp[m, p]                       (Residual add)
 #
-# Forward fuses all three into one tiled (BLOCK_M × BLOCK_N) Triton
-# kernel: each tile streams K in BLOCK_K chunks, computing rms per row
-# in pass 1 and the matmul+relu² in pass 2. RMSNorm's per-row rsqrt
-# lives in registers across both passes.
+# Forward — split into 2 Triton matmul kernels (the two matmuls stay
+# separate; fusing them into one kernel was tried and lost catastrophically
+# to cuBLAS because the matmuls are compute-bound and the saved
+# intermediate buffer is small — see notes in TRITON.md §3):
+#   1. `_norm_linear_fwd_kernel`: RMSNorm + c_fc → writes z (pre-relu²).
+#      bf16 tensor-core matmul (BLOCK_M=BLOCK_N=32, BLOCK_K=64).
+#   2. `_relu_sq_linear_residual_fwd_kernel`: relu²(z) inline in
+#      registers, then c_proj matmul + residual add → writes y.
+#      bf16 tensor-core matmul (BLOCK_M=BLOCK_P=32, BLOCK_N=32).
+# This split beats the previous "Triton fp32-ALU norm+c_fc+relu² +
+# cuBLAS addmm" path by ~3×, mostly by switching to bf16 tensor cores.
+# Still ~2.2× slower than pure native cuBLAS at d24 shape (Triton can't
+# match cuBLAS's L2-aware scheduling + hand-tuned per-shape kernels).
 #
-# Backward saves (x, rms_inv, x_hat, z) in ctx and uses:
-#   - a small Triton kernel for the relu²-backward ⊙ elementwise step
-#     (dz = 2 * relu(z) * dy)
-#   - torch.matmul (cuBLAS) for the linear backward (dW = dz^T @ x_hat,
-#     dx_hat = dz @ W) — cuBLAS already wins at big matmuls
-#   - a Triton kernel for the RMSNorm backward + dnw reduction
-#     (computes dx, dnw together with one K-pass per row)
+# ctx saves (x, norm_w, W_fc, W_proj, z, rms_inv). r and x_hat are
+# recomputed in backward (r = relu(z)², x_hat = x * rms_inv * norm_w)
+# to save M·N_fc + M·K floats of saved state.
+#
+# Backward (4 steps, in order — kept on cuBLAS for the matmul bwds
+# since cuBLAS wins at those):
+#   A. cuBLAS: c_proj bwd → dr = dy @ W_proj ;  dW_proj = dy.T @ r
+#   B. Triton (_relu_square_bwd_kernel): elementwise dz = 2·relu(z)·dr
+#   C. cuBLAS: c_fc bwd  → dx_hat = dz @ W_fc ;  dW_fc = dz.T @ x_hat
+#   D. Triton (_rms_norm_bwd_kernel): 2D grid (M_tile × K_tile),
+#      writes dx and per-m-tile dnw_partials in one pass; caller
+#      reduces dnw_partials.sum(dim=0) → dnw
+#   d_residual = dy passes through (residual add is identity in bwd).
 # ─────────────────────────────────────────────────────────────────────
 
 
 if _HAS_TRITON:
 
     @triton.jit
-    def _norm_mlp_block_fwd_kernel(
+    def _norm_linear_fwd_kernel(
         x_ptr,
         norm_w_ptr,
         fc_w_ptr,
-        proj_w_ptr,
-        residual_ptr,
-        y_ptr,
-        z_ptr,
-        rms_inv_ptr,
-        M,
-        N_fc,
-        K,
-        K_out,
-        eps,
-        stride_xm,
-        stride_xk,
-        stride_fc_n,
-        stride_fc_k,
-        stride_proj_p,
-        stride_proj_n,
-        stride_res_m,
-        stride_res_p,
-        stride_ym,
-        stride_yp,
-        stride_zm,
-        stride_zn,
-        BLOCK_M: tl.constexpr,
-        BLOCK_K_OUT: tl.constexpr,  # tile size along the output (= K_out) dim of c_proj
-        BLOCK_N: tl.constexpr,  # tile size along the c_fc output / c_proj input dim
-        BLOCK_K: tl.constexpr,  # tile size along input K dim (for RMSNorm + c_fc matmul)
-    ):
-        """Fully fused MLP block + residual:
-            y = residual + relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T
-
-        Each program computes one (BLOCK_M, BLOCK_K_OUT) tile of y.
-        Streams the N_fc dim (c_fc output / c_proj input) in BLOCK_N
-        chunks: per chunk we recompute the (BLOCK_M, BLOCK_N) slab of
-        r = relu(x_hat @ W_fc[N_chunk].T)², then accumulate
-        r @ W_proj[K_out_tile, N_chunk].T into the output. The r slab
-        lives only in registers — never written to HBM.
-
-        This is the "two-matmul fused" pattern (analogous to attention's
-        Q@K^T → softmax → @V). Saves the M*N_fc HBM round-trip the
-        non-fused version paid for materializing r.
-        """
-        pid_m = tl.program_id(0)
-        pid_p = tl.program_id(1)
-
-        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        out_cols = pid_p * BLOCK_K_OUT + tl.arange(0, BLOCK_K_OUT)
-        row_mask = rows < M
-        out_col_mask = out_cols < K_out
-
-        # Pass 1: per-row mean(x²) for the rows in this tile.
-        sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        for k_start in range(0, K, BLOCK_K):
-            ks = k_start + tl.arange(0, BLOCK_K)
-            k_mask = ks < K
-            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
-            x = tl.load(
-                x_ptrs,
-                mask=row_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            sum_sq += tl.sum(x * x, axis=1)
-        rms_inv = tl.rsqrt(sum_sq / K + eps)
-
-        # Only the p=0 tile writes rms_inv (it doesn't depend on p)
-        if pid_p == 0:
-            tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
-
-        # Output accumulator (BLOCK_M, BLOCK_K_OUT)
-        out_acc = tl.zeros((BLOCK_M, BLOCK_K_OUT), dtype=tl.float32)
-
-        # Outer loop over N_fc: compute r slab (BLOCK_M, BLOCK_N), then
-        # accumulate r_slab @ W_proj[out_cols, N_slab].T into out_acc.
-        for n_start in range(0, N_fc, BLOCK_N):
-            ns = n_start + tl.arange(0, BLOCK_N)
-            n_mask = ns < N_fc
-
-            # Inner: compute z_slab[BLOCK_M, BLOCK_N] = x_hat @ W_fc[ns, :].T
-            z_slab = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            for k_start in range(0, K, BLOCK_K):
-                ks = k_start + tl.arange(0, BLOCK_K)
-                k_mask = ks < K
-                x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
-                x = tl.load(
-                    x_ptrs,
-                    mask=row_mask[:, None] & k_mask[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
-                x_hat = x * rms_inv[:, None] * nw[None, :]
-                # W_fc shape (N_fc, K): row ns, col ks
-                fc_ptrs = (
-                    fc_w_ptr + ns[:, None] * stride_fc_n + ks[None, :] * stride_fc_k
-                )
-                fc_w = tl.load(
-                    fc_ptrs,
-                    mask=n_mask[:, None] & k_mask[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                z_slab += tl.dot(x_hat, tl.trans(fc_w), input_precision="ieee")
-
-            # relu² elementwise in registers
-            relu_z = tl.where(z_slab > 0.0, z_slab, 0.0)
-            r_slab = relu_z * relu_z  # (BLOCK_M, BLOCK_N) — never to HBM
-
-            # Optionally store z_slab to HBM for backward (we need z, not r,
-            # because z gives us the relu mask + sign info for relu²-bwd).
-            z_ptrs = z_ptr + rows[:, None] * stride_zm + ns[None, :] * stride_zn
-            tl.store(
-                z_ptrs,
-                z_slab.to(z_ptr.dtype.element_ty),
-                mask=row_mask[:, None] & n_mask[None, :],
-            )
-
-            # out_acc += r_slab @ W_proj[out_cols, ns].T
-            # W_proj shape (K_out, N_fc): row out_cols, col ns
-            proj_ptrs = (
-                proj_w_ptr
-                + out_cols[:, None] * stride_proj_p
-                + ns[None, :] * stride_proj_n
-            )
-            proj_w = tl.load(
-                proj_ptrs,
-                mask=out_col_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            out_acc += tl.dot(r_slab, tl.trans(proj_w), input_precision="ieee")
-
-        # Add residual and write y
-        res_ptrs = (
-            residual_ptr
-            + rows[:, None] * stride_res_m
-            + out_cols[None, :] * stride_res_p
-        )
-        residual = tl.load(
-            res_ptrs,
-            mask=row_mask[:, None] & out_col_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        y_final = residual + out_acc
-
-        y_ptrs = y_ptr + rows[:, None] * stride_ym + out_cols[None, :] * stride_yp
-        tl.store(
-            y_ptrs,
-            y_final.to(y_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & out_col_mask[None, :],
-        )
-
-    @triton.jit
-    def _norm_linear_relu_square_fwd_kernel(
-        x_ptr,
-        norm_w_ptr,
-        lin_w_ptr,
-        y_ptr,
         z_ptr,
         rms_inv_ptr,
         M,
         N,
         K,
         eps,
-        stride_xm,
-        stride_xk,
-        stride_wn,
-        stride_wk,
-        stride_ym,
-        stride_yn,
-        stride_zm,
-        stride_zn,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        IEEE_PRECISION: tl.constexpr,
     ):
-        """Forward kernel. Computes y = relu(norm(x) @ W^T)² for one (BLOCK_M, BLOCK_N)
-        tile, and saves z (= norm(x) @ W^T, pre-relu²) + rms_inv for backward.
-        """
+        """norm + c_fc. Writes z (= norm(x) @ W_fc.T) and rms_inv. relu² is
+        NOT applied here — pushed to the relu²+c_proj kernel to avoid
+        materializing r in HBM.
+
+        IEEE_PRECISION=False (bf16 path, default for nanchat): cast x_hat
+        and fc_w to bf16 for tl.dot → Ampere bf16 tensor cores (fast,
+        ~5e-3 rel error vs fp32 reference).
+
+        IEEE_PRECISION=True (fp32 path): keep operands in fp32 and pass
+        `input_precision="ieee"` to tl.dot, which disables Triton's
+        default TF32 downcast on Ampere. Slower (FP32 ALU, no tensor
+        cores) but matches PyTorch's `@` bit-tight for fp32 parity tests."""
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -921,68 +785,113 @@ if _HAS_TRITON:
         row_mask = rows < M
         col_mask = cols < N
 
-        # Pass 1: per-row mean(x²). Computed locally per m-tile; later
-        # cached in `rms_inv_ptr` so the backward doesn't re-derive it.
+        # Pass 1: per-row mean(x²) → rms_inv. Streamed in BLOCK_K chunks.
         sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
         for k_start in range(0, K, BLOCK_K):
             ks = k_start + tl.arange(0, BLOCK_K)
             k_mask = ks < K
-            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
-                x_ptrs,
+                x_ptr + rows[:, None] * K + ks[None, :],
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
             sum_sq += tl.sum(x * x, axis=1)
         rms_inv = tl.rsqrt(sum_sq / K + eps)
-
-        # Only the n=0 tile writes rms_inv (it doesn't depend on n) —
-        # avoid redundant writes by checking pid_n.
         if pid_n == 0:
             tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
-        # Pass 2: matmul x_hat @ W^T into fp32 accumulator, then relu².
+        # Pass 2: c_fc matmul. x_hat = x * rms_inv * norm_w in fp32, then
+        # the IEEE_PRECISION branch picks bf16 tensor cores vs fp32 ALU.
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k_start in range(0, K, BLOCK_K):
             ks = k_start + tl.arange(0, BLOCK_K)
             k_mask = ks < K
-            x_ptrs = x_ptr + rows[:, None] * stride_xm + ks[None, :] * stride_xk
             x = tl.load(
-                x_ptrs,
+                x_ptr + rows[:, None] * K + ks[None, :],
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
             nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
             x_hat = x * rms_inv[:, None] * nw[None, :]
-            w_ptrs = lin_w_ptr + cols[:, None] * stride_wn + ks[None, :] * stride_wk
-            w = tl.load(
-                w_ptrs,
+            fc_w = tl.load(
+                fc_w_ptr + cols[:, None] * K + ks[None, :],
                 mask=col_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            # input_precision="ieee" disables Triton's default TF32 downcast
-            # on Ampere. TF32 has only 10-bit mantissa, while PyTorch's `@`
-            # keeps full fp32 (under default torch.set_float32_matmul_precision
-            # = "highest") — without this flag, fp32 parity drifts by ~1%.
-            acc += tl.dot(x_hat, tl.trans(w), input_precision="ieee")
+            )
+            if IEEE_PRECISION:
+                acc += tl.dot(x_hat, tl.trans(fc_w.to(tl.float32)),
+                              input_precision="ieee")
+            else:
+                acc += tl.dot(x_hat.to(x_ptr.dtype.element_ty), tl.trans(fc_w))
 
-        # Save z (pre-relu²) for backward — backward reads it to compute
-        # 2 * relu(z) * dy. Storing in fp32 keeps the sign info exact.
-        z_ptrs = z_ptr + rows[:, None] * stride_zm + cols[None, :] * stride_zn
+        # Store z (pre-relu²) — consumed by both fwd kernel B and backward.
         tl.store(
-            z_ptrs,
+            z_ptr + rows[:, None] * N + cols[None, :],
             acc.to(z_ptr.dtype.element_ty),
             mask=row_mask[:, None] & col_mask[None, :],
         )
 
-        # Epilogue: y = relu(z)²
-        relu_z = tl.where(acc > 0.0, acc, 0.0)
-        y = relu_z * relu_z
-        y_ptrs = y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yn
+    @triton.jit
+    def _relu_sq_linear_residual_fwd_kernel(
+        z_ptr,
+        proj_w_ptr,
+        residual_ptr,
+        y_ptr,
+        M,
+        N,
+        K_out,
+        BLOCK_M: tl.constexpr,
+        BLOCK_P: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        IEEE_PRECISION: tl.constexpr,
+    ):
+        """relu² + c_proj + residual_add. Reads z (= pre-relu² from kernel A),
+        applies relu² in registers (no HBM round-trip on r), matmuls against
+        W_proj, adds residual, writes y.
+
+        IEEE_PRECISION flag works the same as in `_norm_linear_fwd_kernel`
+        — False = bf16 tensor cores, True = fp32 ALU for bit-tight parity."""
+        pid_m = tl.program_id(0)
+        pid_p = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        p_cols = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        row_mask = rows < M
+        p_col_mask = p_cols < K_out
+
+        # c_proj matmul, inner loop over N.
+        acc = tl.zeros((BLOCK_M, BLOCK_P), dtype=tl.float32)
+        for n_start in range(0, N, BLOCK_N):
+            n_cols = n_start + tl.arange(0, BLOCK_N)
+            n_mask = n_cols < N
+
+            z = tl.load(
+                z_ptr + rows[:, None] * N + n_cols[None, :],
+                mask=row_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            relu_z = tl.where(z > 0.0, z, 0.0)
+            r = relu_z * relu_z  # fp32
+            proj_w = tl.load(
+                proj_w_ptr + p_cols[:, None] * N + n_cols[None, :],
+                mask=p_col_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            )
+            if IEEE_PRECISION:
+                acc += tl.dot(r, tl.trans(proj_w.to(tl.float32)),
+                              input_precision="ieee")
+            else:
+                acc += tl.dot(r.to(z_ptr.dtype.element_ty), tl.trans(proj_w))
+
+        # Add residual, write y.
+        offs = rows[:, None] * K_out + p_cols[None, :]
+        mask_2d = row_mask[:, None] & p_col_mask[None, :]
+        residual = tl.load(residual_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        y = acc + residual
         tl.store(
-            y_ptrs,
+            y_ptr + offs,
             y.to(y_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & col_mask[None, :],
+            mask=mask_2d,
         )
 
     @triton.jit
@@ -1109,7 +1018,7 @@ if _HAS_TRITON:
         )
 
 
-class NormMLPReluSquare(torch.autograd.Function):
+class FusedMLPBlock(torch.autograd.Function):
     """Fused full MLP block + residual: y = residual + relu(RMSNorm(x) @ W_fc.T)² @ W_proj.T.
 
     Math (per row m):
@@ -1144,51 +1053,46 @@ class NormMLPReluSquare(torch.autograd.Function):
         K_proj_out, N_proj_in = proj_weight.shape
         assert K == K_w, f"x last dim {K} != fc_weight in dim {K_w}"
         assert N_fc == N_proj_in, f"fc out dim {N_fc} != proj in dim {N_proj_in}"
-
-        # Block sizes chosen to fit 3090's 100 KB shared memory per SM.
-        # Larger tiles = better arithmetic intensity but need room for
-        # x_hat (BLOCK_M×BLOCK_K) + w slab (BLOCK_N×BLOCK_K) + acc
-        # (BLOCK_M×BLOCK_N), all in fp32. 32×64×32 → ~16 KB total.
-        BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
-        # r will hold relu(z)² (the c_fc output post-activation). We
-        # materialize it because c_proj is done by torch.matmul.
-        r = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
-        z = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
-        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_fc, BLOCK_N))
-        _norm_linear_relu_square_fwd_kernel[grid](
-            x,
-            norm_weight,
-            fc_weight,
-            r,
-            z,
-            rms_inv,
-            M,
-            N_fc,
-            K,
-            eps,
-            x.stride(0),
-            x.stride(1),
-            fc_weight.stride(0),
-            fc_weight.stride(1),
-            r.stride(0),
-            r.stride(1),
-            z.stride(0),
-            z.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-        )
-
-        # Second linear + residual via fused addmm (cuBLAS): y = residual + r @ W_proj.T
-        # `addmm(input, mat1, mat2)` = input + mat1 @ mat2 in one cuBLAS call,
-        # writing directly into `y` without materializing the c_proj output as
-        # a separate HBM tensor. Saves ~M*K of HBM traffic vs `(r @ W_proj.T) + residual`.
         assert residual.shape == (M, K_proj_out), (
             f"residual must be ({M}, {K_proj_out}), got {residual.shape}"
         )
-        y = torch.addmm(residual, r, proj_weight.t())
+
+        # Full-MLP fusion v2: one Triton kernel does norm + c_fc + relu² +
+        # c_proj + residual_add. v2 fixes v1's re-stream catastrophe by
+        # caching x_hat in shared memory once per program, reusing it
+        # across the outer N loop. bf16 throughout matmul path to hit
+        # tensor cores.
+        # 2-kernel split: (1) norm + c_fc → z, (2) relu²(z) + c_proj + residual → y.
+        # No matmul fusion (two matmuls stay separate, each gets standard tile
+        # treatment). Saves M·N_fc bytes of HBM write vs the previous
+        # "Triton norm+c_fc+relu² + cuBLAS addmm" path which materialized
+        # both r and z. Loses cuBLAS-tuned c_proj matmul.
+        BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_P = 32, 32, 64, 32
+        # fp32 inputs → IEEE precision (fp32 ALU, no tensor cores) for
+        # bit-tight parity with PyTorch's `@`. bf16 inputs → bf16 tensor
+        # cores (fast). nanchat only ever runs in bf16; the IEEE path
+        # exists for the fp32 parity test in test_triton_norm_mlp.py.
+        ieee = (x.dtype == torch.float32)
+
+        z = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
+        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+        y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
+
+        grid_a = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_fc, BLOCK_N))
+        _norm_linear_fwd_kernel[grid_a](
+            x, norm_weight, fc_weight, z, rms_inv,
+            M, N_fc, K, eps,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            IEEE_PRECISION=ieee,
+        )
+
+        grid_b = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_P))
+        _relu_sq_linear_residual_fwd_kernel[grid_b](
+            z, proj_weight, residual, y,
+            M, N_fc, K_proj_out,
+            BLOCK_M=BLOCK_M, BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
+            IEEE_PRECISION=ieee,
+        )
 
         ctx.save_for_backward(x, norm_weight, fc_weight, proj_weight, z, rms_inv)
         ctx.M, ctx.N_fc, ctx.K = M, N_fc, K
@@ -1266,7 +1170,7 @@ class NormMLPReluSquare(torch.autograd.Function):
         return dx, dnw, dW_fc, dW_proj, d_residual, None
 
 
-def norm_mlp_relu_square(
+def fused_mlp_block(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
     fc_weight: torch.Tensor,
@@ -1285,9 +1189,9 @@ def norm_mlp_relu_square(
 
     In nanchat's Block.forward, this replaces both `mlp(norm(x))` AND
     the surrounding `x = x + ...` residual add in one call:
-        x = norm_mlp_relu_square(x, norm_w, W_fc, W_proj, residual=x)
+        x = fused_mlp_block(x, norm_w, W_fc, W_proj, residual=x)
     """
-    return NormMLPReluSquare.apply(
+    return FusedMLPBlock.apply(
         x, norm_weight, fc_weight, proj_weight, residual, eps
     )
 

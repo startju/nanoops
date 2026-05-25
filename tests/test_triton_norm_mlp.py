@@ -10,7 +10,7 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
-from nanoops.triton_kernels import norm_mlp_relu_square
+from nanoops.triton_kernels import fused_mlp_block
 
 
 def _reference(x, norm_w, W_fc, W_proj, residual, eps=1e-6):
@@ -45,7 +45,7 @@ def test_forward_parity(dtype, atol):
     residual = torch.randn(M, K, dtype=dtype, device="cuda")
 
     y_ref = _reference(x, norm_w, W_fc, W_proj, residual)
-    y_triton = norm_mlp_relu_square(x, norm_w, W_fc, W_proj, residual)
+    y_triton = fused_mlp_block(x, norm_w, W_fc, W_proj, residual)
     assert torch.allclose(y_ref, y_triton, atol=atol), \
         f"forward mismatch (max {(y_ref - y_triton).abs().max().item():.4f}, dtype={dtype})"
 
@@ -77,7 +77,7 @@ def test_backward_parity():
     Wfc2 = W_fc0.clone().requires_grad_(True)
     Wproj2 = W_proj0.clone().requires_grad_(True)
     res2 = res0.clone().requires_grad_(True)
-    y_triton = norm_mlp_relu_square(x2, nw2, Wfc2, Wproj2, res2)
+    y_triton = fused_mlp_block(x2, nw2, Wfc2, Wproj2, res2)
     y_triton.backward(g)
 
     # Backward goes through 4 matmuls + RMSNorm bwd reduction; the
