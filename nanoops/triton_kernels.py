@@ -753,24 +753,57 @@ def fused_add_norm(
 if _HAS_TRITON:
 
     # Autotune sweep for the (relu² + c_proj + residual_add) kernel.
-    # Configs hand-picked to cover common tile shapes for nanchat MLP
-    # shapes (M ∈ 1k-8k, N=4·K_out, K_out ∈ 768-4096). All combinations
-    # satisfy tl.dot's tensor-core minimum (M, N, K ≥ 16) and stay under
-    # 3090's 100 KB/SM shared-mem budget at num_stages=3.
-    # Triton autotune runs each config once per unique (M, N, K_out)
-    # tuple on first call, caches the winner thereafter.
+    # ~30 configs covering tile shapes 16-128 × num_warps {4,8} ×
+    # num_stages {2,3,4}. All combinations satisfy tl.dot's tensor-core
+    # minimum (all dims ≥ 16). Configs that exceed 100 KB/SM shared mem
+    # or 255 reg/thread get pruned by Triton on first compile.
+    # Autotune runs each config once per unique (M, N, K_out) tuple
+    # on first call and caches the winner — ~40-60 s sweep overhead
+    # per shape per process, then free for the rest of training.
     _RELU_SQ_LIN_RES_CONFIGS = [
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 32,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 64}, num_warps=8, num_stages=2),
+        # Small / skinny tiles
+        triton.Config({"BLOCK_M": 16,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 16,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 16,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+
+        # 32×32 sweet-spot for tiny shapes
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 128}, num_warps=4, num_stages=2),
+
+        # 32×64 / 64×32 — common for unbalanced M/P
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 32,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
+
+        # 64×64 — workhorse
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 128}, num_warps=8, num_stages=2),
+
+        # 64×128 / 128×64 — bigger reuse
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 64},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=2),
+
+        # 128×128 — big tiles, need warps=8 for accumulator reg fit
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 64},  num_warps=8, num_stages=2),
+
+        # Wide / tall skinny tiles for unbalanced shapes
+        triton.Config({"BLOCK_M": 256, "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 256, "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 256, "BLOCK_N": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 256, "BLOCK_N": 32},  num_warps=8, num_stages=2),
     ]
 
     @triton.autotune(configs=_RELU_SQ_LIN_RES_CONFIGS, key=["M", "N", "K_out"])
