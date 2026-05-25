@@ -366,13 +366,16 @@ API 返回两个张量：
 - `summed` → 下一个 block 的 residual stream（caller 不用再 recompute
   `x + residual`）
 
-整条 autograd 链路由 3 个 Triton kernel 撑起：
+整条 autograd 链路由 4 个 Triton kernel 撑起 —— fwd 1 个，bwd 主路径
+1 个 inline kernel，再加上 2 个 kernel 的 D-split fallback（在 inline
+会 spill 的大 D 上兜底）：
 
 | Kernel | Grid | 角色 |
 |---|---|---|
 | `_fused_add_norm_fwd_kernel` | 1D over M | fwd：写 `y` + `summed` + `rms_inv` |
-| `_fused_add_norm_inner_kernel` | 1D over M | bwd 阶段 1：预算 `inner[m]` |
-| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd 阶段 2：写 `d_summed` + `dnw_partial` |
+| `_fused_add_norm_bwd_inline_kernel` | 1D over M | bwd **主路径**：整行单 tile、inner reduction in-register、写 `d_summed`（+ `dnw_partial`） |
+| `_fused_add_norm_inner_kernel` | 1D over M | bwd fallback 阶段 1：预算 `inner[m]` |
+| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd fallback 阶段 2：写 `d_summed` + `dnw_partial` |
 
 ### 2.1 Forward kernel
 
@@ -447,17 +450,22 @@ register 里算——不需要 precompute kernel、不需要 inner HBM buffer、
                                                  ≤ 255 reg/thread
 ```
 
-`_pick_tile_config(M, BLOCK_D, n_live_tiles=5)` 求能装下的最大
-BLOCK_M。`D=1536` 时它选 `BLOCK_M=4, num_warps=8` → 160 reg/thread；
-`D=4096` 时选 `BLOCK_M=1, num_warps=4` → 也是 160 reg/thread，
-都离 255 cap 留足余量。
+`_pick_tile_config(M, BLOCK_D, n_live_tiles=N)` 求能装下的最大
+BLOCK_M。HAS_NW=True 时 N=5（`y_norm, g_eff, dy_t, d_ext, d_summed`
+峰值同时 alive），HAS_NW=False 时 N=4（`y_norm` 别名 `src`、`g_eff`
+别名 `dy_t`，少 2 个 distinct tile，但 `d_ext` 和 `d_summed` 还在，
+所以是 4 不是 3）。`D=1536, HAS_NW=True` 时选 `BLOCK_M=4, num_warps=8`
+→ 160 reg/thread；`D=4096, HAS_NW=True` 时选 `BLOCK_M=1, num_warps=4`
+→ 也是 160 reg/thread，都离 255 cap 留足余量。
 
 #### 大炮兜底：切 D 的 2-kernel fallback
 
 当 `BLOCK_D` 大到连 `BLOCK_M=1, num_warps=16`（封顶）都装不下，
-inline 路径就崩。5 tile 的情况下这个 crossover 在
-`BLOCK_D > 16384`（HAS_NW=True 时 D > 16K）——模型估算 ≥320
-reg/thread，bench 实测 ~10× spill 灾难数字。
+inline 路径就崩。crossover 取决于 n_live_tiles：
+- HAS_NW=True（5 tile）：`BLOCK_D > 16384`（即 D > 16K）——模型
+  估算 ≥320 reg/thread，bench 实测 ~10× spill 灾难数字。
+- HAS_NW=False（4 tile）：`BLOCK_D > 32768`（即 D > 32K）——任何
+  实际模型基本都触发不到（nanchat 哪怕 depth=128 也才 D=8192）。
 
 这种情况 dispatch 自动 fallback 到一对**切 D 维**的 kernel，把
 per-program tile 拉回安全范围。同样一组 `(BLOCK_M=32, BLOCK_D=64)`
@@ -661,8 +669,8 @@ HBM 时间，再加上避免的 ~10-30 μs launch overhead。
 
 bwd 有两条 kernel 路径（dispatch 见 §2.2）。常见情况是 **inline
 单 pass kernel**；**2-kernel D-split fallback** 只在 inline tile
-会超 255 reg/thread cap 时触发（HAS_NW=True at D ≥ 24K）。下面
-两条都算一遍。
+会超 255 reg/thread cap 时触发（HAS_NW=True at D > 16K；
+HAS_NW=False at D > 32K，实际不可能）。下面两条都算一遍。
 
 下面所有账本都按 `HAS_NW=False`（没 learnable affine weight，
 对齐 nanchat 实际配置——见 `nanchat/gpt.py:9`）算。HAS_NW=True
@@ -728,7 +736,7 @@ fwd 和 bwd 主路径有了对称的「三杀」收益。
 
 ##### 路径 B —— 2-kernel fallback：字节打平，launch 还省
 
-inline 会 spill 时（HAS_NW=True at D ≥ 24K，见 §2.2），dispatch
+inline 会 spill 时（HAS_NW=True at D > 16K，见 §2.2），dispatch
 fallback 到 2-kernel 对。切 D 的结构**没法**用 1-pass shared-mem
 招——没有 program 拿到完整一行—— 所以 `summed`/`dy` 要读两次
 （inner 一次，bwd 一次）：

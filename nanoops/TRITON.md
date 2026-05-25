@@ -407,13 +407,16 @@ API returns both `y` and `summed` to the caller:
 - `summed` → the next block's residual stream (caller doesn't need to
   recompute `x + residual` later)
 
-Three Triton kernels make this work end-to-end through autograd:
+Four Triton kernels make this work end-to-end through autograd —
+one for fwd, plus a 3-kernel backward setup (primary inline kernel
++ a 2-kernel D-split fallback for large D where inline would spill):
 
 | Kernel | Grid | Role |
 |---|---|---|
 | `_fused_add_norm_fwd_kernel` | 1D over M | fwd: writes `y` + `summed` + `rms_inv` |
-| `_fused_add_norm_inner_kernel` | 1D over M | bwd stage 1: pre-computes `inner[m]` |
-| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd stage 2: writes `d_summed` + `dnw_partial` |
+| `_fused_add_norm_bwd_inline_kernel` | 1D over M | bwd **primary**: full row per tile, inline inner reduction, writes `d_summed` (+ `dnw_partial`) |
+| `_fused_add_norm_inner_kernel` | 1D over M | bwd fallback stage 1: pre-computes `inner[m]` |
+| `_fused_add_norm_bwd_kernel` | 2D over (M, D) | bwd fallback stage 2: writes `d_summed` + `dnw_partial` |
 
 ### 2.1 Forward kernel
 
@@ -491,18 +494,25 @@ This works because at typical nanchat shapes the tile is small:
                                                     ≤ 255 regs/thread
 ```
 
-`_pick_tile_config(M, BLOCK_D, n_live_tiles=5)` solves for the largest
-BLOCK_M that fits. At `D=1536` it picks `BLOCK_M=4, num_warps=8` →
-160 regs/thread. At `D=4096` it picks `BLOCK_M=1, num_warps=4` →
-also 160 regs/thread. Comfortably under the cap.
+`_pick_tile_config(M, BLOCK_D, n_live_tiles=N)` solves for the largest
+BLOCK_M that fits. `N=5` for HAS_NW=True (`y_norm, g_eff, dy_t,
+d_ext, d_summed` alive at peak), `N=4` for HAS_NW=False (`y_norm`
+aliases `src` and `g_eff` aliases `dy_t` when there's no per-channel
+weight). At `D=1536, HAS_NW=True` it picks `BLOCK_M=4, num_warps=8` →
+160 regs/thread. At `D=4096, HAS_NW=True` it picks `BLOCK_M=1,
+num_warps=4` → also 160 regs/thread. Comfortably under the cap.
 
 #### The bigger gun: 2-kernel D-split fallback
 
 The inline path breaks once `BLOCK_D` is large enough that even
-`BLOCK_M=1, num_warps=16` (the cap) overflows. With 5 live tiles
-that crossover sits around `BLOCK_D > 16384` (i.e. `D > 16K` with
-HAS_NW=True) — model estimates ≥320 regs/thread, bench confirms
-~10× slowdown from local-memory spill.
+`BLOCK_M=1, num_warps=16` (the cap) overflows. The crossover depends
+on n_live_tiles:
+- HAS_NW=True (5 live tiles): `BLOCK_D > 16384` (i.e. `D > 16K`) —
+  model estimates ≥320 regs/thread, bench confirms ~10× slowdown
+  from local-memory spill.
+- HAS_NW=False (4 live tiles): `BLOCK_D > 32768` (i.e. `D > 32K`) —
+  basically never triggers in any realistic model (nanchat tops out
+  at D=8192 even at depth=128).
 
 For those cases the dispatch falls back to a 2-kernel pair that
 **splits along D**, dropping the per-program tile back to manageable
@@ -716,7 +726,8 @@ of HBM time, plus ~10-30 μs of avoided launch overhead.
 Backward has two kernel paths (see §2.2 for the dispatch). Common
 case is the **inline single-pass kernel**; the **2-kernel D-split
 fallback** only engages when the inline tile would exceed the 255
-reg/thread cap (HAS_NW=True at D ≥ 24K). Ledger them both.
+reg/thread cap (HAS_NW=True at D > 16K; HAS_NW=False at D > 32K
+which essentially never triggers). Ledger them both.
 
 Both compare against PyTorch-optimized native. The math itself needs
 two reductions over D (`inner[m] = mean_d(dy · y_norm)` and then
@@ -784,7 +795,7 @@ get the clean three-way win.
 
 ##### Path B — 2-kernel fallback: bytes tie, launches still saved
 
-When inline would spill (HAS_NW=True at D ≥ 24K, see §2.2), the
+When inline would spill (HAS_NW=True at D > 16K, see §2.2), the
 dispatch falls back to the 2-kernel pair. The split-D structure
 **can't** use the 1-pass shared-mem trick — no single program owns
 a full row — so we read `summed`/`dy` twice (once in inner, once

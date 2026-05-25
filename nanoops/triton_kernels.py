@@ -256,8 +256,10 @@ if _HAS_TRITON:
         `_fused_add_norm_bwd_kernel` (below).
 
         BLOCK_M / num_warps come from `_pick_tile_config(M, BLOCK_D,
-        n_live_tiles=5)` — 5 fp32 tiles alive at peak (y_norm, g_eff,
-        dy_t, d_ext, d_summed).
+        n_live_tiles=N)` — N=5 for HAS_NW=True (y_norm, g_eff, dy_t,
+        d_ext, d_summed alive at peak), N=4 for HAS_NW=False (y_norm
+        aliases src and g_eff aliases dy_t when there's no per-channel
+        weight; d_ext and d_summed still independent).
 
         dnw_partial layout: `(ceil(M / BLOCK_M), D)` — per-m-tile sum
         of `(dy * y_norm)`; caller does `.sum(dim=0)` to (D,)."""
