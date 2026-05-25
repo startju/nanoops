@@ -965,91 +965,107 @@ if _HAS_TRITON:
         )
 
 
-
 class FusedMLPBlock(torch.autograd.Function):
-    """MLP body + residual add (norm is NOT included — caller normalizes
-    x_hat upstream, typically via `fused_add_norm`):
-        y = residual + relu(x_hat @ W_fc.T)² @ W_proj.T
+    """Full MLP sub-block + residual add, including the pre-norm step:
+        summed = x + residual_in
+        x_hat  = norm(summed) * norm_weight                              (RMSNorm)
+        z      = x_hat @ W_fc.T                                          (Linear: c_fc)
+        r      = relu(z)²                                                (ReluSquare)
+        mlp    = r @ W_proj.T                                            (Linear: c_proj)
+        y      = summed + mlp                                            (Residual add)
 
-    Math (per row m):
-        z[m, n]   = sum_k x_hat[m, k] * W_fc[n, k]                       (Linear: c_fc)
-        r[m, n]   = relu(z[m, n])²                                       (ReluSquare)
-        mlp[m, p] = sum_n r[m, n] * W_proj[p, n]                         (Linear: c_proj)
-        y[m, p]   = residual[m, p] + mlp[m, p]                           (Residual add)
+    The pre-add+norm boundary matches `FusedAddNorm`'s semantics —
+    internally we call `_fused_add_norm_fwd_kernel` directly (bare
+    Triton, not the autograd Function) and feed `summed` as the
+    residual passthrough for the post-MLP add.
 
     Mixed-implementation strategy:
-      Forward:  cuBLAS for c_fc (38 GFLOPs matmul — Triton can't match
-                ~70% peak cuBLAS achieves here). Triton kernel for
-                (relu² + c_proj + residual) — saves M·N_fc HBM
-                round-trip on r and folds residual add into the matmul
-                output store, both of which cuBLAS can't do natively.
-      Backward: c_proj bwd via cuBLAS; relu²-bwd via Triton; c_fc bwd
-                via cuBLAS. d_residual = dy passes through. dx_hat
-                returned for upstream `FusedAddNorm.backward` to chain
-                norm grad.
+      Forward (4 steps):
+        0. `_fused_add_norm_fwd_kernel`: x + residual_in → summed,
+           norm(summed)·norm_weight → x_hat, save rms_inv.
+        1. cuBLAS: z = x_hat @ W_fc.T.
+        2. `_relu_sq_linear_residual_fwd_kernel`: relu² + c_proj +
+           residual_add(summed) → y in one Triton pass.
 
-    What's saved in ctx:
-      x_hat, W_fc, W_proj, z
-    r is NOT saved — recomputed from z (`relu(z)²`) when needed for
-    `dW_proj = dy^T @ r`. Saves M*N_fc floats (~24 MB at nanchat d24 MLP)."""
+      Backward (5 steps):
+        A. `_relu_sq_linear_residual_bwd_kernel`: dr matmul + relu² bwd
+           → dz (fused).
+        B. `_dW_proj_with_relu_sq_kernel`: dW_proj with on-the-fly r
+           recomputation (fused).
+        C. cuBLAS: dx_hat = dz @ W_fc ; dW_fc = dz.T @ x_hat.
+        D. `_fused_add_norm_bwd_inline_kernel`: takes dx_hat (from C)
+           + dy (= d_summed_external for the final residual add) and
+           does the RMSNorm bwd → d_summed. Both d_x and d_residual_in
+           equal d_summed (sum's grad is identity on both inputs).
+
+    ctx saves (x, residual_in, norm_weight, fc_weight, proj_weight,
+    summed, rms_inv, z) — x_hat recomputed in bwd as x_hat = summed *
+    rms_inv * norm_weight (cheap elementwise, saves the 6 MB ctx slot)."""
 
     @staticmethod
-    def forward(ctx, x_hat, fc_weight, proj_weight, residual):
-        """Caller is responsible for normalizing x_hat upstream (typically
-        via `FusedAddNorm`). This op handles only the MLP body:
-            y = residual + relu²(x_hat @ W_fc.T) @ W_proj.T
-        Norm gradients flow back through the upstream autograd path
-        (FusedAddNorm.backward), not through this op."""
-        assert x_hat.is_cuda and x_hat.is_contiguous()
-        assert fc_weight.is_cuda and proj_weight.is_cuda
-        M, K = x_hat.shape
+    def forward(ctx, x, residual_in, norm_weight, fc_weight, proj_weight, eps=1e-6):
+        assert x.is_cuda and x.is_contiguous()
+        assert residual_in.is_cuda and residual_in.is_contiguous()
+        assert residual_in.shape == x.shape, (
+            f"residual_in shape {residual_in.shape} must match x {x.shape}"
+        )
+        assert norm_weight.is_cuda and fc_weight.is_cuda and proj_weight.is_cuda
+        M, K = x.shape
         N_fc, K_w = fc_weight.shape
         K_proj_out, N_proj_in = proj_weight.shape
-        assert K == K_w, f"x_hat last dim {K} != fc_weight in dim {K_w}"
+        assert K == K_w, f"x last dim {K} != fc_weight in dim {K_w}"
         assert N_fc == N_proj_in, f"fc out dim {N_fc} != proj in dim {N_proj_in}"
-        assert residual.shape == (M, K_proj_out), (
-            f"residual must be ({M}, {K_proj_out}), got {residual.shape}"
+        assert K_proj_out == K, (
+            f"c_proj out dim {K_proj_out} must equal x's K {K} (residual stream width)"
+        )
+        ieee = (x.dtype == torch.float32)
+
+        # Step 0: add + norm — call `_fused_add_norm_fwd_kernel` directly
+        # (bare Triton, not the autograd Function — we're inside an
+        # autograd.Function.forward already so .apply wouldn't chain).
+        BLOCK_D_NORM = triton.next_power_of_2(K)
+        norm_cfg = _pick_tile_config(M, BLOCK_D_NORM, n_live_tiles=2)
+        x_hat = torch.empty_like(x)
+        summed = torch.empty_like(x)
+        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+        _fused_add_norm_fwd_kernel[(triton.cdiv(M, norm_cfg.block_m),)](
+            x, residual_in, norm_weight, x_hat, summed, rms_inv,
+            M, K, eps,
+            BLOCK_M=norm_cfg.block_m, BLOCK_D=BLOCK_D_NORM, HAS_NW=True,
+            num_warps=norm_cfg.num_warps,
         )
 
-        # Step 1: c_fc via cuBLAS bf16 tensor cores (~70% peak — Triton
-        # can't match this on a 38 GFLOPs matmul).
+        # Step 1: c_fc via cuBLAS bf16 tensor cores.
         z = torch.matmul(x_hat, fc_weight.t())  # (M, N_fc)
 
-        # Step 2: Triton kernel for relu² + c_proj + residual — the
-        # only place Triton helps. Saves the M·N_fc HBM round-trip on r
-        # (cuBLAS can't fuse pre-matmul relu²); also folds the residual
-        # add into the matmul output store. Fixed config (was autotuned
-        # at d24 shape) — see kernel comment for why no autotune.
+        # Step 2: Triton kernel for relu² + c_proj + residual (= summed).
         BLOCK_M, BLOCK_P, BLOCK_N = 64, 128, 32
-        ieee = (x_hat.dtype == torch.float32)
-        y = torch.empty((M, K_proj_out), dtype=x_hat.dtype, device=x_hat.device)
+        y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_P))
         _relu_sq_linear_residual_fwd_kernel[grid](
-            z, proj_weight, residual, y,
+            z, proj_weight, summed, y,
             M, N_fc, K_proj_out,
             BLOCK_M=BLOCK_M, BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
             IEEE_PRECISION=ieee,
             num_warps=4, num_stages=3,
         )
 
-        ctx.save_for_backward(x_hat, fc_weight, proj_weight, z)
+        ctx.save_for_backward(
+            x, residual_in, norm_weight, fc_weight, proj_weight, summed, rms_inv, z,
+        )
         ctx.M, ctx.N_fc, ctx.K = M, N_fc, K
         ctx.K_out = K_proj_out
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        x_hat, W_fc, W_proj, z = ctx.saved_tensors
+        (x, residual_in, norm_w, W_fc, W_proj, summed, rms_inv, z) = ctx.saved_tensors
         M, N_fc, K = ctx.M, ctx.N_fc, ctx.K
         K_out = ctx.K_out
         dy = dy.contiguous()
-        ieee = (x_hat.dtype == torch.float32)
+        ieee = (x.dtype == torch.float32)
 
-        # Step A: Triton kernel that mirrors the fwd kernel's structure.
-        # Fwd was (relu² + matmul + residual_add); bwd is (matmul + relu²
-        # bwd). Fuses dr = dy @ W_proj with the dz = dr·2·relu(z)
-        # elementwise — dr never goes to HBM. Fixed config (autotuned
-        # at d24, locked in for CUDA Graph compat).
+        # Step A: Triton fused matmul + relu² bwd → dz.
         BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 64, 128, 32
         dz = torch.empty_like(z)
         grid = (triton.cdiv(M, BLOCK_M_A), triton.cdiv(N_fc, BLOCK_N_A))
@@ -1061,10 +1077,7 @@ class FusedMLPBlock(torch.autograd.Function):
             num_warps=8, num_stages=3,
         )
 
-        # Step B: dW_proj via Triton kernel — same on-the-fly r = relu²(z)
-        # fusion as Step A, no HBM round-trip on r. Different reduction
-        # axis (M instead of K_out) so it's a separate kernel. Fixed
-        # config (autotuned at d24, locked in for CUDA Graph compat).
+        # Step B: Triton fused dW_proj with on-the-fly r = relu²(z).
         BLOCK_K_OUT_B, BLOCK_N_B, BLOCK_M_B = 64, 128, 32
         dW_proj = torch.empty((K_out, N_fc), dtype=z.dtype, device=z.device)
         grid_b = (triton.cdiv(K_out, BLOCK_K_OUT_B), triton.cdiv(N_fc, BLOCK_N_B))
@@ -1076,34 +1089,59 @@ class FusedMLPBlock(torch.autograd.Function):
             num_warps=4, num_stages=3,
         )
 
-        # Step C: c_fc backward (cuBLAS).
-        # z = x_hat @ W_fc.T → dx_hat = dz @ W_fc ; dW_fc = dz.T @ x_hat.
+        # Step C: c_fc bwd via cuBLAS. Recompute x_hat (cheap elementwise)
+        # to avoid saving it through ctx. Promote to fp32 for the
+        # multiplications, cast back to dz's dtype for the cuBLAS matmul.
+        x_hat = (summed.float() * rms_inv.unsqueeze(-1) * norm_w.float()).to(summed.dtype)
         dx_hat = dz @ W_fc  # (M, K)
         dW_fc = dz.t() @ x_hat  # (N_fc, K)
 
-        # No RMSNorm bwd here — norm grad flows back through upstream
-        # FusedAddNorm.backward via the dx_hat we return. d_residual = dy.
-        return dx_hat, dW_fc, dW_proj, dy
+        # Step D: bare-kernel call to `_fused_add_norm_bwd_inline_kernel`.
+        # Tried fusing Step C's matmul + Step D into one Triton kernel
+        # (`_c_fc_rms_norm_bwd_fused_kernel`, kept above for reference) —
+        # bench showed 5× slowdown on d24 because BLOCK_M=4 (forced by
+        # shared-mem fit for full-K dx_hat cache on 3090) drops below
+        # tl.dot's tensor-core minimum of 16, falling back to fp32 ALU.
+        BLOCK_D_BWD = triton.next_power_of_2(K)
+        cfg_bwd = _pick_tile_config(M, BLOCK_D_BWD, n_live_tiles=5)
+        num_m_tiles = triton.cdiv(M, cfg_bwd.block_m)
+        d_summed = torch.empty_like(x)
+        dnw_partials = torch.empty(
+            (num_m_tiles, K), dtype=norm_w.dtype, device=x.device,
+        )
+        _fused_add_norm_bwd_inline_kernel[(num_m_tiles,)](
+            summed, rms_inv, norm_w, dx_hat, dy,
+            d_summed, dnw_partials,
+            M, K,
+            BLOCK_M=cfg_bwd.block_m, BLOCK_D=BLOCK_D_BWD,
+            HAS_NW=True, num_warps=cfg_bwd.num_warps,
+        )
+        dnw = dnw_partials.sum(dim=0)
+
+        # d_x = d_residual_in = d_summed; both inputs of the
+        # `summed = x + residual_in` add receive the same gradient.
+        return d_summed, d_summed, dnw, dW_fc, dW_proj, None
 
 def fused_mlp_block(
-    x_hat: torch.Tensor,
+    x: torch.Tensor,
+    residual_in: torch.Tensor,
+    norm_weight: torch.Tensor,
     fc_weight: torch.Tensor,
     proj_weight: torch.Tensor,
-    residual: torch.Tensor,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    """MLP body + residual add. Caller must pre-normalize x_hat upstream
-    (typically via `fused_add_norm`):
-        y = residual + relu(x_hat @ W_fc.T)² @ W_proj.T
+    """Full MLP sub-block + residual add, with pre-norm:
+        summed = x + residual_in
+        x_hat  = norm(summed) * norm_weight
+        y      = summed + relu²(x_hat @ W_fc.T) @ W_proj.T
 
-    Designed to compose with `fused_add_norm` at the start of an MLP
-    sub-block — that op fuses the prior sub-block's residual add with
-    this sub-block's pre-norm:
-        x_hat, summed = fused_add_norm(attn_out, prev_residual, norm_w)
-        x_out         = fused_mlp_block(x_hat, W_fc, W_proj, residual=summed)
-
-    Triton handles only the (relu² + c_proj + residual) fusion since
-    cuBLAS can't fuse a pre-matmul activation. c_fc is plain cuBLAS."""
-    return FusedMLPBlock.apply(x_hat, fc_weight, proj_weight, residual)
+    Matches a transformer block's mlp side end-to-end (vs the previous
+    API which took already-normalized x_hat). The pre-add+norm boundary
+    uses `_fused_add_norm_fwd_kernel` internally — for the typical
+    nanchat call pattern `x = x + mlp(norm(x))`, set residual_in=zeros
+    (or use the API where `x` is the attn output and `residual_in` is
+    the prev residual stream)."""
+    return FusedMLPBlock.apply(x, residual_in, norm_weight, fc_weight, proj_weight, eps)
 
 
 # ─────────────────────────────────────────────────────────────────────
