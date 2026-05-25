@@ -884,16 +884,20 @@ if _HAS_TRITON:
             other=0.0,
         )
         relu_z = tl.where(z > 0.0, z, 0.0)
-        dz = dr * 2.0 * relu_z
+        dz = dr.to(dz_ptr.dtype.element_ty) * 2 * relu_z
 
         tl.store(
             dz_ptr + rows[:, None] * N + n_cols[None, :],
-            dz.to(dz_ptr.dtype.element_ty),
+            dz,
             mask=row_mask[:, None] & n_mask[None, :],
         )
 
         # Side-output: partial inner = Σ_n(dz·z) (see kernel header).
-        inner_partial = tl.sum(dz * z, axis=1)  # (BLOCK_M,) fp32
+        # Force fp32 accumulator — dz and z are bf16 in the bf16 path, and
+        # summing N up to several thousand bf16 products in bf16 would
+        # lose precision (8-bit mantissa). dtype= upcasts elementwise
+        # into the fp32 accumulator before each add.
+        inner_partial = tl.sum(dz * z, axis=1, dtype=tl.float32)
         tl.atomic_add(inner_buf_ptr + rows, inner_partial, mask=row_mask)
 
     # dW_proj = dy.T @ relu²(z), r recomputed inline (no materialization).
