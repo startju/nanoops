@@ -289,11 +289,11 @@ if _HAS_TRITON:
         # contributed 0). Result is (BLOCK_M,) — one scalar per row.
         inner = tl.sum(g_eff * y_norm, axis=1) / D
 
-        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        d_summed = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
+        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0)
+        d_summed = (rms_inv[:, None] * (g_eff - y_norm * inner[:, None])).to(d_summed_ptr.dtype.element_ty)+ d_ext
         tl.store(
             d_summed_ptr + offs,
-            d_summed.to(d_summed_ptr.dtype.element_ty),
+            d_summed,
             mask=mask_2d,
         )
 
@@ -458,11 +458,13 @@ if _HAS_TRITON:
         # Fold external d_summed (caller's direct consumption of summed)
         # into d_summed in-kernel — saves an extra Python `+` op + its
         # HBM round-trip outside.
-        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        d_summed_tile = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + d_ext
+        d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0)
+        d_summed_tile = (
+            rms_inv[:, None] * (g_eff - y_norm * inner[:, None])
+        ).to(d_summed_ptr.dtype.element_ty) + d_ext
         tl.store(
             d_summed_ptr + offs,
-            d_summed_tile.to(d_summed_ptr.dtype.element_ty),
+            d_summed_tile,
             mask=mask_2d,
         )
 
@@ -771,9 +773,9 @@ if _HAS_TRITON:
                 z_ptr + rows[:, None] * N + n_cols[None, :],
                 mask=row_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             relu_z = tl.where(z > 0.0, z, 0.0)
-            r = relu_z * relu_z  # fp32
+            r = relu_z * relu_z
             proj_w = tl.load(
                 proj_w_ptr + p_cols[:, None] * N + n_cols[None, :],
                 mask=p_col_mask[:, None] & n_mask[None, :],
@@ -783,18 +785,16 @@ if _HAS_TRITON:
                 acc += tl.dot(r, tl.trans(proj_w.to(tl.float32)),
                               input_precision="ieee")
             else:
-                acc += tl.dot(r.to(z_ptr.dtype.element_ty), tl.trans(proj_w))
+                acc += tl.dot(r, tl.trans(proj_w))
 
-        # Add residual, write y.
+        # Add residual, write y. Keep residual in native dtype; cast the
+        # matmul acc to output dtype first, then add — saves a bf16→fp32
+        # conversion on the load + skips the final store cast.
         offs = rows[:, None] * K_out + p_cols[None, :]
         mask_2d = row_mask[:, None] & p_col_mask[None, :]
-        residual = tl.load(residual_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        y = acc + residual
-        tl.store(
-            y_ptr + offs,
-            y.to(y_ptr.dtype.element_ty),
-            mask=mask_2d,
-        )
+        residual = tl.load(residual_ptr + offs, mask=mask_2d, other=0.0)
+        y = acc.to(y_ptr.dtype.element_ty) + residual
+        tl.store(y_ptr + offs, y, mask=mask_2d)
 
     # Bwd of `_relu_sq_linear_residual_fwd_kernel`: dz = 2·relu(z) · (dy @ W_proj).
     # dr stays in registers (saves ~50 MB HBM round-trip at d24).
@@ -1057,7 +1057,10 @@ if _HAS_TRITON:
         # tiny `inner_buf / K` op + launch in the Python caller).
         inner = tl.load(inner_buf_ptr + rows, mask=row_mask, other=0.0).to(tl.float32) / K
         x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        dy = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        # dy kept in native dtype — cast the fp32 norm-path result to
+        # output dtype first, then add dy. Saves a bf16→fp32 conversion
+        # on dy load + skips the final cast on store (small but free).
+        dy = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0)
 
         y_norm = x * rms_inv[:, None]
         if HAS_NW:
@@ -1065,9 +1068,11 @@ if _HAS_TRITON:
             g_eff = dx_hat * nw[None, :]
         else:
             g_eff = dx_hat
-        dx = rms_inv[:, None] * (g_eff - y_norm * inner[:, None]) + dy
+        dx = (
+            rms_inv[:, None] * (g_eff - y_norm * inner[:, None])
+        ).to(dx_ptr.dtype.element_ty) + dy
 
-        tl.store(dx_ptr + offs, dx.to(dx_ptr.dtype.element_ty), mask=mask_2d)
+        tl.store(dx_ptr + offs, dx, mask=mask_2d)
 
         # dnw_partial per (m_tile, k_tile) — only when norm_w exists.
         if HAS_NW:
@@ -2290,16 +2295,10 @@ if _HAS_TRITON:
         cols = pid_d * BLOCK_DOUT + tl.arange(0, BLOCK_DOUT)
         row_mask = rows < M
         col_mask = cols < D_out
-
-        # Start accumulator with residual (the "bias" in addmm)
-        res_ptrs = residual_ptr + rows[:, None] * stride_rm + cols[None, :] * stride_rd
-        acc = tl.load(
-            res_ptrs,
-            mask=row_mask[:, None] & col_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        out_mask = row_mask[:, None] & col_mask[None, :]
 
         # Matmul-accumulate
+        acc = tl.zeros((BLOCK_M, BLOCK_DOUT), dtype=tl.float32)
         for k_start in range(0, D_in, BLOCK_DIN):
             ks = k_start + tl.arange(0, BLOCK_DIN)
             k_mask = ks < D_in
@@ -2321,12 +2320,14 @@ if _HAS_TRITON:
             ).to(tl.float32)
             acc += tl.dot(a, tl.trans(pw), input_precision="ieee")
 
+        # Add residual at the end in native dtype (saves a bf16→fp32
+        # conversion on residual load + skips the final store cast).
+        res_ptrs = residual_ptr + rows[:, None] * stride_rm + cols[None, :] * stride_rd
+        residual = tl.load(res_ptrs, mask=out_mask, other=0.0)
+        y = acc.to(y_ptr.dtype.element_ty) + residual
+
         y_ptrs = y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yd
-        tl.store(
-            y_ptrs,
-            acc.to(y_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & col_mask[None, :],
-        )
+        tl.store(y_ptrs, y, mask=out_mask)
 
 
 class OutputProjResidual(torch.autograd.Function):
