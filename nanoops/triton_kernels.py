@@ -752,61 +752,17 @@ def fused_add_norm(
 
 if _HAS_TRITON:
 
-    # Autotune sweep for the (relu² + c_proj + residual_add) kernel.
-    # ~30 configs covering tile shapes 16-128 × num_warps {4,8} ×
-    # num_stages {2,3,4}. All combinations satisfy tl.dot's tensor-core
-    # minimum (all dims ≥ 16). Configs that exceed 100 KB/SM shared mem
-    # or 255 reg/thread get pruned by Triton on first compile.
-    # Autotune runs each config once per unique (M, N, K_out) tuple
-    # on first call and caches the winner — ~40-60 s sweep overhead
-    # per shape per process, then free for the rest of training.
-    _RELU_SQ_LIN_RES_CONFIGS = [
-        # Small / skinny tiles
-        triton.Config({"BLOCK_M": 16,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 16,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 16,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-
-        # 32×32 sweet-spot for tiny shapes
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 128}, num_warps=4, num_stages=2),
-
-        # 32×64 / 64×32 — common for unbalanced M/P
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 32,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
-
-        # 64×64 — workhorse
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 128}, num_warps=8, num_stages=2),
-
-        # 64×128 / 128×64 — bigger reuse
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 64},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=2),
-
-        # 128×128 — big tiles, need warps=8 for accumulator reg fit
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 32},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 64},  num_warps=8, num_stages=2),
-
-        # Wide / tall skinny tiles for unbalanced shapes
-        triton.Config({"BLOCK_M": 256, "BLOCK_P": 32,  "BLOCK_N": 32},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 256, "BLOCK_P": 64,  "BLOCK_N": 32},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 256, "BLOCK_N": 32},  num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 256, "BLOCK_N": 32},  num_warps=8, num_stages=2),
-    ]
-
-    @triton.autotune(configs=_RELU_SQ_LIN_RES_CONFIGS, key=["M", "N", "K_out"])
+    # Fixed config (no @triton.autotune) for CUDA Graph capture
+    # compatibility. Triton's autotune dispatch path retains some
+    # non-capture-friendly operations, so the kernel can't be captured
+    # into a graph when decorated with @triton.autotune (same lesson as
+    # `_fused_add_norm_bwd_kernel` earlier in this file). Caller hardcodes
+    # the tile config + num_warps + num_stages at the launch site.
+    #
+    # The config (64, 128, 32, nw=4, stages=3) was what autotune picked
+    # for nanchat's d24 shape (M=2048, N_fc=6144, K_out=1536). Other
+    # shapes may lose ≤10% from this hardcoding — see git history for
+    # the autotune sweep + per-shape winners.
     @triton.jit
     def _relu_sq_linear_residual_fwd_kernel(
         z_ptr,
@@ -1051,19 +1007,18 @@ class FusedMLPBlock(torch.autograd.Function):
         # Step 2: Triton kernel for relu² + c_proj + residual — the
         # only place Triton helps. Saves the M·N_fc HBM round-trip on r
         # (cuBLAS can't fuse pre-matmul relu²); also folds the residual
-        # add into the matmul output store. Block sizes come from
-        # @triton.autotune sweep — cached per (M, N_fc, K_proj_out)
-        # shape after first call.
+        # add into the matmul output store. Fixed config (was autotuned
+        # at d24 shape) — see kernel comment for why no autotune.
+        BLOCK_M, BLOCK_P, BLOCK_N = 64, 128, 32
         ieee = (x_hat.dtype == torch.float32)
         y = torch.empty((M, K_proj_out), dtype=x_hat.dtype, device=x_hat.device)
-        grid = lambda meta: (
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(K_proj_out, meta["BLOCK_P"]),
-        )
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_P))
         _relu_sq_linear_residual_fwd_kernel[grid](
             z, proj_weight, residual, y,
             M, N_fc, K_proj_out,
+            BLOCK_M=BLOCK_M, BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
             IEEE_PRECISION=ieee,
+            num_warps=4, num_stages=3,
         )
 
         ctx.save_for_backward(x_hat, fc_weight, proj_weight, z)
