@@ -752,6 +752,28 @@ def fused_add_norm(
 
 if _HAS_TRITON:
 
+    # Autotune sweep for the (relu² + c_proj + residual_add) kernel.
+    # Configs hand-picked to cover common tile shapes for nanchat MLP
+    # shapes (M ∈ 1k-8k, N=4·K_out, K_out ∈ 768-4096). All combinations
+    # satisfy tl.dot's tensor-core minimum (M, N, K ≥ 16) and stay under
+    # 3090's 100 KB/SM shared-mem budget at num_stages=3.
+    # Triton autotune runs each config once per unique (M, N, K_out)
+    # tuple on first call, caches the winner thereafter.
+    _RELU_SQ_LIN_RES_CONFIGS = [
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 32,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_P": 32,  "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 128, "BLOCK_N": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 128, "BLOCK_N": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_P": 64,  "BLOCK_N": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_P": 64,  "BLOCK_N": 64}, num_warps=8, num_stages=2),
+    ]
+
+    @triton.autotune(configs=_RELU_SQ_LIN_RES_CONFIGS, key=["M", "N", "K_out"])
     @triton.jit
     def _relu_sq_linear_residual_fwd_kernel(
         z_ptr,
@@ -996,15 +1018,18 @@ class FusedMLPBlock(torch.autograd.Function):
         # Step 2: Triton kernel for relu² + c_proj + residual — the
         # only place Triton helps. Saves the M·N_fc HBM round-trip on r
         # (cuBLAS can't fuse pre-matmul relu²); also folds the residual
-        # add into the matmul output store.
-        BLOCK_M, BLOCK_P, BLOCK_N = 32, 32, 32
+        # add into the matmul output store. Block sizes come from
+        # @triton.autotune sweep — cached per (M, N_fc, K_proj_out)
+        # shape after first call.
         ieee = (x_hat.dtype == torch.float32)
         y = torch.empty((M, K_proj_out), dtype=x_hat.dtype, device=x_hat.device)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_P))
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(K_proj_out, meta["BLOCK_P"]),
+        )
         _relu_sq_linear_residual_fwd_kernel[grid](
             z, proj_weight, residual, y,
             M, N_fc, K_proj_out,
-            BLOCK_M=BLOCK_M, BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
             IEEE_PRECISION=ieee,
         )
 
