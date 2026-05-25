@@ -824,13 +824,22 @@ if _HAS_TRITON:
         y = acc.to(y_ptr.dtype.element_ty) + residual
         tl.store(y_ptr + offs, y, mask=mask_2d)
 
-    # Bwd of `_relu_sq_linear_residual_fwd_kernel`: dz = 2·relu(z) · (dy @ W_proj).
-    # dr stays in registers (saves ~50 MB HBM round-trip at d24).
-    # Side-output: `inner_buf[m] = Σ_n(dz·z)` via atomic_add. Used by D
-    # via the identity Σ_k(dx_hat·x_hat) = Σ_n(dz·z) to skip its per-row
-    # reduction over the norm dim — D divides by norm_dim inline to get
-    # `inner = (1/norm_dim)·Σ_n(dz·z)`. Free here — dz and z are both
-    # already in registers.
+    # dz bwd for the c_proj + relu² + residual_add fwd op
+    # (`_relu_sq_linear_residual_fwd_kernel`). The other bwd outputs of
+    # that fwd are split off:
+    #   dW_proj          → `_mlp_dW_proj_bwd_kernel` (different reduction axis)
+    #   d_residual = dy  → folded into dx by `_mlp_dx_bwd_kernel`'s outer-residual pass
+    # This kernel produces only dz, plus the inner_buf side-output for D.
+    #
+    # Math:
+    #   dr = dy @ W_proj           (matmul; dr kept in registers, never to HBM,
+    #                               saves ~50 MB round-trip at d24)
+    #   dz = 2·relu(z) · dr        (relu² bwd, applied inline)
+    #
+    # Side-output: inner_buf[m] += Σ_n(dz·z) via atomic_add (= norm_dim·inner).
+    # D uses it via the identity Σ_k(dx_hat·x_hat) = Σ_n(dz·z) to skip its
+    # per-row reduction over norm_dim; D divides by norm_dim inline. Free
+    # here — dz and z are both already in registers.
     # d24 config locked: (BLOCK_M=64, BLOCK_N=128, BLOCK_K_OUT=32, nw=8, st=3).
     @triton.jit
     def _mlp_dz_bwd_kernel(
