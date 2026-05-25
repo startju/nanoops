@@ -831,6 +831,69 @@ if _HAS_TRITON:
             mask=mask_2d,
         )
 
+    # Symmetric bwd of `_relu_sq_linear_residual_fwd_kernel`:
+    #   fwd does relu²(z) → matmul(W_proj) → +residual   (elem + matmul + elem)
+    #   bwd does matmul(dy @ W_proj) → ×2·relu(z)        (matmul + elem)
+    # Fuses dr-matmul with the relu²-bwd elementwise so dr never goes to
+    # HBM (saves ~50 MB round-trip at d24). dW_proj uses a different
+    # reduction axis (sum over M, not over K_out) and stays on cuBLAS.
+    # Fixed config — autotuned at d24, hardcoded for CUDA Graph compat.
+    @triton.jit
+    def _relu_sq_linear_residual_bwd_kernel(
+        dy_ptr,        # (M, K_out) bf16 — gradient w.r.t. y
+        z_ptr,         # (M, N) bf16 — saved from fwd
+        proj_w_ptr,    # (K_out, N) bf16 — W_proj
+        dz_ptr,        # (M, N) bf16 — output (gradient w.r.t. z)
+        M, N, K_out,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K_OUT: tl.constexpr,
+        IEEE_PRECISION: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        n_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = rows < M
+        n_mask = n_cols < N
+
+        # dr matmul: dr[m, n] = sum_{kp} dy[m, kp] * W_proj[kp, n]
+        dr = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for kp_start in range(0, K_out, BLOCK_K_OUT):
+            kps = kp_start + tl.arange(0, BLOCK_K_OUT)
+            kp_mask = kps < K_out
+            dy = tl.load(
+                dy_ptr + rows[:, None] * K_out + kps[None, :],
+                mask=row_mask[:, None] & kp_mask[None, :],
+                other=0.0,
+            )
+            proj_w = tl.load(
+                proj_w_ptr + kps[:, None] * N + n_cols[None, :],
+                mask=kp_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            )
+            if IEEE_PRECISION:
+                dr += tl.dot(dy.to(tl.float32), proj_w.to(tl.float32),
+                             input_precision="ieee")
+            else:
+                dr += tl.dot(dy, proj_w)
+
+        # relu² bwd applied to dr in registers — dr never materialized to HBM.
+        z = tl.load(
+            z_ptr + rows[:, None] * N + n_cols[None, :],
+            mask=row_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        relu_z = tl.where(z > 0.0, z, 0.0)
+        dz = dr * 2.0 * relu_z
+
+        tl.store(
+            dz_ptr + rows[:, None] * N + n_cols[None, :],
+            dz.to(dz_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & n_mask[None, :],
+        )
+
     @triton.jit
     def _relu_square_bwd_kernel(
         z_ptr,
@@ -1030,27 +1093,31 @@ class FusedMLPBlock(torch.autograd.Function):
     def backward(ctx, dy):
         x_hat, W_fc, W_proj, z = ctx.saved_tensors
         M, N_fc, K = ctx.M, ctx.N_fc, ctx.K
+        K_out = ctx.K_out
         dy = dy.contiguous()
+        ieee = (x_hat.dtype == torch.float32)
 
-        # Step A: c_proj backward (cuBLAS).
-        # y = r @ W_proj.T → dr = dy @ W_proj ; dW_proj = dy.T @ r.
-        # Recompute r = relu(z)² to avoid saving M*N_fc floats in ctx.
+        # Step A: Triton kernel that mirrors the fwd kernel's structure.
+        # Fwd was (relu² + matmul + residual_add); bwd is (matmul + relu²
+        # bwd). Fuses dr = dy @ W_proj with the dz = dr·2·relu(z)
+        # elementwise — dr never goes to HBM. Same fixed config as fwd.
+        BLOCK_M, BLOCK_N, BLOCK_K_OUT = 64, 128, 32
+        dz = torch.empty_like(z)
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_fc, BLOCK_N))
+        _relu_sq_linear_residual_bwd_kernel[grid](
+            dy, z, W_proj, dz,
+            M, N_fc, K_out,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K_OUT=BLOCK_K_OUT,
+            IEEE_PRECISION=ieee,
+            num_warps=4, num_stages=3,
+        )
+
+        # Step B: dW_proj via cuBLAS (different reduction axis from dz —
+        # sums over M instead of K_out — so can't share the Triton kernel).
+        # Recompute r = relu(z)² for the matmul.
         relu_z = z.clamp(min=0)
         r = relu_z * relu_z
-        dr = dy @ W_proj  # (M, N_fc)
         dW_proj = dy.t() @ r  # (K_out, N_fc)
-
-        # Step B: relu²-backward (Triton). dz = 2 * relu(z) * dr.
-        dz = torch.empty_like(z)
-        BLOCK_SIZE = 1024
-        grid_rs = (triton.cdiv(M * N_fc, BLOCK_SIZE),)
-        _relu_square_bwd_kernel[grid_rs](
-            z,
-            dr,
-            dz,
-            M * N_fc,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
 
         # Step C: c_fc backward (cuBLAS).
         # z = x_hat @ W_fc.T → dx_hat = dz @ W_fc ; dW_fc = dz.T @ x_hat.
