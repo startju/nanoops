@@ -736,7 +736,7 @@ if _HAS_TRITON:
     # relu² + c_proj + residual_add in one Triton pass — r stays in
     # registers (saves M·N HBM round-trip). Caller passes fixed config
     # (autotune dispatch isn't CUDA Graph capture-friendly); d24 winner
-    # locked: (BLOCK_M=64, BLOCK_P=128, BLOCK_N=32, nw=4, st=3).
+    # locked: (BLOCK_M=64, BLOCK_K_OUT=128, BLOCK_N=32, nw=4, st=3).
     @triton.jit
     def _relu_sq_linear_residual_fwd_kernel(
         z_ptr,
@@ -747,7 +747,7 @@ if _HAS_TRITON:
         N,
         K_out,
         BLOCK_M: tl.constexpr,
-        BLOCK_P: tl.constexpr,
+        BLOCK_K_OUT: tl.constexpr,
         BLOCK_N: tl.constexpr,
         IEEE_PRECISION: tl.constexpr,
     ):
@@ -756,15 +756,15 @@ if _HAS_TRITON:
         `input_precision="ieee"` to tl.dot, disabling TF32 downcast.
         Slower but bit-tight vs PyTorch `@` for fp32 parity tests."""
         pid_m = tl.program_id(0)
-        pid_p = tl.program_id(1)
+        pid_k_out = tl.program_id(1)
 
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        p_cols = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        k_outs = pid_k_out * BLOCK_K_OUT + tl.arange(0, BLOCK_K_OUT)
         row_mask = rows < M
-        p_col_mask = p_cols < K_out
+        k_out_mask = k_outs < K_out
 
         # c_proj matmul, inner loop over N.
-        acc = tl.zeros((BLOCK_M, BLOCK_P), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_K_OUT), dtype=tl.float32)
         for n_start in range(0, N, BLOCK_N):
             n_cols = n_start + tl.arange(0, BLOCK_N)
             n_mask = n_cols < N
@@ -777,8 +777,8 @@ if _HAS_TRITON:
             relu_z = tl.where(z > 0.0, z, 0.0)
             r = relu_z * relu_z
             proj_w = tl.load(
-                proj_w_ptr + p_cols[:, None] * N + n_cols[None, :],
-                mask=p_col_mask[:, None] & n_mask[None, :],
+                proj_w_ptr + k_outs[:, None] * N + n_cols[None, :],
+                mask=k_out_mask[:, None] & n_mask[None, :],
                 other=0.0,
             )
             if IEEE_PRECISION:
@@ -790,8 +790,8 @@ if _HAS_TRITON:
         # Add residual, write y. Keep residual in native dtype; cast the
         # matmul acc to output dtype first, then add — saves a bf16→fp32
         # conversion on the load + skips the final store cast.
-        offs = rows[:, None] * K_out + p_cols[None, :]
-        mask_2d = row_mask[:, None] & p_col_mask[None, :]
+        offs = rows[:, None] * K_out + k_outs[None, :]
+        mask_2d = row_mask[:, None] & k_out_mask[None, :]
         residual = tl.load(residual_ptr + offs, mask=mask_2d, other=0.0)
         y = acc.to(y_ptr.dtype.element_ty) + residual
         tl.store(y_ptr + offs, y, mask=mask_2d)
@@ -1167,13 +1167,13 @@ class FusedMLPBlock(torch.autograd.Function):
         z = torch.matmul(x_hat, fc_weight.t())  # (M, N_fc)
 
         # Step 2: Triton kernel for relu² + c_proj + outer residual (= x).
-        BLOCK_M, BLOCK_P, BLOCK_N = 64, 128, 32
+        BLOCK_M, BLOCK_K_OUT, BLOCK_N = 64, 128, 32
         y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_P))
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_K_OUT))
         _relu_sq_linear_residual_fwd_kernel[grid](
             z, proj_weight, x, y,
             M, N_fc, K_proj_out,
-            BLOCK_M=BLOCK_M, BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
+            BLOCK_M=BLOCK_M, BLOCK_K_OUT=BLOCK_K_OUT, BLOCK_N=BLOCK_N,
             IEEE_PRECISION=ieee,
             num_warps=4, num_stages=3,
         )
