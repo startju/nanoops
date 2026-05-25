@@ -838,9 +838,7 @@ if _HAS_TRITON:
         z_ptr,  # (M, N) bf16 — saved from fwd
         proj_w_ptr,  # (K_out, N) bf16 — W_proj
         dz_ptr,  # (M, N) bf16 — output (gradient w.r.t. z)
-        inner_buf_ptr,  # (M,) fp32 — side-output: sum_n(dz·z) for downstream
-        #             RMSNorm bwd (= K·inner). Caller MUST
-        #             zero-init before launch (atomic_add).
+        inner_buf_ptr,  # (M,) fp32 — side-output Σ_n(dz·z); caller must zero-init
         M,
         N,
         K_out,
@@ -884,7 +882,7 @@ if _HAS_TRITON:
             z_ptr + rows[:, None] * N + n_cols[None, :],
             mask=row_mask[:, None] & n_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
+        )
         relu_z = tl.where(z > 0.0, z, 0.0)
         dz = dr * 2.0 * relu_z
 
@@ -1033,7 +1031,7 @@ if _HAS_TRITON:
     # `inner` makes dx purely elementwise — unlocks big tensor-core tiles
     # vs the BLOCK_M=4 a K-reduction would force.
     #
-    # Math (per element):
+    # Math (per element; K below = norm_dim, the kernel's `K` param):
     #   y_norm   = x · rms_inv
     #   g_eff    = dx_hat · nw
     #   inner    = inner_buf / K           (folded in-kernel from A's raw side-output)
