@@ -835,9 +835,11 @@ if _HAS_TRITON:
     #   fwd does relu²(z) → matmul(W_proj) → +residual   (elem + matmul + elem)
     #   bwd does matmul(dy @ W_proj) → ×2·relu(z)        (matmul + elem)
     # Fuses dr-matmul with the relu²-bwd elementwise so dr never goes to
-    # HBM (saves ~50 MB round-trip at d24). dW_proj uses a different
-    # reduction axis (sum over M, not over K_out) and stays on cuBLAS.
-    # Fixed config — autotuned at d24, hardcoded for CUDA Graph compat.
+    # HBM (saves ~50 MB round-trip at d24).
+    #
+    # Fixed config (was @triton.autotune'd, winner hardcoded for CUDA
+    # Graph compat). Caller passes (BLOCK_M=64, BLOCK_N=128, BLOCK_K_OUT=32,
+    # num_warps=8, num_stages=3) — what autotune picked for d24 shape.
     @triton.jit
     def _relu_sq_linear_residual_bwd_kernel(
         dy_ptr,        # (M, K_out) bf16 — gradient w.r.t. y
@@ -901,32 +903,11 @@ if _HAS_TRITON:
     # Reduction is over M (different axis from dz kernel's K_out
     # reduction), so it's a separate kernel.
     #
-    # This is a transposed matmul (`A.T @ B`) which Triton handles less
-    # efficiently than cuBLAS — autotuned to claw back the gap. Trade-off
-    # vs the fixed-config Step A: autotune dispatcher disables CUDA Graph
-    # capture for this kernel. nanchat doesn't currently use CG for bwd
-    # anyway, so the trade is fine.
-    _DW_PROJ_CONFIGS = [
-        triton.Config({"BLOCK_KO": 32,  "BLOCK_N": 32,  "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 32,  "BLOCK_N": 64,  "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 32,  "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 64,  "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 32,  "BLOCK_N": 128, "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 128, "BLOCK_N": 32,  "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 64,  "BLOCK_M_RED": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 128, "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 128, "BLOCK_M_RED": 32}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_KO": 128, "BLOCK_N": 64,  "BLOCK_M_RED": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_KO": 128, "BLOCK_N": 64,  "BLOCK_M_RED": 32}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_KO": 128, "BLOCK_N": 128, "BLOCK_M_RED": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 64,  "BLOCK_M_RED": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_KO": 64,  "BLOCK_N": 128, "BLOCK_M_RED": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_KO": 128, "BLOCK_N": 64,  "BLOCK_M_RED": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_KO": 256, "BLOCK_N": 32,  "BLOCK_M_RED": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_KO": 32,  "BLOCK_N": 256, "BLOCK_M_RED": 32}, num_warps=8, num_stages=2),
-    ]
-
-    @triton.autotune(configs=_DW_PROJ_CONFIGS, key=["M", "N", "K_out"])
+    # Transposed matmul (`A.T @ B`) needs careful tile selection — was
+    # @triton.autotune'd over 17 configs, winner hardcoded for CUDA
+    # Graph compat. Caller passes (BLOCK_KO=64, BLOCK_N=128,
+    # BLOCK_M_RED=32, num_warps=4, num_stages=3) — what autotune picked
+    # for d24 shape.
     @triton.jit
     def _dW_proj_with_relu_sq_kernel(
         dy_ptr,        # (M, K_out) bf16
@@ -1186,32 +1167,32 @@ class FusedMLPBlock(torch.autograd.Function):
         # Step A: Triton kernel that mirrors the fwd kernel's structure.
         # Fwd was (relu² + matmul + residual_add); bwd is (matmul + relu²
         # bwd). Fuses dr = dy @ W_proj with the dz = dr·2·relu(z)
-        # elementwise — dr never goes to HBM. Same fixed config as fwd.
-        BLOCK_M, BLOCK_N, BLOCK_K_OUT = 64, 128, 32
+        # elementwise — dr never goes to HBM. Fixed config (autotuned
+        # at d24, locked in for CUDA Graph compat).
+        BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 64, 128, 32
         dz = torch.empty_like(z)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_fc, BLOCK_N))
+        grid = (triton.cdiv(M, BLOCK_M_A), triton.cdiv(N_fc, BLOCK_N_A))
         _relu_sq_linear_residual_bwd_kernel[grid](
             dy, z, W_proj, dz,
             M, N_fc, K_out,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K_OUT=BLOCK_K_OUT,
+            BLOCK_M=BLOCK_M_A, BLOCK_N=BLOCK_N_A, BLOCK_K_OUT=BLOCK_K_OUT_A,
             IEEE_PRECISION=ieee,
-            num_warps=4, num_stages=3,
+            num_warps=8, num_stages=3,
         )
 
         # Step B: dW_proj via Triton kernel — same on-the-fly r = relu²(z)
         # fusion as Step A, no HBM round-trip on r. Different reduction
-        # axis (M instead of K_out) so it's a separate kernel. Autotuned
-        # because this is a transposed matmul (`A.T @ B`) where Triton
-        # needs help to match cuBLAS.
+        # axis (M instead of K_out) so it's a separate kernel. Fixed
+        # config (autotuned at d24, locked in for CUDA Graph compat).
+        BLOCK_KO_B, BLOCK_N_B, BLOCK_M_RED_B = 64, 128, 32
         dW_proj = torch.empty((K_out, N_fc), dtype=z.dtype, device=z.device)
-        grid_b = lambda meta: (
-            triton.cdiv(K_out, meta["BLOCK_KO"]),
-            triton.cdiv(N_fc, meta["BLOCK_N"]),
-        )
+        grid_b = (triton.cdiv(K_out, BLOCK_KO_B), triton.cdiv(N_fc, BLOCK_N_B))
         _dW_proj_with_relu_sq_kernel[grid_b](
             dy, z, dW_proj,
             M, N_fc, K_out,
+            BLOCK_KO=BLOCK_KO_B, BLOCK_N=BLOCK_N_B, BLOCK_M_RED=BLOCK_M_RED_B,
             IEEE_PRECISION=ieee,
+            num_warps=4, num_stages=3,
         )
 
         # Step C: c_fc backward (cuBLAS).
