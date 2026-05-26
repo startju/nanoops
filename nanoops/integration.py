@@ -117,6 +117,54 @@ def _mlp_inner(self, x):
     return x
 
 
+def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
+    """Block.forward with the mlp side replaced by `fused_mlp_block`.
+
+    Original (nanchat.gpt.Block.forward):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
+
+    Patched: attn side unchanged; the second line collapses
+    `norm + c_fc + relu² + c_proj + outer-residual-add` into one fused
+    call (3 Triton kernels fwd + 4 Triton kernels bwd, see TRITON_zh.md
+    §3). Input reshape (B,T,C) → (B·T, C) is a no-op view (contiguous
+    along last dim), so no extra copy.
+
+    norm_weight=None because nanchat's `norm()` is
+    `F.rms_norm(x, (x.size(-1),))` — plain RMSNorm without per-channel
+    affine (see gpt.py:42).
+
+    Inference paths (kv_cache present) bypass the fusion — the kv_cache
+    interaction with the (B,T,C) → 2D reshape needs more thought and
+    inference time isn't on the bench path.
+    """
+    # attn side — unchanged
+    x = x + self.attn(_orig_norm(x), ve, cos_sin, window_size, kv_cache)
+    # mlp side — fused (training, CUDA only)
+    if kv_cache is not None or not x.is_cuda:
+        # Inference (kv_cache present) or CPU (e.g. tiny test harness):
+        # fall back to the original mlp+norm+residual chain.
+        return x + self.mlp(_orig_norm(x))
+    B, T, C = x.shape
+    # `.contiguous()` is cheap when already contiguous (returns same tensor);
+    # if attn produced a non-contiguous view (e.g. via stride tricks) the
+    # fused kernel needs contiguous input for its index arithmetic.
+    x_2d = x.reshape(B * T, C).contiguous()
+    y_2d = _fused_mlp_block(
+        x_2d, None,
+        self.mlp.c_fc.weight.to(x.dtype),
+        self.mlp.c_proj.weight.to(x.dtype),
+    )
+    return y_2d.reshape(B, T, C)
+
+
+# Captured at _apply() time so `_patched_block_forward` can call the
+# original `norm` function (since the F-namespace patch may have routed
+# `nanchat.gpt.F` through nanoops).
+_orig_norm = None
+_fused_mlp_block = None
+
+
 def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
     """Activation-checkpoint the full-attention (L) layers. Only the L
     layers are checkpointed — sliding-window S layers already use
@@ -271,6 +319,21 @@ def _apply() -> dict[str, dict]:
     gpt_mod = importlib.import_module("nanochat.gpt")
     originals["method"][("nanochat.gpt", "MLP", "forward")] = gpt_mod.MLP.forward
     gpt_mod.MLP.forward = _patched_mlp_forward
+    # Block.forward: opt-in via NANOOPS_FUSED_MLP_BLOCK=1. Replaces the
+    # mlp half of Block.forward — `x + mlp(norm(x))` — with a single
+    # `fused_mlp_block(x, None, W_fc, W_proj)` call that collapses
+    # norm + c_fc + relu² + c_proj + outer residual into 3 fwd Triton
+    # kernels (one cuBLAS matmul kept for c_fc) + 4 bwd Triton kernels.
+    # See nanoops/TRITON_zh.md §3 for the fusion breakdown. Supersedes
+    # the relu_square fusion (which is a subset of what's fused here).
+    if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
+        from .triton_kernels import fused_mlp_block as _fmb
+        global _orig_norm, _fused_mlp_block
+        assert _orig_norm is None, "_orig_norm already captured — call _restore() first"
+        _orig_norm = gpt_mod.norm
+        _fused_mlp_block = _fmb
+        originals["method"][("nanochat.gpt", "Block", "forward")] = gpt_mod.Block.forward
+        gpt_mod.Block.forward = _patched_block_forward
     # L-layer activation checkpoint: opt-in via NANOOPS_L_ATTN_CHECKPOINT=1.
     # Installed conditionally so when the env var is OFF, attention forward
     # stays the original (no per-call wrapper cost). Env var read once here
@@ -328,9 +391,11 @@ def _restore(originals: dict[str, dict]) -> None:
     for (modname, cls_name, method_name), original in originals["method"].items():
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
-    global _PATCHED, _orig_attn_forward
+    global _PATCHED, _orig_attn_forward, _orig_norm, _fused_mlp_block
     _PATCHED = False
     _orig_attn_forward = None
+    _orig_norm = None
+    _fused_mlp_block = None
 
 
 def patch_nanchat() -> list[str]:
@@ -350,6 +415,8 @@ def patch_nanchat() -> list[str]:
         names.append("MuonAdamW/DistMuonAdamW(CPU optim state offload)")
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
         names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
+    if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
+        names.append("Block.forward(fused_mlp_block — supersedes relu_square fusion)")
     return names
 
 
