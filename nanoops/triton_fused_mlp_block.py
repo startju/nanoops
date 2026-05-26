@@ -787,6 +787,7 @@ def _fused_mlp_block_bwd_impl(
 # shape/dtype works for tracing, here's how its autograd works." Inductor
 # keeps fusing on both sides of the call.
 
+
 @torch.library.custom_op(
     "nanoops::fused_mlp_block_fwd",
     mutates_args=(),
@@ -829,6 +830,7 @@ def _fused_mlp_block_fwd_fake(
 # 4 tensors and use a 1-elem placeholder for dnw when norm_weight is None.
 # The autograd-side wrapper below substitutes that placeholder back to None
 # (autograd convention: gradient for None input must be None).
+
 
 @torch.library.custom_op(
     "nanoops::fused_mlp_block_bwd",
@@ -877,9 +879,7 @@ def _fused_mlp_block_bwd_fake(
 
 def _fused_mlp_block_setup_context(
     ctx: Any,
-    inputs: tuple[
-        torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, float
-    ],
+    inputs: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, float],
     output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
     x, norm_weight, fc_weight, proj_weight, _eps = inputs
@@ -945,5 +945,3 @@ def fused_mlp_block(
         x, norm_weight, fc_weight, proj_weight, eps
     )
     return y
-
-

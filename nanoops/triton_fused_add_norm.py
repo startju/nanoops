@@ -661,6 +661,7 @@ def _fused_add_norm_bwd_impl(
 # dynamo "opaque op, here's its shape via register_fake, here's its
 # autograd". Same pattern used in `triton_fused_mlp_block.py`. ──
 
+
 @torch.library.custom_op(
     "nanoops::fused_add_norm_fwd",
     mutates_args=(),
@@ -695,6 +696,7 @@ def _fused_add_norm_fwd_fake(
 # None. The autograd wrapper below substitutes that placeholder back to
 # None before returning to autograd (autograd requires None grad for a
 # None input).
+
 
 @torch.library.custom_op(
     "nanoops::fused_add_norm_bwd",
@@ -797,5 +799,3 @@ def fused_add_norm(
     # only, so we drop it here and return the original (y, summed) shape.
     y, summed, _rms_inv = _fused_add_norm_fwd_op(x, residual, norm_weight, eps)
     return y, summed
-
-
