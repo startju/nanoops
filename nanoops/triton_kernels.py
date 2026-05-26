@@ -1122,20 +1122,6 @@ if _HAS_TRITON:
     #   inner    = inner_buf                    (A already divided by norm_dim)
     #   dx       = rms_inv · (g_eff - y_norm · inner) + dy  (outer residual passthrough)
     #   dnw_partial[m_tile, k] = Σ_{m∈m_tile} (dx_hat · y_norm)  [HAS_NW only]
-    @triton.autotune(
-        configs=[
-            # Conservative configs only — shared mem budget computed for
-            # fp32 IEEE path (4 bytes/elem). Per stage: dz_tile + W_fc_tile +
-            # acc ≤ ~64 KB; total with num_stages=2 ≤ 128 KB (under 3090's
-            # 100 KB SM limit with some slack).
-            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
-            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 64,  'BLOCK_N': 64},  num_warps=8, num_stages=3),
-            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 32,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
-            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 32,  'BLOCK_N': 128}, num_warps=4, num_stages=3),
-        ],
-        key=['M', 'N_fc', 'K', 'IEEE_PRECISION', 'HAS_NW'],
-    )
     @triton.jit
     def _mlp_dx_bwd_kernel(
         dz_ptr,  # (M, N_fc) bf16
@@ -1320,10 +1306,13 @@ class FusedMLPBlock(torch.autograd.Function):
         # Step 1: c_fc via `_cast_matmul_kernel` — Triton matmul that
         # loads fc_weight (fp32 master typical) in native dtype and casts
         # inline. Replaces `torch.matmul(x_hat, fc_weight.t())` to avoid
-        # materializing a bf16 cast weight tile; trade is Triton matmul's
-        # ~10-15% efficiency gap vs cuBLAS for ~1 launch + ~75 μs HBM
-        # saved on the cast.
-        BLOCK_M_S1, BLOCK_N_S1, BLOCK_K_S1 = 64, 64, 64
+        # materializing a bf16 cast weight tile.
+        # d24 manual sweep winner (bf16): (BM=256, BN=64, BK=32, nw=8, st=2)
+        # gives 639 us — ~2× faster than (64,64,64,nw=4,st=3) and slightly
+        # beats cuBLAS+cast (654 us effective). Per-stage shared mem in
+        # fp32 IEEE path: (256·32 + 64·32)·4 = 40 KB; ×2 stages = 80 KB,
+        # within 100 KB budget, so safe for parity tests too.
+        BLOCK_M_S1, BLOCK_N_S1, BLOCK_K_S1 = 256, 64, 32
         z = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
         grid_s1 = (triton.cdiv(M, BLOCK_M_S1), triton.cdiv(N_fc, BLOCK_N_S1))
         _cast_matmul_kernel[grid_s1](
@@ -1331,27 +1320,23 @@ class FusedMLPBlock(torch.autograd.Function):
             M, N_fc, K,
             BLOCK_M=BLOCK_M_S1, BLOCK_N=BLOCK_N_S1, BLOCK_K=BLOCK_K_S1,
             IEEE_PRECISION=ieee,
-            num_warps=4, num_stages=3,
+            num_warps=8, num_stages=2,
         )
 
         # Step 2: Triton kernel for relu² + c_proj + outer residual (= x).
-        BLOCK_M_FWD, BLOCK_K_OUT_FWD, BLOCK_N_FWD = 64, 128, 32
+        # d24 sweep winner: (BM=128, BKO=64, BN=32, nw=8, st=2) at 737 us
+        # (vs (64,128,32,4,3) 750 us). Marginal but free.
+        BLOCK_M_FWD, BLOCK_K_OUT_FWD, BLOCK_N_FWD = 128, 64, 32
         y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
         grid = (triton.cdiv(M, BLOCK_M_FWD), triton.cdiv(K_proj_out, BLOCK_K_OUT_FWD))
         _relu_sq_linear_residual_fwd_kernel[grid](
-            z,
-            proj_weight,
-            x,
-            y,
-            M,
-            N_fc,
-            K_proj_out,
+            z, proj_weight, x, y,
+            M, N_fc, K_proj_out,
             BLOCK_M=BLOCK_M_FWD,
             BLOCK_K_OUT=BLOCK_K_OUT_FWD,
             BLOCK_N=BLOCK_N_FWD,
             IEEE_PRECISION=ieee,
-            num_warps=4,
-            num_stages=3,
+            num_warps=8, num_stages=2,
         )
 
         ctx.save_for_backward(norm_weight, fc_weight, proj_weight, x, rms_inv, z)
@@ -1370,46 +1355,39 @@ class FusedMLPBlock(torch.autograd.Function):
         # A: dz = 2·relu(z) · (dy @ W_proj)         ← matmul + relu² bwd fused
         #    inner_buf[m] += Σ_n(dz·z) / norm_dim   ← atomic_add side-output for D
         #                                             (see kernel header for why atomic)
-        BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 64, 128, 32
+        # d24 sweep winner: (BM=128, BN=128, BKO=32, nw=8, st=2) at 721 us
+        # (vs prior (64,128,32,8,3) 800 us — ~10% speedup).
+        BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 128, 128, 32
         dz = torch.empty_like(z)
         inner_buf = torch.zeros((M,), dtype=torch.float32, device=z.device)
         grid = (triton.cdiv(M, BLOCK_M_A), triton.cdiv(N_fc, BLOCK_N_A))
         _mlp_dz_bwd_kernel[grid](
-            dy,
-            z,
-            W_proj,
-            dz,
-            inner_buf,
-            M,
-            N_fc,
-            K_out,
+            dy, z, W_proj, dz, inner_buf,
+            M, N_fc, K_out,
             BLOCK_M=BLOCK_M_A,
             BLOCK_N=BLOCK_N_A,
             BLOCK_K_OUT=BLOCK_K_OUT_A,
             IEEE_PRECISION=ieee,
-            num_warps=8,
-            num_stages=3,
+            num_warps=8, num_stages=2,
         )
 
         # B: dW_proj = dy.T @ relu²(z), r recomputed inline.
-        BLOCK_K_OUT_B, BLOCK_N_B, BLOCK_M_B = 64, 128, 32
         # Match W_proj's dtype (fp32 master) so autograd accumulates dW
         # directly onto the master weight without a downstream .to() cast.
+        # d24 sweep winner: (BKO=64, BN=128, BM=64, nw=4, st=2) at 590 us
+        # (vs prior (64,128,32,4,3) 597 us — within noise; keeping for
+        # slight HBM bandwidth advantage from BM=64 reduction tile).
+        BLOCK_K_OUT_B, BLOCK_N_B, BLOCK_M_B = 64, 128, 64
         dW_proj = torch.empty((K_out, N_fc), dtype=W_proj.dtype, device=z.device)
         grid_b = (triton.cdiv(K_out, BLOCK_K_OUT_B), triton.cdiv(N_fc, BLOCK_N_B))
         _mlp_dW_proj_bwd_kernel[grid_b](
-            dy,
-            z,
-            dW_proj,
-            M,
-            N_fc,
-            K_out,
+            dy, z, dW_proj,
+            M, N_fc, K_out,
             BLOCK_K_OUT=BLOCK_K_OUT_B,
             BLOCK_N=BLOCK_N_B,
             BLOCK_M=BLOCK_M_B,
             IEEE_PRECISION=ieee,
-            num_warps=4,
-            num_stages=3,
+            num_warps=4, num_stages=2,
         )
 
         # has_nw — norm_weight exists. Gates both the affine x_hat formula
@@ -1445,9 +1423,17 @@ class FusedMLPBlock(torch.autograd.Function):
         # leaves the kernel. Elementwise dx unlocked by A's pre-divided
         # inner_buf. The outer residual passthrough (dy) is folded into
         # dx in-kernel.
-        # BLOCK_M fixed (autotune only varies BLOCK_K/BLOCK_N) so the
-        # dnw_partials buffer shape stays predictable.
+        # d24 bf16 sweep winner: (BK=64, BN=128, nw=8, st=2) at 1043 us
+        # (vs (64,64,nw=4,st=3) 1456 us — 28% speedup). For fp32 IEEE
+        # path that config would exceed 100 KB SM shared-mem budget
+        # ((64·128+128·64)·4 = 64 KB/stage × 2 = 128 KB), so use a safer
+        # config for parity tests. BLOCK_M=64 fixed (dnw_partials shape
+        # depends on it).
         BLOCK_M_D = 64
+        if ieee:
+            BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3   # fp32-safe
+        else:
+            BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 128, 8, 2  # bf16 winner
         num_m_tiles = triton.cdiv(M, BLOCK_M_D)
         dx = torch.empty_like(x)
         if has_nw:
@@ -1459,13 +1445,15 @@ class FusedMLPBlock(torch.autograd.Function):
         else:
             # 1-elem placeholder — kernel won't touch it when HAS_NW=False.
             dnw_partials = torch.empty(1, dtype=x.dtype, device=x.device)
-        grid_d = lambda meta: (num_m_tiles, triton.cdiv(K, meta['BLOCK_K']))
+        grid_d = (num_m_tiles, triton.cdiv(K, BLOCK_K_D))
         _mlp_dx_bwd_kernel[grid_d](
             dz, W_fc, x, rms_inv, nw_arg, dy, inner_buf,
             dx, dnw_partials,
             M, N_fc, K,
+            BLOCK_M=BLOCK_M_D, BLOCK_K=BLOCK_K_D, BLOCK_N=BLOCK_N_D,
             IEEE_PRECISION=ieee,
             HAS_NW=has_nw,
+            num_warps=NW_D, num_stages=ST_D,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
 
