@@ -47,6 +47,16 @@ export NANOOPS_OFFLOAD_OPTIM="${NANOOPS_OFFLOAD_OPTIM:-1}"
 # trick needed to fit d24+B=1 on a single 24 GiB GPU. Opt out with
 # empty value.
 export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
+# FusedMLPBlock ON by default — swaps `nanchat.gpt.Block.forward`'s
+# `x + mlp(norm(x))` path with a single autograd.Function that runs the
+# whole RMSNorm + c_fc + relu² + c_proj + residual in 3 fused Triton
+# kernels fwd / 4 fused Triton kernels bwd (no cuBLAS). All weight casts
+# are folded into the matmul kernels, dW lands directly on fp32 master.
+# d24+B=1 on 3090 measured ~+2.6% tok/s vs the eager mlp path with full
+# loss parity at 5-step resume; full op-level micro-bench is ~+9% but
+# torch.compile black-box dilutes that. Opt out with empty value.
+# CPU / kv-cache fallback already wired in _patched_block_forward.
+export NANOOPS_FUSED_MLP_BLOCK="${NANOOPS_FUSED_MLP_BLOCK:-1}"
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}
