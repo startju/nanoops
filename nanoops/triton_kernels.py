@@ -1009,8 +1009,8 @@ if _HAS_TRITON:
                 x_ptr + ms[:, None] * K + ks[None, :],
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            rms_inv = tl.load(rms_inv_ptr + ms, mask=m_mask, other=0.0).to(tl.float32)
+            )
+            rms_inv = tl.load(rms_inv_ptr + ms, mask=m_mask, other=0.0)
             if HAS_NW:
                 x_hat = x * rms_inv[:, None] * nw[None, :]
             else:
@@ -1106,13 +1106,13 @@ if _HAS_TRITON:
         # residual gradient (dy) into dx in-kernel.
         offs = rows[:, None] * K + ks[None, :]
         mask_2d = row_mask[:, None] & k_mask[None, :]
-        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
         # inner = (1/K) · Σ_n(dz·z); load raw buf and divide here (saves a
         # tiny `inner_buf / K` op + launch in the Python caller).
         inner = (
-            tl.load(inner_buf_ptr + rows, mask=row_mask, other=0.0).to(tl.float32) / K
+            tl.load(inner_buf_ptr + rows, mask=row_mask, other=0.0) / K
         )
-        x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0)
         # dy kept in native dtype — cast the fp32 norm-path result to
         # output dtype first, then add dy. Saves a bf16→fp32 conversion
         # on dy load + skips the final cast on store (small but free).
@@ -1120,7 +1120,7 @@ if _HAS_TRITON:
 
         y_norm = x * rms_inv[:, None]
         if HAS_NW:
-            nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0)
             g_eff = dx_hat * nw[None, :]
         else:
             g_eff = dx_hat
