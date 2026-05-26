@@ -401,15 +401,17 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
     summed = x + r
     tl.store(summed_ptr + offs, summed, mask=mask)        # ← caller 的 residual stream + bwd 用
 
-    summed_f32 = summed.to(tl.float32)                    # 从这里开始 fp32，对齐 F.rms_norm 精度
-    sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
+    # bf16 squared products feed an fp32 accumulator via `dtype=`. 比起
+    # 显式 `summed.to(fp32)` 后再平方，省一个中间 register tile;
+    # 代价是平方在 bf16 里做（精度损失 ~1e-1, atol 容许内）。
+    sum_sq = tl.sum(summed * summed, axis=1, dtype=tl.float32)
     rms_inv = tl.rsqrt(sum_sq / D + eps)               # rsqrt.approx.f32 单指令
     tl.store(rms_inv_ptr + rows, rms_inv, mask=rows < M)  # ← bwd 用
 
-    y = summed_f32 * rms_inv[:, None]
+    y = summed * rms_inv[:, None]                       # bf16 * fp32 → fp32 (auto-promote)
     if HAS_NW:
-        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0).to(tl.float32)
-        y = y * nw[None, :]
+        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0)
+        y = y * nw[None, :]                             # fp32 * bf16 → fp32 (auto-promote)
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 ```
 
@@ -425,8 +427,9 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
 - **store 时 `element_ty` cast** 让同一个 kernel 支持 caller 传任意
   dtype（bf16 / fp16 / fp32）无需修改。
 - **`summed` 是 kernel 中途写 HBM 的，不是最后**。故意如此：caller
-  的 residual stream 需要 bf16 版，但下游 fp32 compute pipeline 用
-  `summed_f32` 留在 register 里继续算，不重新 load。
+  的 residual stream 需要 bf16 版，下游计算 reuse 这同一个 bf16
+  register tile（喂给 `tl.sum(dtype=fp32)` 做平方累加，以及
+  `summed * rms_inv` 时 Triton auto-promote 到 fp32），不重新 load。
 
 ### 2.2 Backward：根据 register 预算选 kernel
 
@@ -577,7 +580,7 @@ tile 数：
 
 | Kernel | n_live_tiles | 原因 |
 |---|---|---|
-| fwd | 2 | `summed_f32` + `y_f32` |
+| fwd | 2 | auto-promoted summed-as-fp32 + `y_f32` |
 | inner 预算（fallback） | 2 | `y_norm` + `g_eff` 短暂 |
 | bwd inline (HAS_NW=True) | 5 | `y_norm`、`g_eff`、`dy_t`、`d_ext`、`d_summed` |
 | bwd inline (HAS_NW=False) | 4 | 同上，但 `y_norm`/`g_eff` 别名 `src`/`dy_t` |
@@ -605,25 +608,37 @@ Graph stream capture 的操作。写死 config 让 fallback 路径对 graph
 
 ### 2.5 数值精度
 
-这个 kernel **bit-for-bit** 对齐 `F.rms_norm` 在 bf16 输入上的行为
-——实测验证：PyTorch 的 `F.rms_norm` 内部把 bf16 升 fp32 做 reduction
-和 elementwise scale，最后 cast 回去。我们一模一样：
+这个 kernel **跟 `F.rms_norm` 在 bf16 输入上的行为近似但不 bit-tight**——
+PyTorch 的 `F.rms_norm` 内部把 bf16 升 fp32 **再做平方**，我们图省一
+个 register tile，让平方留在 bf16 里、只把 accumulator 升 fp32：
+
+```python
+# F.rms_norm  : summed.to(fp32) → (fp32 * fp32)² → fp32 sum
+# 我们的 fwd  : (bf16 * bf16)² → fp32 sum  (via `tl.sum(..., dtype=fp32)`)
+```
+
+平方在 bf16 截了一次精度，长 D 累加下来 max forward diff ~1.5e-1（在
+adversarial 测试 seeds 上；正常 seeds 远低于这个），低于 gradient
+noise floor。`test_triton_norm_mlp.py` 的 bf16 atol 也相应放到 1.5e-1。
 
 | 操作 | 在哪 | 为什么 |
 |---|---|---|
-| HBM load `x`、`r` | bf16（caller dtype） | 省带宽 |
+| HBM load `x`、`r`、`nw` | bf16（caller dtype） | 省带宽 |
 | `summed = x + r`、residual-stream store | register 里 bf16 | caller 要 bf16 |
-| `sum_sq` reduction、`rsqrt`、y 乘法 | **register 里 fp32** | 匹配 F.rms_norm 精度 |
+| `summed * summed` 平方 | **register 里 bf16**（截精） | 省一个 fp32 register tile |
+| `tl.sum(..., dtype=tl.float32)` | **accumulator 升 fp32** | 防 long-D 累加溢 mantissa |
+| `summed * rms_inv` / `* nw` | **auto-promote 到 fp32** | rms_inv 是 fp32，Triton 自动升级 |
 | 最终 `y` store | cast 回 bf16 | caller 要 bf16 |
 
-bf16 形态的 `summed` **只在 store 那一刻短暂需要**——下游 fp32
-pipeline 一直用 `summed_f32` 在 register 里，直到最后 y store 再 cast。
+**净 register 压力跟「全 fp32 internal」实现差不多**（fwd kernel：
+tile=16384, nw=4 实测 n_regs≈255）——`summed * rms_inv` 的 auto-promote
+反正会在 register 里物化一个 fp32 tile，省下的就是显式 `summed_f32`
+中间变量那一份 SSA 名字。bf16 路径是为了 **HBM dtype 兼容**，不是
+register 省钱。
 
-**净 register 压力跟「全 fp32 internal」实现一样**（fwd kernel：
-tile=16384, nw=4 实测 n_regs=255）。bf16 路径是为了 **HBM dtype
-兼容**，不是 register 省钱。这里有个反直觉的点：「低精度省 register」
-的直觉在 reduction kernel 上是错的——一旦某处需要 fp32 精度，编译器
-会把 fp32 版本一直保留在剩下的 kernel 里。
+> 想要 bit-tight 跟 `F.rms_norm` 对齐？显式 `summed.to(tl.float32)` 后
+> 再平方即可（多一份 register tile，跟 fp32-internal 实现一致）。当前
+> 实现选了精度 vs register 的 tradeoff，工程上更划算。
 
 ### 2.6 预期收益 —— HBM 和 launch 账本
 

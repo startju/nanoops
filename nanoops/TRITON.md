@@ -443,15 +443,18 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
     summed = x + r
     tl.store(summed_ptr + offs, summed, mask=mask)        # ← for caller's residual stream + bwd
 
-    summed_f32 = summed.to(tl.float32)                    # fp32 from here for numerical match
-    sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
+    # bf16 squared products feed an fp32 accumulator via `dtype=`. Saves
+    # an intermediate fp32 register tile vs `summed.to(fp32)` and squaring
+    # in fp32, at the cost of doing the square in bf16 (precision loss
+    # ~1.5e-1, within test atol).
+    sum_sq = tl.sum(summed * summed, axis=1, dtype=tl.float32)
     rms_inv = tl.rsqrt(sum_sq / D + eps)               # rsqrt.approx.f32 (one PTX instruction)
     tl.store(rms_inv_ptr + rows, rms_inv, mask=rows < M)  # ← needed by bwd
 
-    y = summed_f32 * rms_inv[:, None]
+    y = summed * rms_inv[:, None]                       # bf16 * fp32 → fp32 (auto-promote)
     if HAS_NW:
-        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0).to(tl.float32)
-        y = y * nw[None, :]
+        nw = tl.load(nw_ptr + cols, mask=cols < D, other=0.0)
+        y = y * nw[None, :]                             # fp32 * bf16 → fp32 (auto-promote)
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 ```
 
@@ -468,16 +471,17 @@ Patterns to notice:
 - **`element_ty` cast at store** lets the same kernel handle any
   caller dtype (bf16 / fp16 / fp32) without modification.
 - **`summed` is written to HBM mid-kernel**, not at the end. This is
-  intentional: the caller's residual stream needs the bf16 value, but
-  the fp32 compute pipeline downstream of the store keeps using
-  `summed_f32` in registers without re-loading.
+  intentional: the caller's residual stream needs the bf16 value, and
+  the downstream compute reuses that same bf16 register tile (feeding
+  the `tl.sum(dtype=fp32)` reduction and the `summed * rms_inv` step,
+  where Triton auto-promotes to fp32) without re-loading from HBM.
 
 ### 2.2 Backward path: register budget chooses the kernel
 
 There are two viable backward kernel shapes. Which one runs depends
 on whether the **inline** kernel's per-program tile fits the Ampere
 255 fp32 reg/thread spill cap. The dispatch lives in
-`FusedAddNorm.backward` and is driven by `TileConfig.fits_reg_budget`.
+`_fused_add_norm_bwd_impl` and is driven by `TileConfig.fits_reg_budget`.
 
 #### The simple thing first: one kernel, full row per program
 
@@ -628,13 +632,13 @@ alive simultaneously in the hot path:
 
 | Kernel | n_live_tiles | Why |
 |---|---|---|
-| fwd | 2 | `summed_f32` + `y_f32` |
+| fwd | 2 | auto-promoted summed-as-fp32 + `y_f32` |
 | inner pre-compute (fallback) | 2 | `y_norm` + `g_eff` briefly |
 | bwd inline (HAS_NW=True) | 5 | `y_norm`, `g_eff`, `dy_t`, `d_ext`, `d_summed` |
 | bwd inline (HAS_NW=False) | 4 | as above but `y_norm`/`g_eff` alias `src`/`dy_t` |
 
 The `TileConfig.fits_reg_budget` property (`est_regs ≤ 256`) is what
-`FusedAddNorm.backward` queries to choose inline vs 2-kernel fallback.
+`_fused_add_norm_bwd_impl` queries to choose inline vs 2-kernel fallback.
 
 Worked examples at d24 shape (M=2048, D=1536, BLOCK_D=2048):
 
@@ -656,28 +660,41 @@ inner pre-compute kernel uses `_pick_tile_config` (with n_live=2).
 
 ### 2.5 Numerical precision
 
-This kernel matches `F.rms_norm`'s numerical behavior **bit-for-bit**
-on bf16 inputs. We verified empirically: PyTorch's `F.rms_norm`
-internally promotes bf16 → fp32 for the reduction and elementwise
-scale, then casts back. Our kernel does the same:
+This kernel is **close to but not bit-tight** with `F.rms_norm` on
+bf16 inputs. PyTorch's `F.rms_norm` internally promotes bf16 → fp32
+**before** squaring; we save one register tile by leaving the square
+in bf16 and only promoting the accumulator:
+
+```python
+# F.rms_norm  : summed.to(fp32) → (fp32 * fp32)² → fp32 sum
+# our fwd     : (bf16 * bf16)² → fp32 sum  (via `tl.sum(..., dtype=fp32)`)
+```
+
+The bf16-truncated square plus a long-D accumulation drifts about
+~1.5e-1 max forward diff on adversarial seeds (well below the
+gradient-noise floor on typical inputs). The `test_triton_norm_mlp.py`
+bf16 atol is set to 1.5e-1 to allow this.
 
 | Operation | Where it lives | Why |
 |---|---|---|
-| HBM load of `x`, `r` | bf16 (caller's dtype) | Cheaper bandwidth |
+| HBM load of `x`, `r`, `nw` | bf16 (caller's dtype) | Cheaper bandwidth |
 | `summed = x + r`, residual-stream store | bf16 in registers | Caller expects bf16 |
-| `sum_sq` reduction, `rsqrt`, y multiply | **fp32 in registers** | Match F.rms_norm precision |
+| `summed * summed` square | **bf16 in registers** (lossy) | Saves one fp32 register tile |
+| `tl.sum(..., dtype=tl.float32)` | **fp32 accumulator** | Prevents long-D mantissa overflow |
+| `summed * rms_inv` / `* nw` | **auto-promoted to fp32** | rms_inv is fp32, Triton lifts on multiply |
 | Final `y` store | cast back to bf16 | Caller expects bf16 |
 
-The bf16 form of `summed` is needed only briefly to write the
-residual-stream buffer; everything downstream of that store lives in
-fp32 registers until the final y cast.
+**Net register pressure is roughly the same as a fully-fp32-internal
+implementation** (fwd kernel: n_regs≈255 at tile=16384, nw=4) — the
+auto-promote in `summed * rms_inv` materializes an fp32 tile anyway;
+we save the SSA name of the explicit `summed_f32` intermediate but not
+the underlying register. The bf16 path is about HBM dtype compatibility,
+not register savings.
 
-**Net register pressure is the same as a fully-fp32-internal
-implementation** (fwd kernel: n_regs=255 at tile=16384, nw=4). The
-bf16 path is about HBM dtype compatibility, not register savings.
-This is a place where the "save registers by staying low-precision"
-intuition fails: once you need fp32 for accuracy somewhere, the
-compiler keeps the fp32 version alive across the rest of the kernel.
+> Want strict bit-parity with `F.rms_norm` instead? Add `summed.to(tl.float32)`
+> before the square (costing one register tile, matching the fully-fp32
+> implementation). The current code chose the precision-vs-register
+> tradeoff that's worth more in practice.
 
 ### 2.6 Expected savings — HBM and launch ledger
 

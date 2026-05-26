@@ -520,11 +520,12 @@ def _fused_add_norm_fwd_impl(
     BLOCK_D = triton.next_power_of_2(D)
 
     # Tile sizing via the shared _pick_tile_config helper. fwd's hot
-    # path holds ~2 fp32 tiles alive simultaneously (the auto-promoted
-    # summed-as-fp32 used for sum_sq and `summed * rms_inv`, plus the
-    # y_f32 result during the optional `* nw`). The helper translates
-    # that to BLOCK_M and num_warps under the Ampere 255 fp32 reg/
-    # thread spill cap (see helper docstring for the formula).
+    # path holds ~2 fp32 tiles alive simultaneously: the auto-promoted
+    # summed-as-fp32 (used for both sum_sq and `summed * rms_inv`), and
+    # the y_f32 result tile that holds the scaled values until store
+    # (optionally multiplied by nw when HAS_NW=True). The helper
+    # translates that to BLOCK_M and num_warps under the Ampere 255
+    # fp32 reg/thread spill cap (see helper docstring for the formula).
     cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=2)
     BLOCK_M, num_warps = cfg.block_m, cfg.num_warps
 
