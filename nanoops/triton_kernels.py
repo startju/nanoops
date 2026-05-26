@@ -762,6 +762,63 @@ def fused_add_norm(
 
 
 if _HAS_TRITON:
+    # c_fc matmul with inline weight cast: z = x @ W_fc.T, but W_fc is
+    # loaded in its native dtype (fp32 master) and cast to x's dtype
+    # (bf16) on load — avoids materializing a bf16 cast weight tile in
+    # HBM. Replaces `torch.matmul(x_hat, fc_weight.t())` in fwd step 1.
+    # Trade: lose cuBLAS's tensor-core efficiency (~70% peak) for
+    # Triton's (~60% peak), gain 1 launch + ~75 μs HBM round-trip
+    # (36 MB write+read at d24).
+    # d24 config locked: (BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, nw=4, st=3).
+    @triton.jit
+    def _cast_matmul_kernel(
+        x_ptr,  # (M, K) bf16
+        w_ptr,  # (N, K) fp32 (cast to x's dtype on load)
+        z_ptr,  # (M, N) bf16 — output
+        M,
+        N,
+        K,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        IEEE_PRECISION: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        ms = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        ns = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        m_mask = ms < M
+        n_mask = ns < N
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_mask = ks < K
+            x_tile = tl.load(
+                x_ptr + ms[:, None] * K + ks[None, :],
+                mask=m_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            w_tile = tl.load(
+                w_ptr + ns[:, None] * K + ks[None, :],
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            if IEEE_PRECISION:
+                acc += tl.dot(
+                    x_tile.to(tl.float32),
+                    tl.trans(w_tile.to(tl.float32)),
+                    input_precision="ieee",
+                )
+            else:
+                acc += tl.dot(x_tile, tl.trans(w_tile.to(x_tile.dtype)))
+
+        tl.store(
+            z_ptr + ms[:, None] * N + ns[None, :],
+            acc.to(z_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & n_mask[None, :],
+        )
+
     # relu² + c_proj + residual_add in one Triton pass — r stays in
     # registers (saves M·N HBM round-trip). Caller passes fixed config
     # (autotune dispatch isn't CUDA Graph capture-friendly); d24 winner
@@ -805,11 +862,13 @@ if _HAS_TRITON:
             )
             relu_z = tl.where(z > 0.0, z, 0.0)
             r = relu_z * relu_z
+            # Cast weight to z's dtype on load — handles fp32 master +
+            # bf16 activation. `.to(z.dtype)` is a no-op when matched.
             proj_w = tl.load(
                 proj_w_ptr + k_outs[:, None] * N + n_cols[None, :],
                 mask=k_out_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            )
+            ).to(z.dtype)
             if IEEE_PRECISION:
                 acc += tl.dot(r, tl.trans(proj_w), input_precision="ieee")
             else:
@@ -887,11 +946,12 @@ if _HAS_TRITON:
                 mask=row_mask[:, None] & kp_mask[None, :],
                 other=0.0,
             )
+            # Cast fp32 master weight to dy's dtype on load (see Step 2 fwd).
             proj_w = tl.load(
                 proj_w_ptr + kps[:, None] * N + n_cols[None, :],
                 mask=kp_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            )
+            ).to(dy.dtype)
             if IEEE_PRECISION:
                 dr += tl.dot(
                     dy.to(tl.float32), proj_w.to(tl.float32), input_precision="ieee"
@@ -1062,6 +1122,20 @@ if _HAS_TRITON:
     #   inner    = inner_buf                    (A already divided by norm_dim)
     #   dx       = rms_inv · (g_eff - y_norm · inner) + dy  (outer residual passthrough)
     #   dnw_partial[m_tile, k] = Σ_{m∈m_tile} (dx_hat · y_norm)  [HAS_NW only]
+    @triton.autotune(
+        configs=[
+            # Conservative configs only — shared mem budget computed for
+            # fp32 IEEE path (4 bytes/elem). Per stage: dz_tile + W_fc_tile +
+            # acc ≤ ~64 KB; total with num_stages=2 ≤ 128 KB (under 3090's
+            # 100 KB SM limit with some slack).
+            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 64,  'BLOCK_N': 64},  num_warps=8, num_stages=3),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 32,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_K': 32,  'BLOCK_N': 128}, num_warps=4, num_stages=3),
+        ],
+        key=['M', 'N_fc', 'K', 'IEEE_PRECISION', 'HAS_NW'],
+    )
     @triton.jit
     def _mlp_dx_bwd_kernel(
         dz_ptr,  # (M, N_fc) bf16
@@ -1100,11 +1174,12 @@ if _HAS_TRITON:
                 mask=row_mask[:, None] & n_mask[None, :],
                 other=0.0,
             )
+            # Cast fp32 master weight to dz's dtype on load.
             W_fc_tile = tl.load(
                 W_fc_ptr + ns[:, None] * K + ks[None, :],
                 mask=n_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            )
+            ).to(dz_tile.dtype)
             if IEEE_PRECISION:
                 dx_hat += tl.dot(
                     dz_tile.to(tl.float32),
@@ -1242,8 +1317,22 @@ class FusedMLPBlock(torch.autograd.Function):
             num_warps=norm_cfg.num_warps,
         )
 
-        # Step 1: c_fc via cuBLAS bf16 tensor cores.
-        z = torch.matmul(x_hat, fc_weight.t())  # (M, N_fc)
+        # Step 1: c_fc via `_cast_matmul_kernel` — Triton matmul that
+        # loads fc_weight (fp32 master typical) in native dtype and casts
+        # inline. Replaces `torch.matmul(x_hat, fc_weight.t())` to avoid
+        # materializing a bf16 cast weight tile; trade is Triton matmul's
+        # ~10-15% efficiency gap vs cuBLAS for ~1 launch + ~75 μs HBM
+        # saved on the cast.
+        BLOCK_M_S1, BLOCK_N_S1, BLOCK_K_S1 = 64, 64, 64
+        z = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
+        grid_s1 = (triton.cdiv(M, BLOCK_M_S1), triton.cdiv(N_fc, BLOCK_N_S1))
+        _cast_matmul_kernel[grid_s1](
+            x_hat, fc_weight, z,
+            M, N_fc, K,
+            BLOCK_M=BLOCK_M_S1, BLOCK_N=BLOCK_N_S1, BLOCK_K=BLOCK_K_S1,
+            IEEE_PRECISION=ieee,
+            num_warps=4, num_stages=3,
+        )
 
         # Step 2: Triton kernel for relu² + c_proj + outer residual (= x).
         BLOCK_M_FWD, BLOCK_K_OUT_FWD, BLOCK_N_FWD = 64, 128, 32
@@ -1304,7 +1393,9 @@ class FusedMLPBlock(torch.autograd.Function):
 
         # B: dW_proj = dy.T @ relu²(z), r recomputed inline.
         BLOCK_K_OUT_B, BLOCK_N_B, BLOCK_M_B = 64, 128, 32
-        dW_proj = torch.empty((K_out, N_fc), dtype=z.dtype, device=z.device)
+        # Match W_proj's dtype (fp32 master) so autograd accumulates dW
+        # directly onto the master weight without a downstream .to() cast.
+        dW_proj = torch.empty((K_out, N_fc), dtype=W_proj.dtype, device=z.device)
         grid_b = (triton.cdiv(K_out, BLOCK_K_OUT_B), triton.cdiv(N_fc, BLOCK_N_B))
         _mlp_dW_proj_bwd_kernel[grid_b](
             dy,
@@ -1354,7 +1445,9 @@ class FusedMLPBlock(torch.autograd.Function):
         # leaves the kernel. Elementwise dx unlocked by A's pre-divided
         # inner_buf. The outer residual passthrough (dy) is folded into
         # dx in-kernel.
-        BLOCK_M_D, BLOCK_K_D, BLOCK_N_D = 64, 64, 64
+        # BLOCK_M fixed (autotune only varies BLOCK_K/BLOCK_N) so the
+        # dnw_partials buffer shape stays predictable.
+        BLOCK_M_D = 64
         num_m_tiles = triton.cdiv(M, BLOCK_M_D)
         dx = torch.empty_like(x)
         if has_nw:
@@ -1366,27 +1459,13 @@ class FusedMLPBlock(torch.autograd.Function):
         else:
             # 1-elem placeholder — kernel won't touch it when HAS_NW=False.
             dnw_partials = torch.empty(1, dtype=x.dtype, device=x.device)
-        grid_d = (num_m_tiles, triton.cdiv(K, BLOCK_K_D))
+        grid_d = lambda meta: (num_m_tiles, triton.cdiv(K, meta['BLOCK_K']))
         _mlp_dx_bwd_kernel[grid_d](
-            dz,
-            W_fc,
-            x,
-            rms_inv,
-            nw_arg,
-            dy,
-            inner_buf,
-            dx,
-            dnw_partials,
-            M,
-            N_fc,
-            K,
-            BLOCK_M=BLOCK_M_D,
-            BLOCK_K=BLOCK_K_D,
-            BLOCK_N=BLOCK_N_D,
+            dz, W_fc, x, rms_inv, nw_arg, dy, inner_buf,
+            dx, dnw_partials,
+            M, N_fc, K,
             IEEE_PRECISION=ieee,
             HAS_NW=has_nw,
-            num_warps=4,
-            num_stages=3,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
 
@@ -1414,10 +1493,10 @@ def fused_mlp_block(
     back through it and accumulates onto the original weight's dtype.
 
     See `FusedMLPBlock` for the kernel breakdown and ctx contents."""
-    if fc_weight.dtype != x.dtype:
-        fc_weight = fc_weight.to(dtype=x.dtype)
-    if proj_weight.dtype != x.dtype:
-        proj_weight = proj_weight.to(dtype=x.dtype)
+    # fc_weight + proj_weight stay in their native dtype (fp32 master in
+    # nanchat) — the fwd/bwd Triton kernels cast on load. norm_weight is
+    # tiny (K,) so we still pre-cast it to avoid plumbing a cast path
+    # through `_fused_add_norm_fwd_kernel` for a near-zero-cost benefit.
     if norm_weight is not None and norm_weight.dtype != x.dtype:
         norm_weight = norm_weight.to(dtype=x.dtype)
     return FusedMLPBlock.apply(x, norm_weight, fc_weight, proj_weight, eps)
