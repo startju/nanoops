@@ -769,7 +769,7 @@ if _HAS_TRITON:
     # Trade: lose cuBLAS's tensor-core efficiency (~70% peak) for
     # Triton's (~60% peak), gain 1 launch + ~75 μs HBM round-trip
     # (36 MB write+read at d24).
-    # d24 config locked: (BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, nw=4, st=3).
+    # d24 config locked: (BLOCK_M=256, BLOCK_N=64, BLOCK_K=32, nw=8, st=2).
     @triton.jit
     def _cast_matmul_kernel(
         x_ptr,  # (M, K) bf16
@@ -822,7 +822,7 @@ if _HAS_TRITON:
     # relu² + c_proj + residual_add in one Triton pass — r stays in
     # registers (saves M·N HBM round-trip). Caller passes fixed config
     # (autotune dispatch isn't CUDA Graph capture-friendly); d24 winner
-    # locked: (BLOCK_M=64, BLOCK_K_OUT=128, BLOCK_N=32, nw=4, st=3).
+    # locked: (BLOCK_M=128, BLOCK_K_OUT=64, BLOCK_N=32, nw=8, st=2).
     @triton.jit
     def _relu_sq_linear_residual_fwd_kernel(
         z_ptr,
@@ -912,12 +912,12 @@ if _HAS_TRITON:
     # A scratchpad-then-`torch.sum` route works (benched ~equal) but adds
     # an extra (num_n_tiles, M) buffer + a separate reduce launch. Using
     # atomic_add here keeps everything self-contained in this kernel.
-    # d24 config locked: (BLOCK_M=64, BLOCK_N=128, BLOCK_K_OUT=32, nw=8, st=3).
+    # d24 config locked: (BLOCK_M=128, BLOCK_N=128, BLOCK_K_OUT=32, nw=8, st=2).
     @triton.jit
     def _mlp_dz_bwd_kernel(
         dy_ptr,  # (M, K_out) bf16 — gradient w.r.t. y
         z_ptr,  # (M, N) bf16 — saved from fwd
-        proj_w_ptr,  # (K_out, N) bf16 — W_proj
+        proj_w_ptr,  # (K_out, N) fp32 master or bf16 — W_proj (cast to dy.dtype on load)
         dz_ptr,  # (M, N) bf16 — output (gradient w.r.t. z)
         inner_buf_ptr,  # (M,) fp32 — side-output Σ_n(dz·z)/norm_dim; caller zero-inits
         M,
@@ -985,12 +985,12 @@ if _HAS_TRITON:
     # Pairs with `_mlp_dz_bwd_kernel` to cover both bwd outputs of the
     # fwd kernel `_relu_sq_linear_residual_fwd_kernel`; reduction axis
     # differs (M here vs K_out there) so they're separate kernels.
-    # d24 config locked: (BLOCK_K_OUT=64, BLOCK_N=128, BLOCK_M=32, nw=4, st=3).
+    # d24 config locked: (BLOCK_K_OUT=64, BLOCK_N=128, BLOCK_M=64, nw=4, st=2).
     @triton.jit
     def _mlp_dW_proj_bwd_kernel(
         dy_ptr,  # (M, K_out) bf16
         z_ptr,  # (M, N) bf16 — saved from fwd
-        dW_proj_ptr,  # (K_out, N) bf16 — output
+        dW_proj_ptr,  # (K_out, N) — output (dtype = W_proj.dtype, typically fp32 master)
         M,
         N,
         K_out,
@@ -1051,7 +1051,7 @@ if _HAS_TRITON:
         x_ptr,  # (M, K) bf16 — fwd input, source for x_hat recompute
         rms_inv_ptr,  # (M,) fp32
         nw_ptr,  # (K,) bf16 — unused when HAS_NW=False (placeholder)
-        dW_fc_ptr,  # (N_fc, K) bf16 — output
+        dW_fc_ptr,  # (N_fc, K) — output (dtype = W_fc.dtype, typically fp32 master)
         M,
         N_fc,
         K,
@@ -1125,7 +1125,7 @@ if _HAS_TRITON:
     @triton.jit
     def _mlp_dx_bwd_kernel(
         dz_ptr,  # (M, N_fc) bf16
-        W_fc_ptr,  # (N_fc, K) bf16
+        W_fc_ptr,  # (N_fc, K) fp32 master or bf16 — cast to dz.dtype on load
         x_ptr,  # (M, K) bf16 — fwd input, used for y_norm = x·rms_inv
         rms_inv_ptr,  # (M,) fp32
         nw_ptr,  # (K,) bf16 — unused when HAS_NW=False (placeholder)
@@ -1222,7 +1222,8 @@ class FusedMLPBlock(torch.autograd.Function):
       0. `_fused_add_norm_fwd_kernel` with HAS_RESIDUAL=False: just
          x_hat = norm(x)·norm_weight + rms_inv side-output for bwd.
          (Kernel reused for its rms_inv; the add path is skipped.)
-      1. cuBLAS: z = x_hat @ W_fc.T.
+      1. `_cast_matmul_kernel`: z = x_hat @ W_fc.T with the fp32→x.dtype
+         weight cast fused into the matmul load (no bf16 weight tile to HBM).
       2. `_relu_sq_linear_residual_fwd_kernel`: relu² + c_proj +
          residual_add(x) → y in one Triton pass.
 
@@ -1520,10 +1521,8 @@ def fused_mlp_block(
     See `FusedMLPBlock` for the kernel breakdown and ctx contents."""
     # fc_weight + proj_weight stay in their native dtype (fp32 master in
     # nanchat) — the fwd/bwd Triton kernels cast on load. norm_weight is
-    # tiny (K,) so we still pre-cast it to avoid plumbing a cast path
-    # through `_fused_add_norm_fwd_kernel` for a near-zero-cost benefit.
-    if norm_weight is not None and norm_weight.dtype != x.dtype:
-        norm_weight = norm_weight.to(dtype=x.dtype)
+    # passed through as-is; `_fused_add_norm_fwd_kernel` handles either
+    # dtype (the bf16·fp32 multiply auto-promotes inside the kernel).
     return FusedMLPBlock.apply(x, norm_weight, fc_weight, proj_weight, eps)
 
 
