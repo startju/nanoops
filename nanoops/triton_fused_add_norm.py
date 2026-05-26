@@ -4,11 +4,15 @@
 output for the next block's residual stream. See `fused_add_norm` and
 TRITON_zh.md Chapter 2.
 
-Also hosts the shared `TileConfig` / `_pick_tile_config` helper used by
-this file and `triton_fused_mlp_block.py` (which reuses
-`_fused_add_norm_fwd_kernel` for its Step 0 RMSNorm). Other Triton
-modules in this package (`triton_fused_mlp_block`, `triton_attn`)
-import what they need from here.
+Also hosts the shared `TileConfig` / `_pick_tile_config` sizing helper.
+The sibling Triton modules in this package import what they need from
+here:
+  - `triton_fused_mlp_block.py` imports `_pick_tile_config` (sizes its
+    Step 0 RMSNorm) and `_fused_add_norm_fwd_kernel` (the kernel itself,
+    reused with HAS_RESIDUAL=False).
+  - `triton_attn.py` is self-contained (own RMSNorm kernels) — no
+    imports from here yet, kept as an option for future cross-file
+    reuse.
 
 Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 """
@@ -54,7 +58,7 @@ except ImportError:
 #   `+` op + its HBM round-trip.
 #
 # Cheap, useful at the seam between attn-block output and mlp-block
-# norm-input. See TRITON.md Chapter 2.
+# norm-input. See TRITON_zh.md Chapter 2.
 # ─────────────────────────────────────────────────────────────────────
 
 
