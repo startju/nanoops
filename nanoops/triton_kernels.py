@@ -1512,11 +1512,12 @@ def fused_mlp_block(
     needs to pre-sum with an attention residual, do it outside.
     `norm_weight=None` ⇒ plain RMSNorm without the per-channel affine.
 
-    Weights are auto-cast to x's dtype when they differ (e.g. fp32 master
-    weight + bf16 activation) — same pattern as nanchat's `Linear.forward`
-    (`F.linear(x, self.weight.to(dtype=x.dtype))`). The `.to()` op is
-    autograd-traced, so the dW returned from FusedMLPBlock gets routed
-    back through it and accumulates onto the original weight's dtype.
+    fc_weight / proj_weight are loaded in their native dtype inside the
+    fwd/bwd Triton kernels and cast inline to the activation dtype before
+    each tensor-core matmul (handles the fp32-master + bf16-activation
+    case typical in nanchat). dW_fc / dW_proj are allocated with the
+    master weight's dtype, so the gradient lands directly on the master
+    weight — no wrapper-level `.to()` and no autograd routing needed.
 
     See `FusedMLPBlock` for the kernel breakdown and ctx contents."""
     # fc_weight + proj_weight stay in their native dtype (fp32 master in
