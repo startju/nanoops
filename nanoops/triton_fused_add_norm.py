@@ -52,7 +52,7 @@ except ImportError:
 #   Fallback — _fused_add_norm_inner_kernel + _fused_add_norm_bwd_kernel:
 #     Flash-Attention style 2-pass (pre-compute inner[m], then 2D-tile
 #     grid over (M, D) for d_summed + dnw_partial). Engages when inline
-#     would spill (HAS_NW=True at D ≥ 24K).
+#     would spill (HAS_NW=True at D ≥ 16K).
 #   Both paths fold d_summed_external (caller's direct gradient w.r.t.
 #   summed) into the kernel's d_summed store, saving an extra Python
 #   `+` op + its HBM round-trip.
@@ -519,12 +519,12 @@ def _fused_add_norm_fwd_impl(
     # the trailing lanes so they don't affect the reduction.
     BLOCK_D = triton.next_power_of_2(D)
 
-    # Tile sizing via the shared _pick_tile_config helper. fwd's
-    # hot path holds ~2 fp32 tiles alive simultaneously (summed_f32
-    # through the reduction; y_f32 during the final multiply). The
-    # helper translates that to BLOCK_M and num_warps under the
-    # Ampere 255 fp32 reg/thread spill cap (see helper docstring
-    # for the formula).
+    # Tile sizing via the shared _pick_tile_config helper. fwd's hot
+    # path holds ~2 fp32 tiles alive simultaneously (the auto-promoted
+    # summed-as-fp32 used for sum_sq and `summed * rms_inv`, plus the
+    # y_f32 result during the optional `* nw`). The helper translates
+    # that to BLOCK_M and num_warps under the Ampere 255 fp32 reg/
+    # thread spill cap (see helper docstring for the formula).
     cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=2)
     BLOCK_M, num_warps = cfg.block_m, cfg.num_warps
 
