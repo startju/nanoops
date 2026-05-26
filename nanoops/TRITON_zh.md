@@ -432,7 +432,7 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
 
 bwd 有两套可行的 kernel 形状。具体跑哪套取决于 **inline kernel**
 的单 program tile 在 Ampere 255 fp32 reg/thread 上限下能不能装得
-下。dispatch 写在 `FusedAddNorm.backward` 里，由
+下。dispatch 写在 `_fused_add_norm_bwd_impl` 里，由
 `TileConfig.fits_reg_budget` 决定。
 
 #### 主路径：1 个 kernel，整行 in-register
@@ -583,7 +583,7 @@ tile 数：
 | bwd inline (HAS_NW=False) | 4 | 同上，但 `y_norm`/`g_eff` 别名 `src`/`dy_t` |
 
 `TileConfig.fits_reg_budget` 属性（`est_regs ≤ 256`）就是
-`FusedAddNorm.backward` 用来选 inline vs 2-kernel fallback 的依据。
+`_fused_add_norm_bwd_impl` 用来选 inline vs 2-kernel fallback 的依据。
 
 d24 shape (M=2048, D=1536, BLOCK_D=2048) 走一遍：
 
@@ -790,20 +790,27 @@ d24 fwd-only（M=2048, D=1536, bf16, HAS_NW=False）在 RTX 3090
 | 普通 eager `fused_add_norm(...)` call（仅 fwd） | ~163 μs | ~88 μs | fused 慢 1.85× |
 | 普通 eager `fused_add_norm(...) + backward` | ~1075 μs | ~618 μs | fused 慢 1.74× |
 
-eager 模式下慢 **不是 kernel 慢**——是 `autograd.Function` +
-Triton dispatch 的 per-call 固定开销（每次 fwd ~90 μs：tensor 分配、
-`save_for_backward`、ctx 设置、kernel launch arg 打包）。这些 overhead
-在 CUDA Graph 捕获或 `torch.compile` 包大 pipeline 里会消失。
+> ↑ 这两组 eager 数字是 `autograd.Function` 时代测的。fused_add_norm
+> 现已改写成 `torch.library.custom_op`（fwd / bwd 各一个，配
+> `register_fake` + `register_autograd`），eager 走的还是 Python
+> dispatch，per-call overhead 量级差不多；但**核心变化**是
+> `torch.compile(fullgraph=True)` 现在能直接编译进去（autograd.Function
+> 那时是 graph-break 起手），跨 op 路径不再被这个 wrapper 截断。
+
+eager 模式下慢 **不是 kernel 慢**——是 wrapper 的 per-call 固定开销
+（每次 fwd ~90 μs：tensor 分配、`save_for_backward`、ctx 设置、kernel
+launch arg 打包）。这些 overhead 在 CUDA Graph 捕获或 `torch.compile`
+包大 pipeline 里会消失。
 
 大 shape 反过来：`M=2048, D=4096`（fwd+bwd, HAS_NW=False）下 fused
 端到端**赢 1.21×**。crossover 在 kernel 实际 GPU 工作量超过 ~90 μs
 framework overhead 的地方。
 
 核心教训：**kernel 这么短的时候，Python 框架开销很容易超过 kernel
-本身的 GPU 工作量**。对单个 op `torch.compile(fused_add_norm)` 反而
-**更慢**——compile dispatcher 自己加开销。fusion 真正赚到只有两种
-情况：
+本身的 GPU 工作量**。fusion 真正赚到只有两种情况：
 1. op 被包在 `torch.compile(model)` 整 model 里，dispatcher 开销被摊掉
+   —— `custom_op` 改造后的现在这条路才真正打通（以前 autograd.Function
+   会 graph-break，dynamo 退回 eager dispatch）
 2. 整 train step 用 `torch.cuda.CUDAGraph` capture，per-call Python
    工作只在 capture 时跑一次
 
@@ -1422,28 +1429,44 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
 `norm_weight=None` 是因为 nanchat 的 RMSNorm 不带 affine（无 γ）；
 `_orig_norm` 是原 `Block.norm`，被捕获在 module global 里。
 
-**单 op 增益不等于 end-to-end 增益**。`fused_mlp_block` 是
-`torch.autograd.Function`，对 `torch.compile` 是黑盒——nanchat 训练用
-`@torch.compile` 编译整个 step，原版 mlp 的 elementwise/matmul 链路会被
-inductor 跟 attention 的输出 / 下一层的输入做 cross-op fusion，换成 Function
-之后这些 cross-op fusion 没了，Python autograd dispatch 也比 inductor 自家
-生成的 fused fwd/bwd 重一点。d24 + B=1 实测下来 end-to-end 大致从单 op
-1.09× 缩到 ~+3% tok/s（53.88% mfu vs 52.33% mfu baseline）。
+**单 op 增益不完全等于 end-to-end 增益**，但 `fused_mlp_block` 现在
+封装成 `torch.library.custom_op`（fwd / bwd 各一个，配 `register_fake`
++ `register_autograd`），torch.compile 能把它当成一个 opaque FX 节点，
+**不再 graph-break、不再 trace 进 Triton kernel**，Inductor 继续在
+wrapper 两侧做 cross-op fusion。
 
-要真把单 op 增益完全兑现需要：
-1. **跨 op 编译协同**——把 fused_mlp_block 写成 `torch.library.custom_op` +
-   `register_fake` + Inductor schedule hint，让 `torch.compile` 知道这个
-   block 的边界，能继续在外面做 fusion。
-2. **kernel-level CUDA Graph 兼容**——locked configs 已经具备（不用
-   autotune dispatch），但 wrapper 的 Python 控制流（`if has_nw`、
-   `if ieee`）需要拆掉或预 specialize。
-3. **跨 shape / 跨 GPU 鲁棒性**——d24 config 在 3090 上 locked，换 H100
-   要重新 sweep。
+> 之前用 `torch.autograd.Function` 时是 dynamo 黑盒——`.apply()` 会
+> 触发 graph-break，dynamo 退回 eager dispatch；试过 `@allow_in_graph`
+> 但那会让 dynamo 用 FakeTensor 重放 wrapper，撞到 Triton kernel
+> 的 `.data_ptr()` 直接挂掉。`custom_op` 是 PyTorch 给"包第三方 / 自
+> 定义 kernel"准备的官方路径，正好对症。
 
-但 op-level 1.09×（cast fusion 后更高）是真实节省。production-grade kernel
-写到这个程度，主要的边际优化空间已经枯竭——再快需要换路（fp8、structured
-sparsity）或者更深度的 cross-kernel fusion（multi-stream 在 §3.3 已经分析过
-会输 atomic 方案）。
+d24 + B=1 end-to-end 实测（同 checkpoint resume 5 步均值，3090 ×2）：
+
+| 路径 | dt (ms) | tok/sec | bf16_mfu (%) | vs baseline |
+|---|---:|---:|---:|---:|
+| baseline（不开 FUSED_MLP_BLOCK） | 67,175 | 15,610 | 52.49 | — |
+| FUSED + `autograd.Function`（旧） | 65,452 | 16,021 | 53.88 | +2.63% |
+| FUSED + `custom_op`（现） | **65,038** | **16,124** | **54.22** | **+3.29%** |
+
+每个版本的 loss 跟 baseline 都在 ~1e-4 量级内对得上（同 checkpoint
++ 相同 lr，kernel parity 验证过）。fullgraph compile 也直接 OK，
+`y / dx / dW_fc / dW_proj` 差全是 0.0（bit-exact）。
+
+剩下的兑现差是因为：
+1. **MLP 只占 step time ~50-55%**——单 op 1.09× 端到端理论上限 ~4.5%，
+   custom_op 拿到 ~3.3%，已经接近这个上限的 73%。
+2. **其他 overhead**：DDP all-reduce、optimizer step（Muon + AdamW）、
+   data load、Python 控制流——这些跟 mlp fusion 无关，不会被 inductor
+   消掉。
+3. **CUDA Graph capture 还没接**——locked configs 已经具备前提（不用
+   autotune dispatch），但 wrapper 还有 `if has_nw` / `if ieee` 的 Python
+   分支，要 capture 得先 specialize。再 +1-2% 可能。
+
+但 op-level 1.09×（cast fusion 后更高）+ end-to-end +3.3% 是真实节省。
+production-grade kernel 写到这个程度，主要的边际优化空间已经枯竭——
+再快需要换路（fp8、structured sparsity）、动 attention 部分（占 step time
+30-35%）、或者把 B=1 → B=2/4（GEMM 利用率从 53% 推到 70+%）。
 
 ### 3.9 Takeaway
 
