@@ -197,7 +197,7 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 
 **这就是 fusion 设计的根源**：独立的 RMSNorm kernel 做 ~4·M·D 字节 HBM
 流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
-（`NormMLPReluSquare`、`NormQKVProjection`），让归一化的中间值留在
+（mlp 走 `fused_mlp_block`，attn 走 `NormQKVProjection`），让归一化的中间值留在
 register 里，**省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入
 再读）——带宽 bound 的 op 上**纯赚**，没副作用。`fused_add_norm` 在
 block 边界也是一样的道理。
@@ -348,7 +348,7 @@ naive 的比值不变。
 
 本 repo 里最简单的 fused kernel。**纯学习用**——nanchat 生产 block
 里 RMSNorm 已经直接 fold 进相邻的 matmul kernel（attn 走
-`NormQKVProjection`，mlp 走 `NormMLPReluSquare`），所以根本不存在
+`NormQKVProjection`，mlp 走 `fused_mlp_block`），所以根本不存在
 独立的 `add → norm` op 边界让这个 kernel 上 hot path。但这个 kernel
 用到的每一个 pattern 都是更大 fused kernel 的基石，所以它是学这些
 patterns 最干净的样本。
@@ -534,9 +534,9 @@ reduction 要操心。fallback 只在 BLOCK_M 缩到 1 *仍然*装不下时
 
 ### 2.3 d_summed_external 折进 bwd kernel
 
-autograd Function 返回两个输出（`y`、`summed`），所以 backward 收到
-两份梯度（`dy`、`d_summed_external`）。前者是 norm 输出梯度，后者
-来自 caller 在下游直接用了 `summed`。
+op 返回两个输出（`y`、`summed`），所以 backward 收到两份梯度
+（`dy`、`d_summed_external`）。前者是 norm 输出梯度，后者来自 caller
+在下游直接用了 `summed`。
 
 朴素写法：bwd kernel 算 `d_summed_from_norm`，外面 Python 加一行
 `d_summed_total = d_summed_from_norm + d_summed_external`。这是
@@ -835,7 +835,7 @@ framework overhead 的地方。
 常数，更长的 kernel 摊薄得多，哪怕 per-element 吞吐不比一串小 kernel
 更高，wall time 上还是赢。
 
-这也是为什么 nanchat 生产路径跳过这个 kernel：`NormMLPReluSquare`
+这也是为什么 nanchat 生产路径跳过这个 kernel：`fused_mlp_block`
 和 `NormQKVProjection` 把 norm 直接 fold 进 matmul kernel，根本不
 存在让这个 `add+norm` fusion 挂上去的 op 边界。这个 kernel 是来
 演示 patterns 的；真正让 patterns 体现价值的，是更大的生产 kernel。
@@ -899,7 +899,7 @@ matmul 相对 cuBLAS 的 10-15% 效率劣势。Step 1 看起来是孤立的大 m
 跳过 add 路径：
 
 ```python
-# Step 0 caller (FusedMLPBlock.forward)
+# Step 0 caller (_fused_mlp_block_fwd_impl)
 _fused_add_norm_fwd_kernel[...](
     x, x, nw_arg,                  # res_ptr 不会被读；传 x 当占位
     x_hat, x, rms_inv,             # summed_ptr 不会被写；传 x 当占位

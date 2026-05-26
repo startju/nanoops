@@ -219,8 +219,8 @@ Summary table (training-shape scale):
 
 **Why this motivates the fusion stack:** standalone RMSNorm kernel
 does ~4·M·D bytes of HBM traffic for ~0 compute return. Fusing norm
-into the adjacent matmul kernel (`NormMLPReluSquare`,
-`NormQKVProjection`) keeps the normalized intermediate in registers,
+into the adjacent matmul kernel (`fused_mlp_block` on the mlp side,
+`NormQKVProjection` on the attn side) keeps the normalized intermediate in registers,
 saving **4·M·D bytes** of HBM traffic (norm output write + matmul
 input re-read) — pure bandwidth win on a bandwidth-bound op, no
 downside. Same idea for fused_add_norm at block boundaries.
@@ -389,7 +389,7 @@ A **warp** = 32 threads. The fundamental scheduling unit.
 The simplest fused kernel in this repo. It exists purely as a learning
 artifact — nanchat's production blocks fold the RMSNorm directly into
 the adjacent matmul (see `NormQKVProjection` on the attn side,
-`NormMLPReluSquare` on the mlp side), so a standalone `add → norm`
+`fused_mlp_block` on the mlp side), so a standalone `add → norm`
 op boundary doesn't actually appear in the hot path. But every
 pattern this kernel uses is a building block of those bigger fused
 kernels, so it's the cleanest place to learn them.
@@ -585,10 +585,10 @@ i.e. when BLOCK_D alone (= full D) blows the budget.
 
 ### 2.3 d_summed_external is fused into the bwd kernel
 
-The autograd Function returns two outputs (`y`, `summed`), so backward
-receives two gradients (`dy`, `d_summed_external`). The first is the
-norm's output gradient; the second is from the caller using `summed`
-directly downstream.
+The op returns two outputs (`y`, `summed`), so backward receives two
+gradients (`dy`, `d_summed_external`). The first is the norm's output
+gradient; the second is from the caller using `summed` directly
+downstream.
 
 The naïve setup would compute `d_summed_from_norm` in the bwd kernel,
 then do a Python `d_summed_total = d_summed_from_norm + d_summed_external`.
@@ -899,7 +899,7 @@ even if their per-element throughput isn't faster than a chain of
 small kernels.
 
 That's also why nanchat's production path skips this kernel:
-`NormMLPReluSquare` and `NormQKVProjection` fold the norm directly
+`fused_mlp_block` and `NormQKVProjection` fold the norm directly
 into the matmul kernel, so there's no standalone op-boundary call
 that this `add+norm` fusion could attach to. This kernel exists to
 demonstrate the patterns; the bigger production kernels are where
