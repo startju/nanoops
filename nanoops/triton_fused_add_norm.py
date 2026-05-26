@@ -211,7 +211,7 @@ if _HAS_TRITON:
 
         y_f32 = summed * rms_inv[:, None]
         if HAS_NW:
-            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0)
             y_f32 = y_f32 * nw[None, :]
         tl.store(y_ptr + offs, y_f32.to(y_ptr.dtype.element_ty), mask=mask_2d)
 
@@ -294,7 +294,7 @@ if _HAS_TRITON:
         )
 
         if HAS_NW:
-            dnw_partial = tl.sum(dy_t * y_norm, axis=0)
+            dnw_partial = tl.sum(dy_t * y_norm, axis=0, dtype=tl.float32)
             dnw_p_ptrs = dnw_partial_ptr + pid_m * D + cols
             tl.store(
                 dnw_p_ptrs,
