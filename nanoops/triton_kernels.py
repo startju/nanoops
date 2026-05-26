@@ -952,15 +952,15 @@ if _HAS_TRITON:
                 z_ptr + ms[:, None] * N + ns[None, :],
                 mask=m_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             relu_z = tl.where(z > 0.0, z, 0.0)
-            r = relu_z * relu_z  # (BLOCK_M, BLOCK_N) fp32
+            r = relu_z * relu_z
 
             # acc[k_out, n] += sum_m dy[m, k_out] * r[m, n]
             if IEEE_PRECISION:
                 acc += tl.dot(tl.trans(dy.to(tl.float32)), r, input_precision="ieee")
             else:
-                acc += tl.dot(tl.trans(dy), r.to(dy_ptr.dtype.element_ty))
+                acc += tl.dot(tl.trans(dy), r)
 
         tl.store(
             dW_proj_ptr + k_outs[:, None] * N + ns[None, :],
