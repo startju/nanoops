@@ -868,11 +868,11 @@ if _HAS_TRITON:
                 proj_w_ptr + k_outs[:, None] * N + n_cols[None, :],
                 mask=k_out_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            ).to(z.dtype)
+            )
             if IEEE_PRECISION:
                 acc += tl.dot(r, tl.trans(proj_w), input_precision="ieee")
             else:
-                acc += tl.dot(r, tl.trans(proj_w))
+                acc += tl.dot(r, tl.trans(proj_w).to(z.dtype))
 
         # Add residual, write y. Keep residual in native dtype; cast the
         # matmul acc to output dtype first, then add — saves a bf16→fp32
@@ -951,13 +951,13 @@ if _HAS_TRITON:
                 proj_w_ptr + kps[:, None] * N + n_cols[None, :],
                 mask=kp_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            ).to(dy.dtype)
+            )
             if IEEE_PRECISION:
                 dr += tl.dot(
                     dy.to(tl.float32), proj_w.to(tl.float32), input_precision="ieee"
                 )
             else:
-                dr += tl.dot(dy, proj_w)
+                dr += tl.dot(dy, proj_w.to(dy.dtype))
 
         # relu² bwd applied to dr in registers — dr never materialized to HBM.
         z = tl.load(
@@ -1165,7 +1165,7 @@ if _HAS_TRITON:
                 W_fc_ptr + ns[:, None] * K + ks[None, :],
                 mask=n_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(dz_tile.dtype)
+            )
             if IEEE_PRECISION:
                 dx_hat += tl.dot(
                     dz_tile.to(tl.float32),
@@ -1173,7 +1173,7 @@ if _HAS_TRITON:
                     input_precision="ieee",
                 )
             else:
-                dx_hat += tl.dot(dz_tile, W_fc_tile)
+                dx_hat += tl.dot(dz_tile, W_fc_tile.to(dz_tile.dtype))
 
         # Apply RMSNorm bwd inline using pre-computed inner; fold outer
         # residual gradient (dy) into dx in-kernel.
@@ -1316,11 +1316,18 @@ class FusedMLPBlock(torch.autograd.Function):
         z = torch.empty((M, N_fc), dtype=x.dtype, device=x.device)
         grid_s1 = (triton.cdiv(M, BLOCK_M_S1), triton.cdiv(N_fc, BLOCK_N_S1))
         _cast_matmul_kernel[grid_s1](
-            x_hat, fc_weight, z,
-            M, N_fc, K,
-            BLOCK_M=BLOCK_M_S1, BLOCK_N=BLOCK_N_S1, BLOCK_K=BLOCK_K_S1,
+            x_hat,
+            fc_weight,
+            z,
+            M,
+            N_fc,
+            K,
+            BLOCK_M=BLOCK_M_S1,
+            BLOCK_N=BLOCK_N_S1,
+            BLOCK_K=BLOCK_K_S1,
             IEEE_PRECISION=ieee,
-            num_warps=8, num_stages=2,
+            num_warps=8,
+            num_stages=2,
         )
 
         # Step 2: Triton kernel for relu² + c_proj + outer residual (= x).
@@ -1330,13 +1337,19 @@ class FusedMLPBlock(torch.autograd.Function):
         y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
         grid = (triton.cdiv(M, BLOCK_M_FWD), triton.cdiv(K_proj_out, BLOCK_K_OUT_FWD))
         _relu_sq_linear_residual_fwd_kernel[grid](
-            z, proj_weight, x, y,
-            M, N_fc, K_proj_out,
+            z,
+            proj_weight,
+            x,
+            y,
+            M,
+            N_fc,
+            K_proj_out,
             BLOCK_M=BLOCK_M_FWD,
             BLOCK_K_OUT=BLOCK_K_OUT_FWD,
             BLOCK_N=BLOCK_N_FWD,
             IEEE_PRECISION=ieee,
-            num_warps=8, num_stages=2,
+            num_warps=8,
+            num_stages=2,
         )
 
         ctx.save_for_backward(norm_weight, fc_weight, proj_weight, x, rms_inv, z)
@@ -1362,13 +1375,20 @@ class FusedMLPBlock(torch.autograd.Function):
         inner_buf = torch.zeros((M,), dtype=torch.float32, device=z.device)
         grid = (triton.cdiv(M, BLOCK_M_A), triton.cdiv(N_fc, BLOCK_N_A))
         _mlp_dz_bwd_kernel[grid](
-            dy, z, W_proj, dz, inner_buf,
-            M, N_fc, K_out,
+            dy,
+            z,
+            W_proj,
+            dz,
+            inner_buf,
+            M,
+            N_fc,
+            K_out,
             BLOCK_M=BLOCK_M_A,
             BLOCK_N=BLOCK_N_A,
             BLOCK_K_OUT=BLOCK_K_OUT_A,
             IEEE_PRECISION=ieee,
-            num_warps=8, num_stages=2,
+            num_warps=8,
+            num_stages=2,
         )
 
         # B: dW_proj = dy.T @ relu²(z), r recomputed inline.
@@ -1381,13 +1401,18 @@ class FusedMLPBlock(torch.autograd.Function):
         dW_proj = torch.empty((K_out, N_fc), dtype=W_proj.dtype, device=z.device)
         grid_b = (triton.cdiv(K_out, BLOCK_K_OUT_B), triton.cdiv(N_fc, BLOCK_N_B))
         _mlp_dW_proj_bwd_kernel[grid_b](
-            dy, z, dW_proj,
-            M, N_fc, K_out,
+            dy,
+            z,
+            dW_proj,
+            M,
+            N_fc,
+            K_out,
             BLOCK_K_OUT=BLOCK_K_OUT_B,
             BLOCK_N=BLOCK_N_B,
             BLOCK_M=BLOCK_M_B,
             IEEE_PRECISION=ieee,
-            num_warps=4, num_stages=2,
+            num_warps=4,
+            num_stages=2,
         )
 
         # has_nw — norm_weight exists. Gates both the affine x_hat formula
@@ -1431,7 +1456,7 @@ class FusedMLPBlock(torch.autograd.Function):
         # depends on it).
         BLOCK_M_D = 64
         if ieee:
-            BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3   # fp32-safe
+            BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3  # fp32-safe
         else:
             BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 128, 8, 2  # bf16 winner
         num_m_tiles = triton.cdiv(M, BLOCK_M_D)
@@ -1447,13 +1472,25 @@ class FusedMLPBlock(torch.autograd.Function):
             dnw_partials = torch.empty(1, dtype=x.dtype, device=x.device)
         grid_d = (num_m_tiles, triton.cdiv(K, BLOCK_K_D))
         _mlp_dx_bwd_kernel[grid_d](
-            dz, W_fc, x, rms_inv, nw_arg, dy, inner_buf,
-            dx, dnw_partials,
-            M, N_fc, K,
-            BLOCK_M=BLOCK_M_D, BLOCK_K=BLOCK_K_D, BLOCK_N=BLOCK_N_D,
+            dz,
+            W_fc,
+            x,
+            rms_inv,
+            nw_arg,
+            dy,
+            inner_buf,
+            dx,
+            dnw_partials,
+            M,
+            N_fc,
+            K,
+            BLOCK_M=BLOCK_M_D,
+            BLOCK_K=BLOCK_K_D,
+            BLOCK_N=BLOCK_N_D,
             IEEE_PRECISION=ieee,
             HAS_NW=has_nw,
-            num_warps=NW_D, num_stages=ST_D,
+            num_warps=NW_D,
+            num_stages=ST_D,
         )
         dnw = dnw_partials.sum(dim=0) if has_nw else None
 

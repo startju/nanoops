@@ -153,7 +153,8 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
     # `fused_mlp_block` itself, so we pass the raw module weights here.
     x_2d = x.reshape(B * T, C).contiguous()
     y_2d = _fused_mlp_block(
-        x_2d, None,
+        x_2d,
+        None,
         self.mlp.c_fc.weight,
         self.mlp.c_proj.weight,
     )
@@ -181,7 +182,13 @@ def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
     """
     if kv_cache is None and (window_size[0] < 0 or window_size[0] >= x.size(1)):
         return _ckpt.checkpoint(
-            _orig_attn_forward, self, x, ve, cos_sin, window_size, kv_cache,
+            _orig_attn_forward,
+            self,
+            x,
+            ve,
+            cos_sin,
+            window_size,
+            kv_cache,
             use_reentrant=False,
         )
     return _orig_attn_forward(self, x, ve, cos_sin, window_size, kv_cache)
@@ -213,7 +220,11 @@ def _patched_sdpa_attention(q, k, v, window_size, enable_gqa):
     # autograd graph, easier to reason about).
     if (window < 0 or window >= Tq) and Tq == Tk:
         return nF.sliding_window_sdpa(
-            q, k, v, window_size=Tq, enable_gqa=enable_gqa,
+            q,
+            k,
+            v,
+            window_size=Tq,
+            enable_gqa=enable_gqa,
             chunk_size=max(1, Tq // 8),
         )
 
@@ -262,11 +273,11 @@ _TARGET_MODULES = [
     # bare `nn.Linear` could slip in via future code. Patching here is
     # cheap insurance — within one NANOOPS=1 process, replacing PyTorch's
     # F.embedding / F.linear with nanoops's is exactly the intent.
-    "torch.nn.modules.sparse",          # nn.Embedding -> F.embedding
-    "torch.nn.modules.linear",          # nn.Linear -> F.linear
-    "torch.nn.modules.normalization",   # nn.RMSNorm / nn.LayerNorm -> F.rms_norm / F.layer_norm
-    "torch.nn.modules.loss",            # nn.CrossEntropyLoss -> F.cross_entropy
-    "torch.nn.modules.activation",      # nn.Softmax -> F.softmax
+    "torch.nn.modules.sparse",  # nn.Embedding -> F.embedding
+    "torch.nn.modules.linear",  # nn.Linear -> F.linear
+    "torch.nn.modules.normalization",  # nn.RMSNorm / nn.LayerNorm -> F.rms_norm / F.layer_norm
+    "torch.nn.modules.loss",  # nn.CrossEntropyLoss -> F.cross_entropy
+    "torch.nn.modules.activation",  # nn.Softmax -> F.softmax
 ]
 
 
@@ -330,11 +341,14 @@ def _apply() -> dict[str, dict]:
     # the relu_square fusion (which is a subset of what's fused here).
     if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
         from .triton_kernels import fused_mlp_block as _fmb
+
         global _orig_norm, _fused_mlp_block
         assert _orig_norm is None, "_orig_norm already captured — call _restore() first"
         _orig_norm = gpt_mod.norm
         _fused_mlp_block = _fmb
-        originals["method"][("nanochat.gpt", "Block", "forward")] = gpt_mod.Block.forward
+        originals["method"][("nanochat.gpt", "Block", "forward")] = (
+            gpt_mod.Block.forward
+        )
         gpt_mod.Block.forward = _patched_block_forward
     # L-layer activation checkpoint: opt-in via NANOOPS_L_ATTN_CHECKPOINT=1.
     # Installed conditionally so when the env var is OFF, attention forward
@@ -346,7 +360,9 @@ def _apply() -> dict[str, dict]:
             "_orig_attn_forward already captured — call _restore() before _apply()"
         )
         _orig_attn_forward = gpt_mod.CausalSelfAttention.forward
-        originals["method"][("nanochat.gpt", "CausalSelfAttention", "forward")] = _orig_attn_forward
+        originals["method"][("nanochat.gpt", "CausalSelfAttention", "forward")] = (
+            _orig_attn_forward
+        )
         gpt_mod.CausalSelfAttention.forward = _patched_l_attn_forward
     # Sliding window SDPA: always ON (measured +6.2% tok/sec and -10.4%
     # peak memory at B=2 on nanchat d20, RTX 3090). Patched
@@ -366,17 +382,26 @@ def _apply() -> dict[str, dict]:
     # cliff. See nanoops/cpu_offload.py for the patch bodies.
     if os.environ.get("NANOOPS_OFFLOAD_OPTIM"):
         from . import cpu_offload
+
         optim_mod = importlib.import_module("nanochat.optim")
         # Distributed path (>1 GPU)
         dist_cls = optim_mod.DistMuonAdamW
-        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_adamw")] = dist_cls._compute_adamw
-        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_muon")] = dist_cls._compute_muon
+        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_adamw")] = (
+            dist_cls._compute_adamw
+        )
+        originals["method"][("nanochat.optim", "DistMuonAdamW", "_compute_muon")] = (
+            dist_cls._compute_muon
+        )
         dist_cls._compute_adamw = cpu_offload.patched_compute_adamw
         dist_cls._compute_muon = cpu_offload.patched_compute_muon
         # Single-GPU path
         single_cls = optim_mod.MuonAdamW
-        originals["method"][("nanochat.optim", "MuonAdamW", "_step_adamw")] = single_cls._step_adamw
-        originals["method"][("nanochat.optim", "MuonAdamW", "_step_muon")] = single_cls._step_muon
+        originals["method"][("nanochat.optim", "MuonAdamW", "_step_adamw")] = (
+            single_cls._step_adamw
+        )
+        originals["method"][("nanochat.optim", "MuonAdamW", "_step_muon")] = (
+            single_cls._step_muon
+        )
         single_cls._step_adamw = cpu_offload.patched_step_adamw
         single_cls._step_muon = cpu_offload.patched_step_muon
     _PATCHED = True  # global declared at top of _apply()

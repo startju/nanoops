@@ -67,47 +67,54 @@ def patched_compute_adamw(self, group, info, gather_list, rank, world_size):
     D2H back. Dual-GPU only (single-GPU goes through the simpler
     patched_step_adamw via train.sh's NPROC=1 / no-torchrun branch).
     """
-    param_infos = info['param_infos']
-    for p in group['params']:
+    param_infos = info["param_infos"]
+    for p in group["params"]:
         pinfo = param_infos[p]
-        pinfo['future'].wait()
-        grad_slice = pinfo['grad_slice']
+        pinfo["future"].wait()
+        grad_slice = pinfo["grad_slice"]
         state = self.state[p]
 
-        if pinfo['is_small']:
+        if pinfo["is_small"]:
             p_slice = p
         else:
             rank_size = p.shape[0] // world_size
-            p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+            p_slice = p[rank * rank_size : (rank + 1) * rank_size]
 
         if not state:
-            state['step'] = 0
-            state['exp_avg'] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
-            state['exp_avg_sq'] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
-        state['step'] += 1
+            state["step"] = 0
+            state["exp_avg"] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
+            state["exp_avg_sq"] = _cpu_pinned_zeros(p_slice.shape, p_slice.dtype)
+        state["step"] += 1
 
         # H2D — async because state is pinned
-        exp_avg_g = state['exp_avg'].to(p.device, non_blocking=True)
-        exp_avg_sq_g = state['exp_avg_sq'].to(p.device, non_blocking=True)
+        exp_avg_g = state["exp_avg"].to(p.device, non_blocking=True)
+        exp_avg_sq_g = state["exp_avg_sq"].to(p.device, non_blocking=True)
 
-        self._adamw_step_t.fill_(state['step'])
-        self._adamw_lr_t.fill_(group['lr'])
-        self._adamw_beta1_t.fill_(group['betas'][0])
-        self._adamw_beta2_t.fill_(group['betas'][1])
-        self._adamw_eps_t.fill_(group['eps'])
-        self._adamw_wd_t.fill_(group['weight_decay'])
+        self._adamw_step_t.fill_(state["step"])
+        self._adamw_lr_t.fill_(group["lr"])
+        self._adamw_beta1_t.fill_(group["betas"][0])
+        self._adamw_beta2_t.fill_(group["betas"][1])
+        self._adamw_eps_t.fill_(group["eps"])
+        self._adamw_wd_t.fill_(group["weight_decay"])
 
         adamw_step_fused(
-            p_slice, grad_slice, exp_avg_g, exp_avg_sq_g,
-            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            p_slice,
+            grad_slice,
+            exp_avg_g,
+            exp_avg_sq_g,
+            self._adamw_step_t,
+            self._adamw_lr_t,
+            self._adamw_beta1_t,
+            self._adamw_beta2_t,
+            self._adamw_eps_t,
+            self._adamw_wd_t,
         )
 
         # D2H — async copy back to pinned CPU buffer
-        state['exp_avg'].copy_(exp_avg_g, non_blocking=True)
-        state['exp_avg_sq'].copy_(exp_avg_sq_g, non_blocking=True)
+        state["exp_avg"].copy_(exp_avg_g, non_blocking=True)
+        state["exp_avg_sq"].copy_(exp_avg_sq_g, non_blocking=True)
 
-        if not pinfo['is_small']:
+        if not pinfo["is_small"]:
             future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
             gather_list.append(dict(future=future, params=None))
 
@@ -121,10 +128,10 @@ def patched_compute_muon(self, group, info, gather_list, rank):
     single-GPU goes through patched_step_muon via train.sh's NPROC=1
     no-torchrun branch.
     """
-    info['future'].wait()
-    params = group['params']
-    chunk_size = info['chunk_size']
-    grad_chunk = info['grad_chunk']
+    info["future"].wait()
+    params = group["params"]
+    chunk_size = info["chunk_size"]
+    grad_chunk = info["grad_chunk"]
     p = params[0]
     shape, device, dtype = p.shape, p.device, p.dtype
 
@@ -148,7 +155,9 @@ def patched_compute_muon(self, group, info, gather_list, rank):
     if num_owned > 0:
         # H2D the OWNED slice only — saves PCIe bandwidth for non-owned chunks
         mom_g = state["momentum_buffer"][:num_owned].to(device, non_blocking=True)
-        mom2_g = state["second_momentum_buffer"][:num_owned].to(device, non_blocking=True)
+        mom2_g = state["second_momentum_buffer"][:num_owned].to(
+            device, non_blocking=True
+        )
 
         owned_params = [params[start_idx + i] for i in range(num_owned)]
         stacked_owned = torch.stack(owned_params)
@@ -159,10 +168,16 @@ def patched_compute_muon(self, group, info, gather_list, rank):
         self._muon_wd_t.fill_(group["weight_decay"])
 
         muon_step_fused(
-            grad_chunk[:num_owned], stacked_owned,
-            mom_g, mom2_g,
-            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-            group["ns_steps"], red_dim,
+            grad_chunk[:num_owned],
+            stacked_owned,
+            mom_g,
+            mom2_g,
+            self._muon_momentum_t,
+            self._muon_lr_t,
+            self._muon_wd_t,
+            self._muon_beta2_t,
+            group["ns_steps"],
+            red_dim,
         )
         updated_params[:num_owned].copy_(stacked_owned)
 
@@ -177,50 +192,60 @@ def patched_compute_muon(self, group, info, gather_list, rank):
     future = dist.all_gather_into_tensor(
         stacked_params, updated_params, async_op=True
     ).get_future()
-    gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+    gather_list.append(
+        dict(future=future, stacked_params=stacked_params, params=params)
+    )
 
 
 # -----------------------------------------------------------------------------
 # Single-GPU (MuonAdamW) versions: full-size state on CPU pinned memory.
 # Same H2D/D2H pattern but without the reduce_scatter / all_gather glue.
 
+
 def patched_step_adamw(self, group):
     """CPU-offloaded version of MuonAdamW._step_adamw (single-GPU path)."""
-    for p in group['params']:
+    for p in group["params"]:
         if p.grad is None:
             continue
         grad = p.grad
         state = self.state[p]
 
         if not state:
-            state['step'] = 0
-            state['exp_avg'] = _cpu_pinned_zeros(p.shape, p.dtype)
-            state['exp_avg_sq'] = _cpu_pinned_zeros(p.shape, p.dtype)
-        state['step'] += 1
+            state["step"] = 0
+            state["exp_avg"] = _cpu_pinned_zeros(p.shape, p.dtype)
+            state["exp_avg_sq"] = _cpu_pinned_zeros(p.shape, p.dtype)
+        state["step"] += 1
 
-        exp_avg_g = state['exp_avg'].to(p.device, non_blocking=True)
-        exp_avg_sq_g = state['exp_avg_sq'].to(p.device, non_blocking=True)
+        exp_avg_g = state["exp_avg"].to(p.device, non_blocking=True)
+        exp_avg_sq_g = state["exp_avg_sq"].to(p.device, non_blocking=True)
 
-        self._adamw_step_t.fill_(state['step'])
-        self._adamw_lr_t.fill_(group['lr'])
-        self._adamw_beta1_t.fill_(group['betas'][0])
-        self._adamw_beta2_t.fill_(group['betas'][1])
-        self._adamw_eps_t.fill_(group['eps'])
-        self._adamw_wd_t.fill_(group['weight_decay'])
+        self._adamw_step_t.fill_(state["step"])
+        self._adamw_lr_t.fill_(group["lr"])
+        self._adamw_beta1_t.fill_(group["betas"][0])
+        self._adamw_beta2_t.fill_(group["betas"][1])
+        self._adamw_eps_t.fill_(group["eps"])
+        self._adamw_wd_t.fill_(group["weight_decay"])
 
         adamw_step_fused(
-            p, grad, exp_avg_g, exp_avg_sq_g,
-            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            p,
+            grad,
+            exp_avg_g,
+            exp_avg_sq_g,
+            self._adamw_step_t,
+            self._adamw_lr_t,
+            self._adamw_beta1_t,
+            self._adamw_beta2_t,
+            self._adamw_eps_t,
+            self._adamw_wd_t,
         )
 
-        state['exp_avg'].copy_(exp_avg_g, non_blocking=True)
-        state['exp_avg_sq'].copy_(exp_avg_sq_g, non_blocking=True)
+        state["exp_avg"].copy_(exp_avg_g, non_blocking=True)
+        state["exp_avg_sq"].copy_(exp_avg_sq_g, non_blocking=True)
 
 
 def patched_step_muon(self, group):
     """CPU-offloaded version of MuonAdamW._step_muon (single-GPU path)."""
-    params = group['params']
+    params = group["params"]
     if not params:
         return
 
@@ -254,10 +279,16 @@ def patched_step_muon(self, group):
     self._muon_wd_t.fill_(group["weight_decay"])
 
     muon_step_fused(
-        stacked_grads, stacked_params,
-        mom_g, mom2_g,
-        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-        group["ns_steps"], red_dim,
+        stacked_grads,
+        stacked_params,
+        mom_g,
+        mom2_g,
+        self._muon_momentum_t,
+        self._muon_lr_t,
+        self._muon_wd_t,
+        self._muon_beta2_t,
+        group["ns_steps"],
+        red_dim,
     )
 
     # D2H copy state back

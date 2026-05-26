@@ -34,7 +34,9 @@ class Linear(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        self.weight = nn.Parameter(
+            torch.empty((out_features, in_features), **factory_kwargs)
+        )
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
         else:
@@ -78,7 +80,9 @@ class Embedding(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weight = nn.Parameter(torch.empty((num_embeddings, embedding_dim), **factory_kwargs))
+        self.weight = nn.Parameter(
+            torch.empty((num_embeddings, embedding_dim), **factory_kwargs)
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -88,7 +92,9 @@ class Embedding(nn.Module):
         return F.embedding(input, self.weight)
 
     def extra_repr(self) -> str:
-        return f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}"
+        return (
+            f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}"
+        )
 
 
 class RMSNorm(nn.Module):
@@ -116,7 +122,9 @@ class RMSNorm(nn.Module):
         self.normalized_shape = tuple(normalized_shape)
         self.eps = eps
         if elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
+            self.weight = nn.Parameter(
+                torch.empty(self.normalized_shape, **factory_kwargs)
+            )
         else:
             self.register_parameter("weight", None)
         self.reset_parameters()

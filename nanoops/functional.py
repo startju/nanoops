@@ -17,6 +17,7 @@ import torch
 try:
     _allow_in_graph = torch.compiler.allow_in_graph
 except AttributeError:  # PyTorch < 2.0
+
     def _allow_in_graph(fn):
         return fn
 
@@ -217,7 +218,9 @@ class Lookup(torch.autograd.Function):
         (indices,) = ctx.saved_tensors
         N = indices.shape[0]
         grad_weight = torch.zeros(
-            ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device,
+            ctx.weight_shape,
+            dtype=ctx.weight_dtype,
+            device=ctx.weight_device,
         )
         if N == 0:
             return None, grad_weight  # nothing to scatter, mirror LookupSorted
@@ -381,8 +384,8 @@ def _lookup_sorted_backward_impl(
         else sorted_grads.dtype
     )
     cumsum = sorted_grads.cumsum(0, dtype=cumsum_dtype)
-    group_ends = counts.cumsum(0).sub_(1)              # last index per group
-    group_sums = cumsum.index_select(0, group_ends)    # alloc (G, D)
+    group_ends = counts.cumsum(0).sub_(1)  # last index per group
+    group_sums = cumsum.index_select(0, group_ends)  # alloc (G, D)
     if unique_rows.numel() > 1:
         group_sums[1:].sub_(cumsum.index_select(0, group_ends[:-1]))
 
@@ -420,9 +423,7 @@ except AttributeError:
 if _HAS_CUSTOM_OP:
 
     @torch.library.custom_op("nanoops::lookup_sorted", mutates_args=())
-    def _lookup_sorted_op(
-        indices: torch.Tensor, weight: torch.Tensor
-    ) -> torch.Tensor:
+    def _lookup_sorted_op(indices: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """Forward: identical to Lookup.forward (just weight[indices])."""
         assert indices.ndim == 1
         assert weight.ndim == 2
@@ -584,10 +585,10 @@ class RMSNorm(torch.autograd.Function):
         # chain of in-place ops instead of `rsqrt * (g_eff - y * (g_eff*y).mean)`
         # which churns 4 input-sized temps via Python operator chain. Same
         # math, fewer alloc/free cycles.
-        inner = (g_eff * y).mean(dim=-1, keepdim=True)    # tiny (..., 1)
-        grad_input = y * inner                              # alloc 1 (broadcasts)
-        grad_input.neg_().add_(g_eff)                       # in-place: g_eff - y*inner
-        grad_input.mul_(rsqrt)                              # in-place: rsqrt * (above)
+        inner = (g_eff * y).mean(dim=-1, keepdim=True)  # tiny (..., 1)
+        grad_input = y * inner  # alloc 1 (broadcasts)
+        grad_input.neg_().add_(g_eff)  # in-place: g_eff - y*inner
+        grad_input.mul_(rsqrt)  # in-place: rsqrt * (above)
         return grad_input, grad_weight, None
 
 
@@ -602,11 +603,14 @@ def rms_norm(
         f"nanoops rms_norm only supports 1D normalized_shape, got {normalized_shape}"
     )
     D = normalized_shape[0]
-    assert input.shape[-1] == D, f"input last dim {input.shape[-1]} != normalized_shape {D}"
+    assert input.shape[-1] == D, (
+        f"input last dim {input.shape[-1]} != normalized_shape {D}"
+    )
     input_shape = input.shape
     input_flat = input.reshape(-1, D)
     out_flat = RMSNorm.apply(input_flat, weight, eps)
     return out_flat.reshape(input_shape)
+
 
 @_allow_in_graph
 def outer(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
@@ -723,6 +727,7 @@ def relu_square(input: torch.Tensor) -> torch.Tensor:
     """Fused relu(x)**2 — nanchat's MLP activation."""
     return ReluSquare.apply(input)
 
+
 class Softmax(torch.autograd.Function):
     """Softmax along a dim, mirroring `torch.nn.functional.softmax` semantics."""
 
@@ -753,9 +758,9 @@ class Softmax(torch.autograd.Function):
         # then in-place subtract y * <g,y> via addcmul_(... value=-1), which
         # is a single fused kernel — no `output * inner` intermediate tensor.
         # Saves one input-sized transient + one kernel launch vs the naive form.
-        gy = grad_output * output                                  # 1 alloc
-        inner = gy.sum(dim=dim, keepdim=True)                       # tiny <g,y>
-        gy.addcmul_(output, inner, value=-1)                        # in-place: gy -= y * inner
+        gy = grad_output * output  # 1 alloc
+        inner = gy.sum(dim=dim, keepdim=True)  # tiny <g,y>
+        gy.addcmul_(output, inner, value=-1)  # in-place: gy -= y * inner
         return gy, None  # None for dim (int, non-differentiable)
 
 
@@ -822,9 +827,11 @@ def chunked_logsumexp(
     # the chunk's own exp-sum contribution computed in that same basis.
     for chunk in chunks[1:]:
         new_max = torch.maximum(running_max, chunk.amax(dim, keepdim=True))
-        rebase = (running_max - new_max).exp()                        # rescale old sum
-        chunk_sum = (chunk - new_max).exp_().sum(dim, keepdim=True)   # same .exp_() trick
-        running_sum.mul_(rebase).add_(chunk_sum)                       # in-place chain
+        rebase = (running_max - new_max).exp()  # rescale old sum
+        chunk_sum = (
+            (chunk - new_max).exp_().sum(dim, keepdim=True)
+        )  # same .exp_() trick
+        running_sum.mul_(rebase).add_(chunk_sum)  # in-place chain
         running_max = new_max
     result = running_max + running_sum.log()
     return result if keepdim else result.squeeze(dim)
@@ -1009,7 +1016,9 @@ def cross_entropy(
     if weight is not None:
         raise NotImplementedError("nanoops.cross_entropy: weight not supported")
     if label_smoothing != 0.0:
-        raise NotImplementedError("nanoops.cross_entropy: label_smoothing not supported")
+        raise NotImplementedError(
+            "nanoops.cross_entropy: label_smoothing not supported"
+        )
     if size_average is not None or reduce is not None:
         raise NotImplementedError(
             "nanoops.cross_entropy: deprecated size_average/reduce not supported"
@@ -1057,9 +1066,9 @@ class Sigmoid(torch.autograd.Function):
         # temp instead of `y * (1 - y)` (which is 2 allocs by itself: 1 for
         # (1 - y), 1 for the product). One alloc + two in-place ops; then
         # one final mul with grad_output.
-        buf = y * y                # alloc 1
-        buf.neg_().add_(y)          # in-place: buf = y - y² = y(1-y)
-        return grad_output * buf    # alloc 2
+        buf = y * y  # alloc 1
+        buf.neg_().add_(y)  # in-place: buf = y - y² = y(1-y)
+        return grad_output * buf  # alloc 2
 
 
 @_allow_in_graph
@@ -1091,9 +1100,9 @@ class Tanh(torch.autograd.Function):
     ) -> torch.Tensor:
         (y,) = ctx.saved_tensors
         # 1 - y² built via in-place neg + add (saves 1 alloc vs `1 - y * y`).
-        buf = y * y                 # alloc 1
-        buf.neg_().add_(1)           # in-place: buf = 1 - y²
-        return grad_output * buf     # alloc 2
+        buf = y * y  # alloc 1
+        buf.neg_().add_(1)  # in-place: buf = 1 - y²
+        return grad_output * buf  # alloc 2
 
 
 @_allow_in_graph
@@ -1214,9 +1223,7 @@ class Where(torch.autograd.Function):
 
 
 @_allow_in_graph
-def where(
-    condition: torch.Tensor, a: torch.Tensor, b: torch.Tensor
-) -> torch.Tensor:
+def where(condition: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Mirrors `torch.where(condition, a, b)` (3-arg form)."""
     return Where.apply(condition, a, b)
 
@@ -1324,9 +1331,7 @@ class ScaledDotProductAttention(torch.autograd.Function):
         H_q = query.shape[-3] if query.ndim >= 3 else 1
         H_kv = key.shape[-3] if key.ndim >= 3 else 1
         if enable_gqa and H_q != H_kv:
-            assert H_q % H_kv == 0, (
-                f"GQA needs H_q ({H_q}) divisible by H_kv ({H_kv})"
-            )
+            assert H_q % H_kv == 0, f"GQA needs H_q ({H_q}) divisible by H_kv ({H_kv})"
             G = H_q // H_kv
             key_e = key.repeat_interleave(G, dim=-3)
             value_e = value.repeat_interleave(G, dim=-3)
@@ -1350,7 +1355,9 @@ class ScaledDotProductAttention(torch.autograd.Function):
             # right-aligned to the K edge — this is PyTorch's documented
             # convention. Cached-generation use cases (where you want
             # right-aligned causal) should pass an explicit attn_mask.
-            causal_mask = torch.ones(L, S, dtype=torch.bool, device=scores.device).tril()
+            causal_mask = torch.ones(
+                L, S, dtype=torch.bool, device=scores.device
+            ).tril()
             scores.masked_fill_(~causal_mask, float("-inf"))
 
         if attn_mask is not None:
@@ -1398,9 +1405,11 @@ class ScaledDotProductAttention(torch.autograd.Function):
         # That's a single fused kernel — no `P * <P,dP>` intermediate. Saves
         # one P-sized transient per SDPA backward (the (B,H,L,S) attention
         # matrix is the dominant memory term, so cutting one is meaningful).
-        grad_scores = probs * grad_probs                                    # 1 P-size alloc
-        inner = grad_scores.sum(dim=-1, keepdim=True)                       # tiny (B,H,L,1)
-        grad_scores.addcmul_(probs, inner, value=-1)                        # in-place: grad_scores -= probs * inner
+        grad_scores = probs * grad_probs  # 1 P-size alloc
+        inner = grad_scores.sum(dim=-1, keepdim=True)  # tiny (B,H,L,1)
+        grad_scores.addcmul_(
+            probs, inner, value=-1
+        )  # in-place: grad_scores -= probs * inner
 
         # Fold scale into dS once, used by both dQ and dK. In-place since
         # grad_scores has no other references.
@@ -1576,9 +1585,7 @@ class SlidingWindowSDPA(torch.autograd.Function):
         # expanded) K and V so we don't pay the G× memory tax twice; the
         # expansion is recomputed cheaply in backward.
         if enable_gqa and H_q != H_kv:
-            assert H_q % H_kv == 0, (
-                f"GQA needs H_q ({H_q}) divisible by H_kv ({H_kv})"
-            )
+            assert H_q % H_kv == 0, f"GQA needs H_q ({H_q}) divisible by H_kv ({H_kv})"
             G = H_q // H_kv
             key_e = key.repeat_interleave(G, dim=-3)
             value_e = value.repeat_interleave(G, dim=-3)
@@ -1617,10 +1624,10 @@ class SlidingWindowSDPA(torch.autograd.Function):
             # causal guarantees at least one allowed key per query (the
             # diagonal `j == i` is always True), so LSE is never -inf
             # and `(scores - lse).exp()` is never NaN.
-            lse = scores.logsumexp(dim=-1, keepdim=True)        # (..., q_sz, 1)
+            lse = scores.logsumexp(dim=-1, keepdim=True)  # (..., q_sz, 1)
             # Reuse `scores`'s storage for `probs`: scores has no other
             # refs after this point in the loop. Saves one P-sized alloc.
-            probs = scores.sub_(lse).exp_()                      # transient
+            probs = scores.sub_(lse).exp_()  # transient
             output[..., q_start:q_end, :] = probs @ v_blk
 
             chunk_info.append((q_start, q_end, k_start, k_end))
@@ -1744,4 +1751,6 @@ def sliding_window_sdpa(
     route here. Always on when NANOOPS=1. See SlidingWindowSDPA docstring
     for the empirical end-to-end findings (+6.2% tok/sec, -10.4% peak memory).
     """
-    return SlidingWindowSDPA.apply(query, key, value, window_size, enable_gqa, chunk_size)
+    return SlidingWindowSDPA.apply(
+        query, key, value, window_size, enable_gqa, chunk_size
+    )
