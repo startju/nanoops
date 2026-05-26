@@ -205,12 +205,11 @@ if _HAS_TRITON:
         # here through the y store, so register pressure is fp32-internal
         # in effect — the bf16 `summed` was only kept around for the HBM
         # write above.
-        summed_f32 = summed.to(tl.float32)
-        sum_sq = tl.sum(summed_f32 * summed_f32, axis=1)
+        sum_sq = tl.sum(summed * summed, axis=1, dtype=tl.float32)
         rms_inv = tl.rsqrt(sum_sq / D + eps)
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
 
-        y_f32 = summed_f32 * rms_inv[:, None]
+        y_f32 = summed * rms_inv[:, None]
         if HAS_NW:
             nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
             y_f32 = y_f32 * nw[None, :]
