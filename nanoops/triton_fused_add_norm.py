@@ -108,7 +108,8 @@ def _pick_tile_config(M: int, BLOCK_D: int, n_live_tiles: int) -> TileConfig:
       BLOCK_D: column tile size, typically next_power_of_2(D).
       n_live_tiles: peak number of (BLOCK_M × BLOCK_D) fp32 tiles alive
         simultaneously in the kernel hot path. Examples:
-          fwd ≈ 2 (summed_f32, y_f32)
+          fwd ≈ 2 (auto-promoted summed-as-fp32 for `summed * rms_inv`,
+            plus y_f32)
           bwd inline ≈ 5 with affine weight (y_norm, g_eff, dy_t, d_ext,
             d_summed), ≈ 4 without (y_norm/src and g_eff/dy_t alias)
           inner pre-compute ≈ 2 (y_norm, g_eff)
@@ -166,17 +167,18 @@ if _HAS_TRITON:
             masked (load contributes 0, store skipped). So D can be e.g.
             1536 with BLOCK_D=2048.
 
-        Precision: computation runs in fp32 throughout to match F.rms_norm
-        bit-for-bit on bf16 inputs (PyTorch's F.rms_norm internally promotes
-        bf16 → fp32 for the reduction and elementwise scale, then casts back
-        — verified empirically). The bf16 form of `summed` is needed only
-        briefly to write the caller's residual-stream buffer; everything
-        downstream of that store lives in fp32 registers until the final
-        y cast at store time. Net register pressure is the same as a
-        full-fp32-internal implementation (n_regs=255 at tile=16384,
-        nw=4) — bf16 is for HBM/caller dtype compatibility, not for
-        register savings. See `_pick_tile_config` for the spill-aware
-        tile sizing that keeps this within budget.
+        Precision: bf16 inputs, fp32 accumulator
+        (`tl.sum(..., dtype=tl.float32)`), and fp32 elementwise compute
+        (`summed * rms_inv` auto-promotes since rms_inv is fp32, so y_f32
+        is fp32). The squared products `summed * summed` happen in bf16
+        before the fp32 accumulator picks them up — slight precision loss
+        vs F.rms_norm's promote-then-square pattern; max forward diff
+        ~1.5e-1 on bf16 adversarial seeds at the test shape (M=64, D=128),
+        well below the gradient-noise floor in training (see test atol in
+        test_triton_norm_mlp.py). Register pressure stays in the same
+        bracket as the explicit-fp32 implementation — Triton materializes
+        an fp32 tile for the auto-promoted `summed * rms_inv` anyway —
+        so `_pick_tile_config(..., n_live_tiles=2)` still sizes right.
 
         HAS_NW=False ⇒ no per-channel affine weight; output is plain
         `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
@@ -200,11 +202,9 @@ if _HAS_TRITON:
             # summed = x; caller uses x directly downstream (no store).
             summed = x
 
-        # Compute pipeline runs in fp32 (matches F.rms_norm bit-for-bit;
-        # see kernel docstring). summed_f32 stays live in registers from
-        # here through the y store, so register pressure is fp32-internal
-        # in effect — the bf16 `summed` was only kept around for the HBM
-        # write above.
+        # Squared products done in bf16 (truncated mantissa), accumulator
+        # promoted to fp32 via the `dtype=` kwarg — slight precision loss
+        # vs F.rms_norm's promote-then-square (see kernel docstring).
         sum_sq = tl.sum(summed * summed, axis=1, dtype=tl.float32)
         rms_inv = tl.rsqrt(sum_sq / D + eps)
         tl.store(rms_inv_ptr + rows, rms_inv, mask=row_mask)
