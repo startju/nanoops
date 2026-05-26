@@ -142,12 +142,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fused_add_norm_fwd_kernel(
-        x_ptr,
-        res_ptr,
-        nw_ptr,
-        y_ptr,
-        summed_ptr,
-        rms_inv_ptr,
+        x_ptr,  # (M, D) bf16 — in: input
+        res_ptr,  # (M, D) bf16 — in: residual (untouched when HAS_RESIDUAL=False; pass x as placeholder)
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass x as placeholder)
+        y_ptr,  # (M, D) bf16 — out: y = norm(x + res) [* nw]
+        summed_ptr,  # (M, D) bf16 — out: x + res (untouched when HAS_RESIDUAL=False)
+        rms_inv_ptr,  # (M,) fp32 — out: 1/RMS(summed) row-wise, saved for bwd
         M,
         D,
         eps,
@@ -223,13 +223,13 @@ if _HAS_TRITON:
     # dispatches to the inner + 2D-tile fallback pair below.
     @triton.jit
     def _fused_add_norm_bwd_inline_kernel(
-        ynorm_src_ptr,
-        rms_inv_ptr,
-        nw_ptr,
-        dy_ptr,
-        d_ext_ptr,
-        d_summed_ptr,
-        dnw_partial_ptr,
+        ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
+        rms_inv_ptr,  # (M,) fp32 — in: from fwd
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; placeholder)
+        dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
+        d_ext_ptr,  # (M, D) bf16 — in: ∂L/∂summed from caller's other usage (folded into d_summed)
+        d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
+        dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False)
         M,
         D,
         BLOCK_M: tl.constexpr,
@@ -304,11 +304,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fused_add_norm_inner_kernel(
-        ynorm_src_ptr,
-        rms_inv_ptr,
-        nw_ptr,
-        dy_ptr,
-        inner_ptr,
+        ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
+        rms_inv_ptr,  # (M,) fp32 — in: from fwd
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; placeholder)
+        dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
+        inner_ptr,  # (M,) fp32 — out: per-row (1/D) Σ_d(g_eff · y_norm)
         M,
         D,
         BLOCK_M: tl.constexpr,
@@ -371,14 +371,14 @@ if _HAS_TRITON:
     # in autotune state.
     @triton.jit
     def _fused_add_norm_bwd_kernel(
-        ynorm_src_ptr,
-        rms_inv_ptr,
-        nw_ptr,
-        dy_ptr,
-        d_ext_ptr,
-        inner_ptr,
-        d_summed_ptr,
-        dnw_partial_ptr,
+        ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
+        rms_inv_ptr,  # (M,) fp32 — in: from fwd
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; placeholder)
+        dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
+        d_ext_ptr,  # (M, D) bf16 — in: ∂L/∂summed from caller's other usage (folded into d_summed)
+        inner_ptr,  # (M,) fp32 — in: precomputed by `_fused_add_norm_inner_kernel`
+        d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
+        dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False)
         M,
         D,
         BLOCK_M: tl.constexpr,
