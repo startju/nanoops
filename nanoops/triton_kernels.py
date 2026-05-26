@@ -723,6 +723,7 @@ class FusedAddNorm(torch.autograd.Function):
         return d_x, d_residual, dnw, None
 
 
+@torch.compiler.allow_in_graph
 def fused_add_norm(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1498,6 +1499,7 @@ class FusedMLPBlock(torch.autograd.Function):
         return dx, dnw, dW_fc, dW_proj, None
 
 
+@torch.compiler.allow_in_graph
 def fused_mlp_block(
     x: torch.Tensor,
     norm_weight: torch.Tensor | None,
@@ -1827,6 +1829,7 @@ class NormQKVProjection(torch.autograd.Function):
         return dx, dnw, d_qkv_w, None
 
 
+@torch.compiler.allow_in_graph
 def norm_qkv_projection(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -2317,6 +2320,7 @@ class FlashSDPA(torch.autograd.Function):
         return dq, dk, dv, None
 
 
+@torch.compiler.allow_in_graph
 def flash_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2628,6 +2632,7 @@ class OutputProjResidual(torch.autograd.Function):
         return d_attn_out, d_proj_weight, d_residual
 
 
+@torch.compiler.allow_in_graph
 def output_proj_residual(
     attn_out: torch.Tensor,
     proj_weight: torch.Tensor,
@@ -2722,6 +2727,7 @@ class ValueGate(torch.autograd.Function):
         return d_v, d_ve, d_x, d_gate_w
 
 
+@torch.compiler.allow_in_graph
 def value_gate(
     v: torch.Tensor,
     ve: torch.Tensor,
@@ -2813,6 +2819,7 @@ class RotaryQKNormScale(torch.autograd.Function):
         return d_qk, None, None, None, None
 
 
+@torch.compiler.allow_in_graph
 def rotary_qk_norm_scale(
     qk: torch.Tensor,
     cos: torch.Tensor,
