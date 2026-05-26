@@ -820,4 +820,524 @@ framework overhead 的地方。
 
 ---
 
-（第 3 章及后续 —— 待写）
+## 第 3 章 —— FusedMLPBlock：production-level、bwd 全 Triton
+
+第 2 章的 `FusedAddNorm` 是教学样本。这章是 nanchat mlp side 的**实际目标
+fusion**——standard transformer mlp 块（pre-norm + linear + relu² + linear
++ outer residual）端到端 7 个 op，在我们这里被压缩成 **3 步 fwd（cuBLAS 1 个
++ Triton 2 个）+ 4 步全 Triton bwd**，无 cuBLAS。
+
+数学：
+```
+y = x + relu²(RMSNorm(x) · norm_weight @ W_fc.T) @ W_proj.T
+```
+
+API 签名：
+
+```python
+def fused_mlp_block(x, norm_weight, fc_weight, proj_weight, eps=1e-6) -> y
+#   norm_weight=None 时退化为无 affine 的 plain RMSNorm
+```
+
+caller 在外面做 outer residual 的预求和（如果有），这个 block 只做
+`y = x + mlp(norm(x))` 的标准 pattern。
+
+为什么这个比第 2 章值得读：**第 2 章是 add+norm 这种纯 memory-bound 的
+2-op fusion；第 3 章的核心是 _在 matmul 的 bwd 反向链路里塞 fusion_**。
+matmul 本身是 compute-bound，但 bwd 的 dz/dW_proj/dW_fc/dx 每一步都
+带 elementwise 或 reduction 的"副产物"——这些副产物是我们 fuse 的对象。
+
+### 3.1 Kernel 布局总览
+
+| 阶段 | Kernel | Grid | 干什么 |
+|---|---|---|---|
+| Fwd 0 | `_fused_add_norm_fwd_kernel`（重用 ch2 的）| 1D over M | RMSNorm 算 `x_hat` + 副产物 `rms_inv` |
+| Fwd 1 | cuBLAS `torch.matmul` | — | `z = x_hat @ W_fc.T` |
+| Fwd 2 | `_relu_sq_linear_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
+| Bwd A | `_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + 副产物 `inner_buf`（D 要用）|
+| Bwd B | `_mlp_dW_proj_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj` |
+| Bwd C | `_mlp_dW_fc_bwd_kernel` | 2D over (N_fc, K) | `dW_fc` |
+| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + RMSNorm bwd + outer residual fold → `dx` (+ `dnw`) |
+
+**没有 cuBLAS 进 bwd 是故意的**——nanchat 训练时 d24 shape (M=2048,
+N_fc=6144, K=1536) 上，bwd 的每个 matmul 都能跟相邻的 elementwise 操作
+fuse 掉一次 HBM round-trip 或者一次 launch；这种 saving 大于 Triton 自家
+matmul 相对 cuBLAS 的 10-20% 效率劣势。详见 §3.4。
+
+### 3.2 Forward
+
+#### 3.2.1 Step 0 —— RMSNorm 复用 ch2 的 add+norm kernel
+
+复用 `_fused_add_norm_fwd_kernel`，新加 `HAS_RESIDUAL: tl.constexpr` 开关
+跳过 add 路径：
+
+```python
+# Step 0 caller (FusedMLPBlock.forward)
+_fused_add_norm_fwd_kernel[...](
+    x, x, nw_arg,                  # res_ptr 不会被读；传 x 当占位
+    x_hat, x, rms_inv,             # summed_ptr 不会被写；传 x 当占位
+    M, K, eps,
+    BLOCK_M=norm_cfg.block_m, BLOCK_D=BLOCK_D_NORM,
+    HAS_NW=has_nw, HAS_RESIDUAL=False,
+    num_warps=norm_cfg.num_warps,
+)
+```
+
+kernel 体里：
+```python
+if HAS_RESIDUAL:
+    r = tl.load(res_ptr + offs, ...)
+    summed = x + r
+    tl.store(summed_ptr + offs, summed, ...)
+else:
+    summed = x   # caller 把 x 直接当 residual stream 用
+```
+
+为什么不写一个独立的 plain-norm kernel？因为这个 kernel **副产物 `rms_inv`
+正是 bwd 要的**——独立写一个就要重复维护 rsqrt+精度对齐这套逻辑。
+HAS_RESIDUAL=False 时占位指针不会被 dereference，安全。
+
+#### 3.2.2 Step 1 —— cuBLAS c_fc
+
+```python
+z = torch.matmul(x_hat, fc_weight.t())   # (M, N_fc) bf16
+```
+
+为什么留给 cuBLAS：在 d24 (M=2048, N_fc=6144, K=1536) 这种 compute-bound
+matmul 上 3090 cuBLAS 跑 ~70% peak、Triton 自己写 ~55-60%。**单步 fwd
+matmul 没有可 fuse 的副产物**（z 要喂 bwd 的 relu² + matmul），所以
+fusion 收益不存在，纯比 matmul 效率——cuBLAS 赢。
+
+#### 3.2.3 Step 2 —— `_relu_sq_linear_residual_fwd_kernel`
+
+把 `relu²(z) @ W_proj.T + x` 三个 op 塞一个 Triton kernel 里：
+
+```python
+acc = tl.zeros((BLOCK_M, BLOCK_K_OUT), dtype=tl.float32)
+for n_start in range(0, N, BLOCK_N):
+    z = tl.load(...)                        # bf16 native
+    relu_z = tl.where(z > 0.0, z, 0.0)      # bf16；tl.where 保持 x 的 dtype
+    r = relu_z * relu_z                     # bf16 * bf16 = bf16
+    proj_w = tl.load(...)                   # bf16
+    acc += tl.dot(r, tl.trans(proj_w))      # bf16 @ bf16 → tensor core → fp32 acc
+
+# Residual fold-in：acc 先 cast 回 bf16，再加 native dtype 的 residual
+residual = tl.load(residual_ptr + offs, ...)         # bf16
+y = acc.to(y_ptr.dtype.element_ty) + residual         # bf16
+tl.store(y_ptr + offs, y, ...)
+```
+
+注意 patterns：
+- **bf16 全程 + fp32 acc**：z/r/proj_w 全 bf16 喂 tensor core，accumulator
+  fp32 兜底精度。`tl.where(z > 0.0, z, 0.0)` 的字面量 `0.0` 被强制 coerce
+  到 z 的 dtype（不像 `tl.maximum(z, 0.0)` 会把 z promote 成 fp32），这是
+  保 bf16 路径不破的关键。
+- **residual cast 推迟**：先 `acc.to(bf16)`、再 `+ residual(bf16)`，不是
+  先 `residual.to(fp32)` 再 fp32 加。省一次 bf16→fp32 conversion，最后
+  store 也少一次 cast。代价是最后那次加法在 bf16 而非 fp32——精度损失
+  ~1e-3 / 元素，atol 兜得住。
+
+### 3.3 Backward —— 4 个 Triton kernel 全包
+
+bwd 出 4 个梯度：`dz, dW_proj, dW_fc, dx + dnw`。这 4 个 reduction 轴
+互相正交（A reduce K_out、B reduce M、C reduce M、D reduce N_fc），所以
+**不可能塞进单 kernel**。但每一步都跟相邻 elementwise fuse 掉了一次 HBM
+round-trip。
+
+#### 3.3.1 Step A —— `_mlp_dz_bwd_kernel`：matmul + relu² bwd + side-output
+
+数学：
+```
+dr = dy @ W_proj                # matmul, reduce K_out
+dz = 2·relu(z) · dr             # elementwise (relu² bwd)
+inner_partial = Σ_n(dz·z) / norm_dim  ← 副产物，给 D
+```
+
+kernel 体精简版：
+```python
+dr = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+for kp_start in range(0, K_out, BLOCK_K_OUT):
+    dy = tl.load(...); proj_w = tl.load(...)
+    dr += tl.dot(dy, proj_w)        # bf16 @ bf16, fp32 acc
+
+z = tl.load(...)                                              # bf16 native
+relu_z = tl.where(z > 0.0, z, 0.0)
+dz = dr.to(dz_ptr.dtype.element_ty) * 2 * relu_z              # bf16 throughout
+tl.store(dz_ptr + ..., dz, ...)
+
+# Side-output: per-tile partial inner, atomic_add into (M,) fp32 buffer
+inner_partial = tl.sum(dz * z, axis=1, dtype=tl.float32) / K_out
+tl.atomic_add(inner_buf_ptr + rows, inner_partial, mask=row_mask)
+```
+
+3 个值得提的 pattern：
+
+**1. dr 不出 HBM**——matmul accumulator 出来后直接被 `* 2·relu(z)` 消费成
+dz。如果让 PyTorch 走，就是 `dr = dy @ W_proj`（写 25 MB 到 HBM at d24）+
+`dz = 2·relu(z)·dr`（再读这 25 MB 回来）。fused 全程 register。
+
+**2. dz 全程 bf16**——`dr.to(bf16) * 2 * relu_z`。`2` 故意写成 int 字面量
+（不是 `2.0`）以避免把 bf16 promote 到 fp32。要是 promote 了，下游 `tl.sum`
+会拿到 fp32 输入，store 时需要额外 cast。
+
+**3. 副产物 inner_partial**——`tl.sum(dz * z, axis=1, dtype=tl.float32)`，
+然后 atomic_add 累进 `inner_buf[rows]`。3 个细节：
+
+- **dtype=tl.float32 强制 accumulator**：dz 和 z 都是 bf16，bf16 累加 N=6144
+  个 product 会爆精度（8-bit mantissa）。`dtype=` 让 sum 的累加器升 fp32，
+  每个 bf16 product 升 fp32 再加，等价于 PyTorch 内部 promote。
+- **除以 `K_out` 在这里、不在 D**：MLP 结构 `K_out == norm_dim`（forward
+  assert `K_proj_out == K`），所以 A 用自己已有的 K_out 参数除即可。D 直接
+  load `inner_buf` 不再 divide。除法在 atomic_add 前做也意味着累加的是更
+  小数量级的值，fp32 rounding 更精细。
+- **为什么 atomic_add 而不是 scratchpad+reduce**：详见 §3.4。
+
+##### 关键代数 identity
+
+D 的 RMSNorm bwd 公式需要：
+```
+inner[m] = (1/norm_dim) · Σ_k(g_eff[m,k] · y_norm[m,k])
+```
+其中 `g_eff = dx_hat · nw`，`y_norm = x · rms_inv`，`x_hat = y_norm · nw`。
+
+如果让 D 自己算，per (m, k_tile) program 要做完整的 K-reduction，把 dx_hat
+摊在 BM=4 的小 tile 上（要装 full-K 进 register）——tensor core 用不上，
+慢 5×。
+
+但 forward 里 `z[m,n] = Σ_k x_hat[m,k] · W_fc[n,k]`，bwd 里
+`dx_hat[m,k] = Σ_n dz[m,n] · W_fc[n,k]`，把这俩 substitute 进 inner 的内
+积：
+
+```
+Σ_k(dx_hat[m,k] · x_hat[m,k])
+  = Σ_k (Σ_n dz[m,n] · W[n,k]) · x_hat[m,k]
+  = Σ_n dz[m,n] · (Σ_k W[n,k] · x_hat[m,k])
+  = Σ_n dz[m,n] · z[m,n]
+```
+
+——线性算子伴随性质 `⟨L*v, u⟩ = ⟨v, Lu⟩`，c_fc 的 transpose 让我们能用
+N 维度算同一个 inner。A 在算 dz 的时候 dz 和 z 都在 register 里，多一行
+`tl.sum(dz * z)` 几乎 0 成本。
+
+##### 为什么 atomic_add（不是 scratchpad）
+
+A 的 grid 是 `(M/BM, N/BN)`——同一 m_tile 被 N/BN = 48 个 program 切。
+inner 需要把这 48 个 partial 沿 N 加起来。可选方案：
+
+| 方案 | 开销 at d24 |
+|---|---|
+| **atomic_add（当前）** | ~10 μs；硬件 atomic，inner_buf 8 KB 全在 L2 |
+| Scratchpad `(num_n_tiles, M)` + `torch.sum(dim=0)` | ~15 μs；多一个 buffer + 一次 reduce launch（bench 实测打平） |
+| 塞进 D 里顺路算 | ~25-50 μs；D grid 是 `(M/BM, K/BK)`，m_tile 被 K 维 24× 复制，要嘛重复算要嘛 sync；而且 z 不是 D 的输入，要加 HBM 读 |
+
+atomic_add 优势：dz/z 已经在 register、目标 buffer (M,) 全在 L2、不要额外
+buffer 也不要额外 launch。**self-contained 在 kernel 内**。
+
+#### 3.3.2 Step B —— `_mlp_dW_proj_bwd_kernel`：dy.T @ relu²(z)
+
+```python
+acc = tl.zeros((BLOCK_K_OUT, BLOCK_N), dtype=tl.float32)
+for m_start in range(0, M, BLOCK_M):
+    dy = tl.load(...)
+    z = tl.load(...)
+    relu_z = tl.where(z > 0.0, z, 0.0)
+    r = relu_z * relu_z                       # r 重算，不从 HBM 读
+    acc += tl.dot(tl.trans(dy), r)
+tl.store(dW_proj_ptr + ..., acc.to(bf16), ...)
+```
+
+跟 Step A 是「同一个 fwd op 的两个 bwd 输出」，但 reduction 轴不同（B
+reduce M、A reduce K_out），所以分两个 kernel 而不是一个。
+
+唯一的 fusion 是 **r 在 register 重算**——A 已经把 dz 写出 HBM 了，但 r
+本身没存（fwd 也没存，z 才存了）。B 这里现场算 `relu²(z)`，省一个 M·N_fc
+的 HBM round-trip。
+
+#### 3.3.3 Step C —— `_mlp_dW_fc_bwd_kernel`：dz.T @ x_hat，x_hat 重算
+
+```python
+if HAS_NW:
+    nw = tl.load(nw_ptr + ks, ...)              # bf16
+
+acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+for m_start in range(0, M, BLOCK_M):
+    x = tl.load(x_ptr + ..., ...)               # bf16
+    rms_inv = tl.load(rms_inv_ptr + ms, ...)    # fp32
+    if HAS_NW:
+        x_hat = x * rms_inv[:, None] * nw[None, :]   # fp32（auto-promote）
+    else:
+        x_hat = x * rms_inv[:, None]
+
+    dz_tile = tl.load(...)
+    acc += tl.dot(tl.trans(dz_tile), x_hat.to(dz_tile.dtype))   # bf16 @ bf16
+```
+
+**x_hat 在 GEMM inner loop 里现场重算**——不需要在 fwd 时把 x_hat 写到
+HBM 给 bwd 用（forward 里 ctx 只存 `x`、`rms_inv`、`norm_weight`，x_hat
+丢弃）。
+
+这相当于跟「cuBLAS 版」对比：
+```
+[cuBLAS path]
+x_hat = (x * rms_inv * nw).contiguous()        # M·K HBM 写
+dW_fc = dz.T @ x_hat                            # M·K HBM 读 + cuBLAS matmul
+```
+
+vs Triton fused：matmul 里直接 reconstruct，x_hat 不出 register。**省一次
+M·K HBM 写 + 读**。代价是 Triton matmul 比 cuBLAS 慢 ~10-15%。d24 测下来
+fused 净赢 ~30 μs。
+
+#### 3.3.4 Step D —— `_mlp_dx_bwd_kernel`：dx 全部来源汇总
+
+x 在 forward 中出现两次：
+```
+y = x + mlp(norm(x))
+       ↑     ↑
+     outer  norm path
+```
+
+所以 dx 有两条贡献：
+- **outer-residual path**：`dx ← dy`（直接 passthrough）
+- **norm path**：`dx ← RMSNorm_bwd(dx_hat)`，`dx_hat ← dz @ W_fc`
+
+D 把这两条全部塞进**一个 kernel**：
+
+```python
+dx_hat = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+for n_start in range(0, N_fc, BLOCK_N):
+    dz_tile = tl.load(...)                       # bf16
+    W_fc_tile = tl.load(...)                     # bf16
+    dx_hat += tl.dot(dz_tile, W_fc_tile)         # matmul, fp32 acc
+
+# RMSNorm bwd inline，用 A 已经算好的 inner
+rms_inv = tl.load(rms_inv_ptr + rows, ...)       # fp32
+inner = tl.load(inner_buf_ptr + rows, ...)       # fp32（A 已经 /norm_dim）
+x = tl.load(x_ptr + offs, ...)                   # bf16
+dy = tl.load(dy_ptr + offs, ...)                 # bf16 native（passthrough）
+
+y_norm = x * rms_inv[:, None]                    # fp32（auto-promote）
+if HAS_NW:
+    nw = tl.load(nw_ptr + ks, ...)               # bf16
+    g_eff = dx_hat * nw[None, :]                 # fp32
+else:
+    g_eff = dx_hat
+
+# 一行汇总：RMSNorm bwd norm path → cast bf16 → + dy
+dx = (rms_inv[:, None] * (g_eff - y_norm * inner[:, None])).to(bf16) + dy
+tl.store(dx_ptr + offs, dx, ...)
+```
+
+3 个 fusion 同时发生：
+
+**1. dx_hat 不出 HBM**——matmul 出 fp32 register，立刻进 RMSNorm bwd 公
+式被消费。对照 cuBLAS 路径：`dx_hat = dz @ W_fc`（M·K HBM 写）+ 后续 kernel
+读回来用。fused 全程 register。**省 ~13 μs HBM round-trip at d24**。
+
+> 安全前提：dW_fc（kernel C）用的是 x_hat 不是 dx_hat，所以 dx_hat 没必要
+> materialize 出来给别的 kernel 用。
+
+**2. inner 是 A 准备好的**——D 不做 K-reduction，整个 dx 公式纯 elementwise。
+unlock 了用 BLOCK_M=64、BLOCK_K=64 这种 tensor core 友好的 tile（如果 D 自
+己要做 K-reduction，BLOCK_M 被压到 4，tensor core 失效）。
+
+**3. outer-residual 折进 store**——`+ dy` 在 kernel 内完成，不需要外面的
+Python `dx_total = dx_norm + dy` 那一步 + 一次额外 HBM round-trip。
+
+D 还顺路写 `dnw_partial`（per-tile sum，caller 再 `.sum(dim=0)` 收成 dnw）
+when HAS_NW=True。dx_hat 反正在 register 里，多一个 `tl.sum(dx_hat * y_norm)`
+基本免费。
+
+##### dx 公式表达式里的精度路径
+
+```python
+dx = (rms_inv[:, None] * (g_eff - y_norm * inner[:, None])).to(bf16) + dy
+#     [    fp32     *      (fp32 - fp32 * fp32)        ]    bf16 + bf16
+```
+
+括号里全 fp32 算完，**cast 到 bf16 后再 + dy**。又是 §3.2.3 的 residual
+defer 招——dy 不需要升 fp32，最后那次加法在 bf16 里完成。
+
+### 3.4 设计权衡总结
+
+| Op | 谁负责 | 为什么 |
+|---|---|---|
+| Fwd c_fc matmul (z = x_hat @ W_fc) | **cuBLAS** | 单独的 compute-bound matmul，没有 free fusion 机会，纯比 matmul 效率 |
+| Fwd relu² + c_proj + residual | Triton | 三 op fused，r 不出 HBM |
+| Fwd RMSNorm | Triton | 复用 ch2 的 add+norm kernel（HAS_RESIDUAL=False） |
+| Bwd dz (A) | Triton | matmul + relu² bwd + atomic_add 副产物，三 in one |
+| Bwd dW_proj (B) | Triton | r 重算 fused 进 matmul |
+| Bwd dW_fc (C) | Triton | x_hat 重算 fused 进 matmul |
+| Bwd dx (D) | Triton | dx_hat matmul + RMSNorm bwd + outer residual fold，**三 op in one** |
+
+**核心准则**：matmul 旁边有可 fuse 的副产物时，写 Triton 抵消 ~10-15% 效率
+劣势是值得的；没副产物的 lone matmul 让 cuBLAS 跑。
+
+### 3.5 数值精度路径
+
+整个 bwd 全程**bf16 in register / fp32 in accumulator / bf16 in HBM**：
+
+| 操作 | dtype | 原因 |
+|---|---|---|
+| HBM load: x, z, dy, dz, W_fc, W_proj, nw | bf16 native | caller dtype |
+| HBM load: rms_inv, inner_buf, dnw_partial | fp32 native | 精度敏感的副产物 |
+| matmul accumulator (`acc`, `dx_hat`, `dr`) | fp32 | tensor core 默认 fp32 acc |
+| `inner_partial = tl.sum(dz·z, dtype=fp32)` | fp32 | 显式累加器升 fp32 防止 bf16 mantissa 累加溢精度 |
+| `bf16 * fp32` 形如 `x * rms_inv` | fp32（auto-promote） | Triton 标准 promotion 规则 |
+| relu² bwd: `dr.to(bf16) * 2 * relu_z` | bf16 | int `2` 不触发 fp32 promote（vs `2.0` 会） |
+| RMSNorm bwd 公式 `rms_inv·(g_eff - y_norm·inner)` | fp32 | 精度关键路径 |
+| store: `dx`、`dz`、`dW_fc`、`dW_proj`、`y` | bf16 | caller dtype |
+| dx 末尾 `+ dy` | bf16 + bf16 | residual defer（接受 bf16 加法精度损失） |
+
+bf16 routes 全程不踩 fp32 中转：load 进 register 是 bf16，喂 tensor core
+是 bf16，最后 store 还是 bf16。fp32 只出现在 matmul accumulator 和 RMSNorm
+公式（精度敏感）。
+
+### 3.6 预期收益账本
+
+按 d24 (M=2048, N_fc=6144, K=1536, bf16) 算。
+
+#### Forward
+
+Native（5 个独立 op）：
+```
+RMSNorm:    read x (M·K) + write x_hat (M·K)              = 2·M·K
+matmul:     read x_hat (M·K) + W_fc (N·K) + write z (M·N) = 2·M·K + N·K + M·N
+relu²:      read z (M·N) + write r (M·N)                  = 2·M·N
+matmul:     read r (M·N) + W_proj (K·N) + write mlp (M·K) = M·N + N·K + M·K
+add:        read mlp (M·K) + x (M·K) + write y (M·K)      = 3·M·K
+────────────────────────────────────────
+合计 HBM:   8·M·K + 5·M·N + 2·N·K
+launches:   5
+```
+
+Fused：
+```
+Step 0 (Triton):   read x (M·K) + write x_hat (M·K)              = 2·M·K
+Step 1 (cuBLAS):   read x_hat (M·K) + W_fc (N·K) + write z (M·N) = 2·M·K + N·K + M·N
+Step 2 (Triton):   read z (M·N) + W_proj (K·N) + x (M·K) + write y (M·K)
+                                                                  = M·N + N·K + 2·M·K
+────────────────────────────────────────
+合计 HBM:   6·M·K + 2·M·N + 2·N·K
+launches:   3
+```
+
+净收益：
+- **HBM 省 2·M·K + 3·M·N**（r 和 mlp 不出 HBM，relu² 和最后 add 都 fused 进 Step 2）
+- d24: 2·M·K + 3·M·N = 6.3 MB + 75.5 MB = ~82 MB / 936 GB/s ≈ **87 μs HBM 时间**
+- launch 数: 5 → 3，**省 2 次**（~20-60 μs）
+
+#### Backward
+
+Native（PyTorch 的 mlp bwd 链路展开，按生产实现估算）：
+```
+约 8 次 kernel launch：
+  - relu² bwd                                    M·N
+  - dW_proj = dy.T @ r                           大 matmul
+  - dr = dy @ W_proj                             大 matmul（dr → HBM）
+  - dz = dr * 2·relu(z)                          M·N（rd dr, rd z, wr dz）
+  - x_hat = x * rms_inv * nw                     M·K（rd x, rd rms, rd nw, wr x_hat）
+  - dW_fc = dz.T @ x_hat                         大 matmul
+  - dx_hat = dz @ W_fc                           大 matmul（dx_hat → HBM）
+  - RMSNorm bwd: dx_norm = f(dx_hat, x, ...)     M·K（rd dx_hat, rd x, wr dx_norm）
+  - dx = dx_norm + dy                            M·K（rd dx_norm, rd dy, wr dx）
+合计 HBM: 大量中间 buffer round-trip
+launches: ~8
+```
+
+Fused（4 个 Triton kernel）：
+```
+A:  rd dy + z + W_proj, wr dz, atomic inner_buf  (no dr to HBM)
+B:  rd dy + z, wr dW_proj                        (no r to HBM)
+C:  rd dz + x + rms_inv + nw, wr dW_fc           (no x_hat to HBM)
+D:  rd dz + W_fc + x + rms_inv + nw + dy + inner_buf, wr dx + dnw_partial
+                                                  (no dx_hat / dnw to HBM directly)
+合计:
+  - 省了 dr (M·N)、r (M·N)、x_hat (M·K)、dx_hat (M·K)、dx_norm (M·K) 这些
+    中间 buffer 的 HBM round-trip
+  - 省了 dx = dx_norm + dy 的最后 fold（D 直接折进 dx store）
+launches: 4
+```
+
+净收益（粗略估算）：
+- **HBM 省 ~3·M·K + 2·M·N**（5 个中间 buffer 不出 HBM）
+- d24: 3·M·K + 2·M·N = 9.4 MB + 50 MB = ~60 MB / 936 GB/s ≈ **64 μs**
+- launch 数：~8 → 4，**省 ~4 次**（~40-120 μs）
+
+bwd 比 fwd 复杂得多，账本也更不精确——具体看后面性能现实。
+
+### 3.7 性能现实
+
+d24 (M=2048, N_fc=6144, K=1536, bf16) 在 RTX 3090 上：
+
+| 测量 | fused | native | 对比 |
+|---|---|---|---|
+| Forward only | ~2.6 ms | ~2.9 ms | **fused 1.12×** |
+| Forward + Backward | ~8.2 ms | ~8.9 ms | **fused 1.09×** |
+
+其他 shape（fwd + bwd ratio）：
+
+| shape | fwd | f+b |
+|---|---|---|
+| M=2048, N_fc=6144, K=1536 (d24) | 1.12× | 1.09× |
+| M=4096, N_fc=6144, K=1536 | 1.15× | 1.07× |
+| M=2048, N_fc=8192, K=2048 | 1.10× | 1.08× |
+| M=2048, N_fc=3072, K=768 | 1.35× | 1.24× |
+| M=1024, N_fc=16384, K=4096 | 1.05× | 1.03× |
+
+观察：
+- **小 shape 收益最大**（fwd 1.35×, bwd 1.24×）——HBM/launch overhead 占
+  比高，fusion 收益相对放大
+- **大 shape 收益最小**（fwd 1.05×, bwd 1.03×）——matmul compute 主导，
+  fusion 的 HBM 节省相对小；Triton vs cuBLAS 的效率差也开始显现
+- **bwd ratio 普遍小于 fwd ratio**——bwd 4 个 matmul 都是 Triton，跟
+  cuBLAS 的效率差是叠加的；fwd 只一个 cuBLAS matmul（z = x_hat @ W_fc.T）
+
+### 3.8 真正的天花板
+
+FusedMLPBlock 在 d24 上 fwd+bwd 净赢 ~9%（700 μs / 8.9 ms）。**这是单 op
+bench，不是 end-to-end 训练 step time**。要真在 nanchat 上落地还要做：
+
+1. **接进 `nanchat/gpt.py` 的 `Block.forward`**——目前是独立的 autograd
+   函数，未集成。
+2. **验数值稳定性**——跑 ≥1000 steps 对比 native baseline 的 val BPB 曲
+   线，确认没漂移。
+3. **跨 shape / 跨 GPU 鲁棒性**——d24 config 在 3090 上 locked，换 H100
+   要重新 autotune。
+
+但 op-level 1.09× 是真实节省。production-grade kernel 写到这个程度，主要
+的边际优化空间已经枯竭——再快需要换路（fp8、structured sparsity）或者
+更深度的 cross-kernel fusion（multi-stream 在 §3.3 已经分析过会输 atomic
+方案）。
+
+### 3.9 Takeaway
+
+**核心 patterns 总结**（按对性能影响的大小）：
+
+1. **算子合并要在 reduction 轴上下功夫**——matmul 周围的 elementwise
+   和小 reduction 可以塞进 matmul 的 register stage 里，省 HBM round-trip。
+   matmul 本身（compute-bound）的效率劣势小于 fusion 节省。
+
+2. **副产物挪到合适的 kernel 里**——inner 这种 cross-kernel 共享的中间
+   量，放到「已经有 dz 和 z 在 register 的 kernel」里算（A），比放到「要
+   用 inner 但没原料的 kernel」里算（D）快 10×。
+
+3. **代数 identity 是 fusion 的钥匙**——`Σ_k(dx_hat·x_hat) = Σ_n(dz·z)`
+   把 D 里的 K-reduction 换成 A 里的 N-reduction，unlock 了 tensor core 友
+   好的 tile size。
+
+4. **dtype 路径要精打细算**——bf16 全程 + fp32 accumulator + 精确知道
+   什么时候 promote / 什么时候 cast。`tl.where(x>0, x, 0.0)` vs
+   `tl.maximum(x, 0.0)`、int `2` vs float `2.0`、`dtype=tl.float32` on
+   `tl.sum`——这些细节决定 register / HBM 是 fp32 还是 bf16。
+
+5. **不要为了 fusion 而 fusion**——cuBLAS 的大 matmul 比 Triton 快，单
+   独的 compute-bound matmul 没必要硬 fuse。Step 1 (`z = x_hat @ W_fc.T`)
+   就老老实实留给 cuBLAS。
+
+6. **atomic_add 在 small target buffer 上是免费的**——L2 友好，硬件
+   atomic unit 处理 contention。比 scratchpad+reduce 简单且不输。
+
+---
+
+（第 4 章及后续 —— 待写）
+
