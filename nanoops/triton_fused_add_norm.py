@@ -249,6 +249,14 @@ if _HAS_TRITON:
         aliases src and g_eff aliases dy_t when there's no per-channel
         weight; d_ext and d_summed still independent).
 
+        Precision: bf16 inputs (src, dy_t, nw) read native; rms_inv read
+        as fp32 (its HBM dtype). `tl.sum(..., dtype=fp32)` keeps the
+        inner accumulator fp32. Products like `dy_t * nw` and
+        `g_eff * y_norm` happen in their operand dtype before the fp32
+        accumulator picks them up — same bf16-product tradeoff as the
+        fwd kernel; tolerated by the test atol (see
+        `_fused_add_norm_fwd_kernel` docstring for the full discussion).
+
         dnw_partial layout: `(ceil(M / BLOCK_M), D)` — per-m-tile sum
         of `(dy * y_norm)`; caller does `.sum(dim=0)` to (D,)."""
         pid_m = tl.program_id(0)
@@ -259,12 +267,12 @@ if _HAS_TRITON:
         mask_2d = row_mask[:, None] & col_mask[None, :]
         offs = rows[:, None] * D + cols[None, :]
 
-        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
-        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0)
 
         if HAS_NW:
-            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0)
             y_norm = src * rms_inv[:, None]
             g_eff = dy_t * nw[None, :]
         else:
@@ -273,7 +281,7 @@ if _HAS_TRITON:
 
         # Inner reduction over the full D (BLOCK_D ≥ D, masked elements
         # contributed 0). Result is (BLOCK_M,) — one scalar per row.
-        inner = tl.sum(g_eff * y_norm, axis=1) / D
+        inner = tl.sum(g_eff * y_norm, axis=1, dtype=tl.float32) / D
 
         d_ext = tl.load(d_ext_ptr + offs, mask=mask_2d, other=0.0)
         d_summed = (rms_inv[:, None] * (g_eff - y_norm * inner[:, None])).to(
@@ -319,6 +327,12 @@ if _HAS_TRITON:
         row tile reduction. BLOCK_D = next_power_of_2(D) so the whole D
         fits in a single tile column-wise (same pattern as fwd kernel).
 
+        Precision: same bf16-product + fp32-accumulator pattern as the
+        inline bwd kernel — bf16 inputs read native, `tl.sum(..., dtype=
+        fp32)` for the accumulator, slight precision loss on bf16 squared
+        products vs F.rms_norm's promote-then-multiply (tolerated by test
+        atol; see `_fused_add_norm_fwd_kernel` docstring).
+
         Writes one fp32 per row to `inner_ptr` (shape (M,))."""
         pid_m = tl.program_id(0)
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -328,19 +342,19 @@ if _HAS_TRITON:
         mask_2d = row_mask[:, None] & col_mask[None, :]
         offs = rows[:, None] * D + cols[None, :]
 
-        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
-        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
-        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0)
 
         if HAS_NW:
             y_norm = src * rms_inv[:, None]
-            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + cols, mask=col_mask, other=0.0)
             g_eff = dy_t * nw[None, :]
         else:
             y_norm = src
             g_eff = dy_t
 
-        inner = tl.sum(g_eff * y_norm, axis=1) / D
+        inner = tl.sum(g_eff * y_norm, axis=1, dtype=tl.float32) / D
         tl.store(inner_ptr + rows, inner, mask=row_mask)
 
     # Fixed-config kernel (no @triton.autotune) for CUDA Graph compatibility.
@@ -410,6 +424,11 @@ if _HAS_TRITON:
         When HAS_NW=False: y_norm[m, d] = ynorm_src[m, d] directly,
         g_eff collapses to dy, dnw_partial is not produced; nw_ptr
         and dnw_partial_ptr are not dereferenced.
+
+        Precision: same bf16-product + fp32-accumulator pattern as the
+        inline + inner kernels — bf16 inputs read native, fp32 promotion
+        happens via auto-promote on multiplies against fp32 tensors
+        (rms_inv, inner) and via explicit `dtype=fp32` on `tl.sum`.
         """
         pid_m = tl.program_id(0)
         pid_d = tl.program_id(1)
@@ -419,13 +438,13 @@ if _HAS_TRITON:
         row_mask = rows < M
         d_mask = ds < D
 
-        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
         if HAS_NW:
-            nw = tl.load(nw_ptr + ds, mask=d_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + ds, mask=d_mask, other=0.0)
         # Pre-computed per-row inner — replaces the previous pass-1
         # full-D reduction loop. One scalar load per row, not redone
         # per d_tile program.
-        inner = tl.load(inner_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        inner = tl.load(inner_ptr + rows, mask=row_mask, other=0.0)
 
         # Compute d_summed for this (m_tile, d_tile) slice.
         # All (M, D) tensors are contiguous (autograd boundary ensures
@@ -433,12 +452,12 @@ if _HAS_TRITON:
         # stride params needed.
         offs = rows[:, None] * D + ds[None, :]
         mask_2d = row_mask[:, None] & d_mask[None, :]
-        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        src = tl.load(ynorm_src_ptr + offs, mask=mask_2d, other=0.0)
         if HAS_NW:
             y_norm = src * rms_inv[:, None]
         else:
             y_norm = src
-        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0).to(tl.float32)
+        dy_t = tl.load(dy_ptr + offs, mask=mask_2d, other=0.0)
         if HAS_NW:
             g_eff = dy_t * nw[None, :]
         else:
@@ -459,7 +478,7 @@ if _HAS_TRITON:
         # Per-m-tile partial dnw[d] = sum over tile rows of (dy * y_norm)
         # — only when affine weight exists.
         if HAS_NW:
-            dnw_partial = tl.sum(dy_t * y_norm, axis=0)
+            dnw_partial = tl.sum(dy_t * y_norm, axis=0, dtype=tl.float32)
             dnw_p_ptrs = dnw_partial_ptr + pid_m * D + ds
             tl.store(
                 dnw_p_ptrs,
