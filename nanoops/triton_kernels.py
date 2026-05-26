@@ -780,8 +780,8 @@ if _HAS_TRITON:
         BLOCK_N: tl.constexpr,
         IEEE_PRECISION: tl.constexpr,
     ):
-        """IEEE_PRECISION: False (bf16 path) → cast r to bf16 → Ampere
-        bf16 tensor cores. True (fp32 path) → keep r in fp32 + pass
+        """IEEE_PRECISION: False (bf16 path) → r stays bf16 → Ampere
+        bf16 tensor cores. True (fp32 path) → r stays fp32 + pass
         `input_precision="ieee"` to tl.dot, disabling TF32 downcast.
         Slower but bit-tight vs PyTorch `@` for fp32 parity tests."""
         pid_m = tl.program_id(0)
@@ -836,10 +836,23 @@ if _HAS_TRITON:
     #                               saves ~50 MB round-trip at d24)
     #   dz = 2·relu(z) · dr        (relu² bwd, applied inline)
     #
-    # Side-output: inner_buf[m] += Σ_n(dz·z) via atomic_add (= norm_dim·inner).
+    # Side-output: inner_buf[m] += Σ_n(dz·z)/norm_dim via atomic_add (= inner).
     # D uses it via the identity Σ_k(dx_hat·x_hat) = Σ_n(dz·z) to skip its
-    # per-row reduction over norm_dim; D divides by norm_dim inline. Free
-    # here — dz and z are both already in registers.
+    # per-row reduction over norm_dim. Division folded in here (we already
+    # have K_out, which equals norm_dim in MLP by construction — asserted
+    # in forward as K_proj_out == K). Free — dz and z are both already in
+    # registers.
+    #
+    # Why atomic_add (and not a scratchpad + downstream reduce)?
+    # Our grid here is (M/BM, N/BN), so the N-axis reduction needed for
+    # inner is split across multiple programs per m_tile. None of the
+    # downstream kernels (B, C, D) has a free natural N-axis reduction
+    # we could piggyback on — D reduces over N for its dx_hat matmul,
+    # but its (M/BM, K/BK) grid duplicates each m_tile K/BK times, which
+    # would either duplicate the inner work or require inter-program sync.
+    # A scratchpad-then-`torch.sum` route works (benched ~equal) but adds
+    # an extra (num_n_tiles, M) buffer + a separate reduce launch. Using
+    # atomic_add here keeps everything self-contained in this kernel.
     # d24 config locked: (BLOCK_M=64, BLOCK_N=128, BLOCK_K_OUT=32, nw=8, st=3).
     @triton.jit
     def _mlp_dz_bwd_kernel(
@@ -847,7 +860,7 @@ if _HAS_TRITON:
         z_ptr,  # (M, N) bf16 — saved from fwd
         proj_w_ptr,  # (K_out, N) bf16 — W_proj
         dz_ptr,  # (M, N) bf16 — output (gradient w.r.t. z)
-        inner_buf_ptr,  # (M,) fp32 — side-output Σ_n(dz·z); caller must zero-init
+        inner_buf_ptr,  # (M,) fp32 — side-output Σ_n(dz·z)/norm_dim; caller zero-inits
         M,
         N,
         K_out,
@@ -901,19 +914,18 @@ if _HAS_TRITON:
             mask=row_mask[:, None] & n_mask[None, :],
         )
 
-        # Side-output: partial inner = Σ_n(dz·z) (see kernel header).
+        # Side-output: partial inner = Σ_n(dz·z) / norm_dim (see kernel header).
         # Force fp32 accumulator — dz and z are bf16 in the bf16 path, and
-        # summing N up to several thousand bf16 products in bf16 would
-        # lose precision (8-bit mantissa). dtype= upcasts elementwise
-        # into the fp32 accumulator before each add.
-        inner_partial = tl.sum(dz * z, axis=1, dtype=tl.float32)
+        # summing BLOCK_N bf16 products in bf16 would lose precision.
+        # K_out == norm_dim in MLP, so dividing here saves D a div-on-load.
+        inner_partial = tl.sum(dz * z, axis=1, dtype=tl.float32) / K_out
         tl.atomic_add(inner_buf_ptr + rows, inner_partial, mask=row_mask)
 
     # dW_proj = dy.T @ relu²(z), r recomputed inline (no materialization).
     # Pairs with `_mlp_dz_bwd_kernel` to cover both bwd outputs of the
     # fwd kernel `_relu_sq_linear_residual_fwd_kernel`; reduction axis
     # differs (M here vs K_out there) so they're separate kernels.
-    # d24 config locked: (BLOCK_KO=64, BLOCK_N=128, BLOCK_M=32, nw=4, st=3).
+    # d24 config locked: (BLOCK_K_OUT=64, BLOCK_N=128, BLOCK_M=32, nw=4, st=3).
     @triton.jit
     def _mlp_dW_proj_bwd_kernel(
         dy_ptr,  # (M, K_out) bf16
@@ -971,8 +983,8 @@ if _HAS_TRITON:
     # dW_fc = dz.T @ x_hat with x_hat reconstructed from (x, rms_inv, nw)
     # inside the GEMM inner loop — no x_hat materialization. Saves
     # M·K HBM write+read + one launch vs the eager (cuBLAS) chain.
-    # d24 config locked: (BM=64, BN=64, BK=128, nw=4, st=2). Other shapes
-    # prefer (BN=128, BK=64), within 2% on 3090.
+    # d24 config locked: (BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, nw=4, st=2).
+    # Other shapes prefer (BLOCK_N=128, BLOCK_K=64), within 2% on 3090.
     @triton.jit
     def _mlp_dW_fc_bwd_kernel(
         dz_ptr,  # (M, N_fc) bf16
@@ -997,7 +1009,7 @@ if _HAS_TRITON:
         k_mask = ks < K
 
         if HAS_NW:
-            nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + ks, mask=k_mask, other=0.0)
 
         acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
         for m_start in range(0, M, BLOCK_M):
@@ -1046,8 +1058,8 @@ if _HAS_TRITON:
     #
     # Math (per element; K below = norm_dim, the kernel's `K` param):
     #   y_norm   = x · rms_inv
-    #   g_eff    = dx_hat · nw
-    #   inner    = inner_buf / K           (folded in-kernel from A's raw side-output)
+    #   g_eff    = dx_hat · nw                  (= dx_hat if HAS_NW=False)
+    #   inner    = inner_buf                    (A already divided by norm_dim)
     #   dx       = rms_inv · (g_eff - y_norm · inner) + dy  (outer residual passthrough)
     #   dnw_partial[m_tile, k] = Σ_{m∈m_tile} (dx_hat · y_norm)  [HAS_NW only]
     @triton.jit
@@ -1056,9 +1068,9 @@ if _HAS_TRITON:
         W_fc_ptr,  # (N_fc, K) bf16
         x_ptr,  # (M, K) bf16 — fwd input, used for y_norm = x·rms_inv
         rms_inv_ptr,  # (M,) fp32
-        nw_ptr,  # (K,) bf16
+        nw_ptr,  # (K,) bf16 — unused when HAS_NW=False (placeholder)
         dy_ptr,  # (M, K) bf16 — outer residual passthrough, folded into dx
-        inner_buf_ptr,  # (M,) fp32 — raw Σ_n(dz·z) from A; divided by K in-kernel
+        inner_buf_ptr,  # (M,) fp32 — Σ_n(dz·z) / norm_dim from A (= inner)
         dx_ptr,  # (M, K) bf16 — output
         dnw_partial_ptr,  # (num_m_tiles, K) bf16 — output (only used if HAS_NW)
         M,
@@ -1107,11 +1119,8 @@ if _HAS_TRITON:
         offs = rows[:, None] * K + ks[None, :]
         mask_2d = row_mask[:, None] & k_mask[None, :]
         rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
-        # inner = (1/K) · Σ_n(dz·z); load raw buf and divide here (saves a
-        # tiny `inner_buf / K` op + launch in the Python caller).
-        inner = (
-            tl.load(inner_buf_ptr + rows, mask=row_mask, other=0.0) / K
-        )
+        # inner = (1/norm_dim) · Σ_n(dz·z); A already did the division.
+        inner = tl.load(inner_buf_ptr + rows, mask=row_mask, other=0.0)
         x = tl.load(x_ptr + offs, mask=mask_2d, other=0.0)
         # dy kept in native dtype — cast the fp32 norm-path result to
         # output dtype first, then add dy. Saves a bf16→fp32 conversion
@@ -1158,8 +1167,9 @@ class FusedMLPBlock(torch.autograd.Function):
 
     Backward (4 Triton kernels, no cuBLAS):
       A. `_mlp_dz_bwd_kernel`: dz = 2·relu(z) · (dy @ W_proj).
-         Side-output `inner_buf[m] = Σ_n(dz·z)` via atomic_add (free —
-         dz/z in registers). Step D uses it via the identity
+         Side-output `inner_buf[m] = Σ_n(dz·z) / norm_dim` via atomic_add
+         (free — dz/z in registers; division folded in since K_out ==
+         norm_dim in MLP). Step D uses it via the identity
          Σ_k(dx_hat·x_hat) = Σ_n(dz·z) to skip its K-reduction.
       B. `_mlp_dW_proj_bwd_kernel`: dW_proj = dy.T @ relu²(z), r
          recomputed inline.
@@ -1175,8 +1185,9 @@ class FusedMLPBlock(torch.autograd.Function):
              g_eff  = dx_hat · nw          (= dx_hat if no affine)
              dx_path_ii = rms_inv · (g_eff - y_norm · inner)
          where `inner = (1/K) Σ_k(g_eff · y_norm) = (1/K) Σ_n(dz · z)`
-         (the latter form is what A precomputes — see the identity in
-         A's notes). Total `dx = dx_path_ii + dy`.
+         (the latter form is what A computes — see the identity in A's
+         notes; A divides by K=norm_dim in-kernel, so D loads `inner`
+         directly). Total `dx = dx_path_ii + dy`.
 
          Kernel does (ii)'s matmul in-kernel — dx_hat is never written
          to HBM (kernel C uses x_hat, not dx_hat, so loss-free). Inner
@@ -1206,9 +1217,9 @@ class FusedMLPBlock(torch.autograd.Function):
         # Step 0: RMSNorm. Reuse `_fused_add_norm_fwd_kernel` with
         # HAS_RESIDUAL=False (no plain-norm variant exists, and we need
         # this kernel's rms_inv side-output for bwd). The kernel skips
-        # the residual load + summed store; we pass x as a placeholder
-        # for res_ptr/summed_ptr (untouched) and treat x itself as the
-        # `summed` for downstream consumers.
+        # the residual load + summed store; x is passed as a placeholder
+        # for res_ptr/summed_ptr (untouched). Step 2 / bwd consume x
+        # directly as the residual stream.
         BLOCK_D_NORM = triton.next_power_of_2(K)
         norm_cfg = _pick_tile_config(M, BLOCK_D_NORM, n_live_tiles=2)
         x_hat = torch.empty_like(x)
@@ -1235,9 +1246,9 @@ class FusedMLPBlock(torch.autograd.Function):
         z = torch.matmul(x_hat, fc_weight.t())  # (M, N_fc)
 
         # Step 2: Triton kernel for relu² + c_proj + outer residual (= x).
-        BLOCK_M, BLOCK_K_OUT, BLOCK_N = 64, 128, 32
+        BLOCK_M_FWD, BLOCK_K_OUT_FWD, BLOCK_N_FWD = 64, 128, 32
         y = torch.empty((M, K_proj_out), dtype=x.dtype, device=x.device)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_proj_out, BLOCK_K_OUT))
+        grid = (triton.cdiv(M, BLOCK_M_FWD), triton.cdiv(K_proj_out, BLOCK_K_OUT_FWD))
         _relu_sq_linear_residual_fwd_kernel[grid](
             z,
             proj_weight,
@@ -1246,9 +1257,9 @@ class FusedMLPBlock(torch.autograd.Function):
             M,
             N_fc,
             K_proj_out,
-            BLOCK_M=BLOCK_M,
-            BLOCK_K_OUT=BLOCK_K_OUT,
-            BLOCK_N=BLOCK_N,
+            BLOCK_M=BLOCK_M_FWD,
+            BLOCK_K_OUT=BLOCK_K_OUT_FWD,
+            BLOCK_N=BLOCK_N_FWD,
             IEEE_PRECISION=ieee,
             num_warps=4,
             num_stages=3,
@@ -1267,9 +1278,9 @@ class FusedMLPBlock(torch.autograd.Function):
         dy = dy.contiguous()
         ieee = x.dtype == torch.float32
 
-        # A: dz = 2·relu(z) · (dy @ W_proj)   ← matmul + relu² bwd fused
-        #    inner_buf[m] += Σ_n(dz · z)      ← atomic_add side-output for D
-        #                                       (D divides by K=norm_dim inline)
+        # A: dz = 2·relu(z) · (dy @ W_proj)         ← matmul + relu² bwd fused
+        #    inner_buf[m] += Σ_n(dz·z) / norm_dim   ← atomic_add side-output for D
+        #                                             (see kernel header for why atomic)
         BLOCK_M_A, BLOCK_N_A, BLOCK_K_OUT_A = 64, 128, 32
         dz = torch.empty_like(z)
         inner_buf = torch.zeros((M,), dtype=torch.float32, device=z.device)
@@ -1310,8 +1321,9 @@ class FusedMLPBlock(torch.autograd.Function):
             num_stages=3,
         )
 
-        # HAS_NW tracks whether norm_weight exists (affects x_hat formula);
-        # dnw is only produced when norm_weight also requires grad.
+        # has_nw — norm_weight exists. Gates both the affine x_hat formula
+        # (in C/D) and the dnw output. We always compute dnw when norm_w
+        # exists; PyTorch discards it if it doesn't need grad.
         has_nw = norm_w is not None
         nw_arg = norm_w if has_nw else x  # placeholder when HAS_NW=False
 
@@ -1339,9 +1351,9 @@ class FusedMLPBlock(torch.autograd.Function):
         )
 
         # D: dx_hat = dz @ W_fc fused with RMSNorm bwd. dx_hat never
-        # leaves the kernel. Elementwise dx unlocked by A's inner_buf
-        # (kernel divides by K inline). The outer residual passthrough
-        # (dy) is folded into dx in-kernel.
+        # leaves the kernel. Elementwise dx unlocked by A's pre-divided
+        # inner_buf. The outer residual passthrough (dy) is folded into
+        # dx in-kernel.
         BLOCK_M_D, BLOCK_K_D, BLOCK_N_D = 64, 64, 64
         num_m_tiles = triton.cdiv(M, BLOCK_M_D)
         dx = torch.empty_like(x)
@@ -1352,6 +1364,7 @@ class FusedMLPBlock(torch.autograd.Function):
                 device=x.device,
             )
         else:
+            # 1-elem placeholder — kernel won't touch it when HAS_NW=False.
             dnw_partials = torch.empty(1, dtype=x.dtype, device=x.device)
         grid_d = (num_m_tiles, triton.cdiv(K, BLOCK_K_D))
         _mlp_dx_bwd_kernel[grid_d](
@@ -1375,7 +1388,7 @@ class FusedMLPBlock(torch.autograd.Function):
             num_warps=4,
             num_stages=3,
         )
-        dnw = dnw_partials.sum(dim=0) if (has_nw and ctx.needs_input_grad[1]) else None
+        dnw = dnw_partials.sum(dim=0) if has_nw else None
 
         return dx, dnw, dW_fc, dW_proj, None
 
