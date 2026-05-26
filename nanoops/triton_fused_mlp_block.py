@@ -12,6 +12,8 @@ Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from .triton_fused_add_norm import _pick_tile_config
@@ -873,17 +875,25 @@ def _fused_mlp_block_bwd_fake(
     )
 
 
-def _fused_mlp_block_setup_context(ctx, inputs, output):
-    _x, norm_weight, fc_weight, proj_weight, _eps = inputs
+def _fused_mlp_block_setup_context(
+    ctx: Any,
+    inputs: tuple[
+        torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, float
+    ],
+    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    x, norm_weight, fc_weight, proj_weight, _eps = inputs
     _y, rms_inv, z = output
-    # Save the same tensors the eager class did, plus the inputs we need
-    # again in bwd. x is an input so we save it via save_for_backward too.
-    x = inputs[0]
     ctx.save_for_backward(norm_weight, fc_weight, proj_weight, x, rms_inv, z)
 
 
-def _fused_mlp_block_op_backward(ctx, grad_y, grad_rms_inv, grad_z):
-    # grad_rms_inv / grad_z are unused: rms_inv and z exist only to
+def _fused_mlp_block_autograd_backward(
+    ctx: Any,
+    grad_y: torch.Tensor,
+    grad_rms_inv: torch.Tensor,
+    grad_z: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, None]:
+    # grad_rms_inv / grad_z are zeros: rms_inv and z exist only to
     # plumb fwd→bwd state inside this op, no downstream consumer.
     norm_w, W_fc, W_proj, x, rms_inv, z = ctx.saved_tensors
     dx, dnw, dW_fc, dW_proj = _fused_mlp_block_bwd_op(
@@ -898,7 +908,7 @@ def _fused_mlp_block_op_backward(ctx, grad_y, grad_rms_inv, grad_z):
 
 
 _fused_mlp_block_fwd_op.register_autograd(
-    _fused_mlp_block_op_backward,
+    _fused_mlp_block_autograd_backward,
     setup_context=_fused_mlp_block_setup_context,
 )
 

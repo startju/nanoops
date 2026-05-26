@@ -19,7 +19,7 @@ Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 
@@ -731,7 +731,11 @@ def _fused_add_norm_bwd_fake(
     return torch.empty_like(ynorm_src), dnw
 
 
-def _fused_add_norm_setup_context(ctx, inputs, output):
+def _fused_add_norm_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float],
+    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
     _x, _residual, norm_weight, _eps = inputs
     y, summed, rms_inv = output
     # ynorm_src is `summed` when norm_weight exists (bwd needs to multiply
@@ -742,8 +746,13 @@ def _fused_add_norm_setup_context(ctx, inputs, output):
     ctx.save_for_backward(ynorm_src, norm_weight, rms_inv)
 
 
-def _fused_add_norm_op_backward(ctx, grad_y, grad_summed, grad_rms_inv):
-    # grad_rms_inv is always None — no downstream consumer.
+def _fused_add_norm_autograd_backward(
+    ctx: Any,
+    grad_y: torch.Tensor,
+    grad_summed: torch.Tensor,
+    grad_rms_inv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, None]:
+    # grad_rms_inv is zeros — no downstream consumer of rms_inv.
     # grad_summed IS the d_summed_external from the residual stream.
     ynorm_src, norm_weight, rms_inv = ctx.saved_tensors
     d_summed, dnw = _fused_add_norm_bwd_op(
@@ -752,11 +761,12 @@ def _fused_add_norm_op_backward(ctx, grad_y, grad_summed, grad_rms_inv):
     if norm_weight is None:
         dnw = None
     # d_x = d_residual = d_summed (both alias — autograd accumulates correctly).
+    # 4 inputs → 4 grads. eps is a Python float, no grad.
     return d_summed, d_summed, dnw, None
 
 
 _fused_add_norm_fwd_op.register_autograd(
-    _fused_add_norm_op_backward,
+    _fused_add_norm_autograd_backward,
     setup_context=_fused_add_norm_setup_context,
 )
 
