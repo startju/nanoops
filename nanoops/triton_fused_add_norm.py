@@ -15,11 +15,9 @@ Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 
 from __future__ import annotations
 
-import os
 from typing import NamedTuple
 
 import torch
-import torch.nn.functional as F
 
 try:
     import triton
@@ -28,11 +26,6 @@ try:
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
-
-
-# Cached at module load — same pattern as NANOOPS_LOOKUP_SORTED so the
-# hot path doesn't pay an os.environ.get dict lookup on every call.
-NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -45,8 +38,8 @@ NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"
 # summed = x + residual (which the next block needs anyway and the
 # backward kernel also consumes).
 #
-# Backward: two paths, dispatched in FusedAddNorm.backward based on
-# whether the inline kernel's per-program tile fits in the 255 fp32
+# Backward: two paths, dispatched in `_fused_add_norm_bwd_impl` based
+# on whether the inline kernel's per-program tile fits in the 255 fp32
 # reg/thread cap (checked via TileConfig.fits_reg_budget):
 #   Primary — _fused_add_norm_bwd_inline_kernel: single-pass, full
 #     row in one tile, inner reduction computed in registers. Used
@@ -61,7 +54,7 @@ NORM_MLP_ENABLED = _HAS_TRITON and bool(os.environ.get("NANOOPS_TRITON_NORM_MLP"
 #   `+` op + its HBM round-trip.
 #
 # Cheap, useful at the seam between attn-block output and mlp-block
-# norm-input. See FusedAddNorm class docstring + TRITON.md Chapter 2.
+# norm-input. See TRITON.md Chapter 2.
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -178,8 +171,8 @@ if _HAS_TRITON:
         y cast at store time. Net register pressure is the same as a
         full-fp32-internal implementation (n_regs=255 at tile=16384,
         nw=4) — bf16 is for HBM/caller dtype compatibility, not for
-        register savings. See FusedAddNorm class docstring for the
-        spill-aware tile sizing that keeps this within budget.
+        register savings. See `_pick_tile_config` for the spill-aware
+        tile sizing that keeps this within budget.
 
         HAS_NW=False ⇒ no per-channel affine weight; output is plain
         `summed / RMS(summed)`. nw_ptr is then not dereferenced."""
@@ -223,7 +216,7 @@ if _HAS_TRITON:
     # precompute, no D-split). Used when the (BLOCK_M × full-D) tile
     # fits in registers — covers HAS_NW=False at any D and HAS_NW=True
     # up to the size where the (M / BLOCK_M, D) dnw_partials buffer
-    # becomes the HBM bottleneck. Above that, FusedAddNorm.backward
+    # becomes the HBM bottleneck. Above that, `_fused_add_norm_bwd_impl`
     # dispatches to the inner + 2D-tile fallback pair below.
     @triton.jit
     def _fused_add_norm_bwd_inline_kernel(
@@ -657,12 +650,12 @@ def _fused_add_norm_bwd_impl(
     return d_summed, dnw
 
 
-# ── torch.library.custom_op wrapping — opaque to dynamo, same rationale
-# as FusedMLPBlock above. Without this, calling fused_add_norm under
-# torch.compile would either graph-break (autograd.Function) or attempt
-# to trace into the Triton kernels with FakeTensors and crash on
-# .data_ptr() (allow_in_graph). custom_op tells dynamo "opaque op,
-# here's its shape via register_fake, here's its autograd". ──
+# ── torch.library.custom_op wrapping — opaque to dynamo. Without this,
+# calling fused_add_norm under torch.compile would either graph-break
+# (autograd.Function) or attempt to trace into the Triton kernels with
+# FakeTensors and crash on .data_ptr() (allow_in_graph). custom_op tells
+# dynamo "opaque op, here's its shape via register_fake, here's its
+# autograd". Same pattern used in `triton_fused_mlp_block.py`. ──
 
 @torch.library.custom_op(
     "nanoops::fused_add_norm_fwd",

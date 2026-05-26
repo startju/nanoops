@@ -10,9 +10,10 @@ Wins come from:
     3× HBM traffic; fused is 1× input read + 1× output write)
   - smaller working set (no intermediate buffers between ops)
 
-Activated via env var per op (e.g. `NANOOPS_TRITON_NORM_MLP=1`).
-If triton isn't installed or the env var isn't set, callers fall back
-to the eager Python implementation in `functional.py`.
+Activated via env var per op (e.g. `NANOOPS_FUSED_MLP_BLOCK=1` for the
+production-wired FusedMLPBlock — see `nanoops/integration.py` for the
+flag list). If triton isn't installed or the env var isn't set, callers
+fall back to the eager Python implementation in `functional.py`.
 
 The actual code lives in three feature-split sibling modules:
   - `triton_fused_add_norm.py` — FusedAddNorm + shared TileConfig helper
@@ -31,7 +32,6 @@ from __future__ import annotations
 
 # ── FusedAddNorm + shared utilities ─────────────────────────────────
 from .triton_fused_add_norm import (
-    NORM_MLP_ENABLED,
     TileConfig,
     _fused_add_norm_bwd_impl,
     _fused_add_norm_bwd_op,
@@ -66,9 +66,8 @@ from .triton_attn import (
 
 # Private @triton.jit kernels — re-exported for direct benchmark scripts
 # (/tmp/sweep_*.py, /tmp/bench_*.py) that import them by name. Guarded
-# because they only exist when triton is installed; on a no-triton
-# environment NORM_MLP_ENABLED is False and these names just aren't
-# bound — same behavior as the pre-split file.
+# because they only exist when triton is installed; on a no-triton env
+# the names just aren't bound — same behavior as the pre-split file.
 try:
     from .triton_fused_add_norm import (
         _fused_add_norm_bwd_inline_kernel,
