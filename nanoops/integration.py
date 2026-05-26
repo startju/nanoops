@@ -149,11 +149,13 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
     # `.contiguous()` is cheap when already contiguous (returns same tensor);
     # if attn produced a non-contiguous view (e.g. via stride tricks) the
     # fused kernel needs contiguous input for its index arithmetic.
+    # Weight dtype cast (fp32 master → bf16 activation) is handled inside
+    # `fused_mlp_block` itself, so we pass the raw module weights here.
     x_2d = x.reshape(B * T, C).contiguous()
     y_2d = _fused_mlp_block(
         x_2d, None,
-        self.mlp.c_fc.weight.to(x.dtype),
-        self.mlp.c_proj.weight.to(x.dtype),
+        self.mlp.c_fc.weight,
+        self.mlp.c_proj.weight,
     )
     return y_2d.reshape(B, T, C)
 

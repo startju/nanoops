@@ -1406,7 +1406,20 @@ def fused_mlp_block(
     Standard transformer mlp side: `y = x + mlp(norm(x))`. If the caller
     needs to pre-sum with an attention residual, do it outside.
     `norm_weight=None` ⇒ plain RMSNorm without the per-channel affine.
+
+    Weights are auto-cast to x's dtype when they differ (e.g. fp32 master
+    weight + bf16 activation) — same pattern as nanchat's `Linear.forward`
+    (`F.linear(x, self.weight.to(dtype=x.dtype))`). The `.to()` op is
+    autograd-traced, so the dW returned from FusedMLPBlock gets routed
+    back through it and accumulates onto the original weight's dtype.
+
     See `FusedMLPBlock` for the kernel breakdown and ctx contents."""
+    if fc_weight.dtype != x.dtype:
+        fc_weight = fc_weight.to(dtype=x.dtype)
+    if proj_weight.dtype != x.dtype:
+        proj_weight = proj_weight.to(dtype=x.dtype)
+    if norm_weight is not None and norm_weight.dtype != x.dtype:
+        norm_weight = norm_weight.to(dtype=x.dtype)
     return FusedMLPBlock.apply(x, norm_weight, fc_weight, proj_weight, eps)
 
 
