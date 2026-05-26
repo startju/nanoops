@@ -146,7 +146,7 @@ if _HAS_TRITON:
         res_ptr,  # (M, D) bf16 — in: residual (untouched when HAS_RESIDUAL=False; pass x as placeholder)
         nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass x as placeholder)
         y_ptr,  # (M, D) bf16 — out: y = norm(x + res) [* nw]
-        summed_ptr,  # (M, D) bf16 — out: x + res (untouched when HAS_RESIDUAL=False)
+        summed_ptr,  # (M, D) bf16 — out: x + res (untouched when HAS_RESIDUAL=False; pass x as placeholder)
         rms_inv_ptr,  # (M,) fp32 — out: 1/RMS(summed) row-wise, saved for bwd
         M,
         D,
@@ -196,7 +196,9 @@ if _HAS_TRITON:
         if HAS_RESIDUAL:
             r = tl.load(res_ptr + offs, mask=mask_2d, other=0.0)
             summed = x + r
-            # Caller's next-block residual stream + bwd y_norm reconstruction.
+            # Caller's next-block residual stream; bwd reads this for
+            # y_norm reconstruction (`y_norm = summed * rms_inv`) when
+            # HAS_NW=True. HAS_NW=False bwd reads `y` directly instead.
             tl.store(summed_ptr + offs, summed, mask=mask_2d)
         else:
             # summed = x; caller uses x directly downstream (no store).
@@ -225,11 +227,11 @@ if _HAS_TRITON:
     def _fused_add_norm_bwd_inline_kernel(
         ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
         rms_inv_ptr,  # (M,) fp32 — in: from fwd
-        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; placeholder)
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
         d_ext_ptr,  # (M, D) bf16 — in: ∂L/∂summed from caller's other usage (folded into d_summed)
         d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
-        dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False)
+        dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         M,
         D,
         BLOCK_M: tl.constexpr,
@@ -306,7 +308,7 @@ if _HAS_TRITON:
     def _fused_add_norm_inner_kernel(
         ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
         rms_inv_ptr,  # (M,) fp32 — in: from fwd
-        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; placeholder)
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
         inner_ptr,  # (M,) fp32 — out: per-row (1/D) Σ_d(g_eff · y_norm)
         M,
@@ -373,12 +375,12 @@ if _HAS_TRITON:
     def _fused_add_norm_bwd_kernel(
         ynorm_src_ptr,  # (M, D) bf16 — in: `summed` if HAS_NW else `y` (== y_norm)
         rms_inv_ptr,  # (M,) fp32 — in: from fwd
-        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; placeholder)
+        nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
         d_ext_ptr,  # (M, D) bf16 — in: ∂L/∂summed from caller's other usage (folded into d_summed)
         inner_ptr,  # (M,) fp32 — in: precomputed by `_fused_add_norm_inner_kernel`
         d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
-        dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False)
+        dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         M,
         D,
         BLOCK_M: tl.constexpr,
