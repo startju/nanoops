@@ -485,242 +485,296 @@ if _HAS_TRITON:
             )
 
 
-class FusedAddNorm(torch.autograd.Function):
-    """y = norm(x + residual), also returns summed = x + residual.
+def _fused_add_norm_fwd_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward kernel call for FusedAddNorm. Returns (y, summed, rms_inv);
+    rms_inv (and one of y/summed as ynorm_src) is saved for backward.
 
-    NOTE: Demo / learning kernel — the simplest example of a two-op
-    Triton fusion (elementwise add + RMSNorm). NOT wired into nanchat's
-    hot path for an architectural reason, not a perf one: nanchat's
-    production blocks fold the RMSNorm directly into the adjacent
-    matmul kernel (see FusedMLPBlock on the mlp side,
-    NormQKVProjection on the attn side), so a standalone
-    `add → norm` op boundary doesn't exist as a call site to optimize.
+    One Triton kernel does add + RMSNorm and writes y + summed (no separate
+    y_norm tensor — it stays in registers during fwd). The kernel's
+    constexpr HAS_NW branch skips the per-channel scale entirely when
+    norm_weight is None."""
+    assert x.is_cuda and x.is_contiguous()
+    assert residual.is_cuda and residual.is_contiguous()
+    M, D = x.shape
+    assert residual.shape == (M, D)
+    has_nw = norm_weight is not None
+    if has_nw:
+        assert norm_weight.is_cuda
+        assert norm_weight.shape == (D,)
+    y = torch.empty_like(x)
+    summed = torch.empty_like(x)
+    rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
 
-    Performance is fine in isolation — kernel-only actually beats
-    native `x + r; F.rms_norm(...)` at d24 shape (e.g. ~75 μs vs ~90 μs
-    under CUDA Graph fwd capture). The ~2× slowdown of `fused_add_norm`
-    vs native that you see in plain eager benchmarks (~184 μs vs ~91 μs
-    per call at d24) is the autograd.Function + Triton dispatch
-    overhead, which disappears once the kernel runs inside a larger
-    compiled / graph-captured pipeline.
+    # Triton's tl.arange requires power-of-2 BLOCK_D; non-pow2 D
+    # (e.g. d24's 1536) gets padded and the kernel's col_mask zeroes
+    # the trailing lanes so they don't affect the reduction.
+    BLOCK_D = triton.next_power_of_2(D)
 
-    Kept here as the first Triton kernel for learning purposes — it
-    covers the core patterns: 2D tile loading, power-of-2-rounded
-    BLOCK_D with col masking, fp32-promoted reduction, HAS_NW
-    constexpr branch, and on-the-fly y_norm reconstruction in bwd.
+    # Tile sizing via the shared _pick_tile_config helper. fwd's
+    # hot path holds ~2 fp32 tiles alive simultaneously (summed_f32
+    # through the reduction; y_f32 during the final multiply). The
+    # helper translates that to BLOCK_M and num_warps under the
+    # Ampere 255 fp32 reg/thread spill cap (see helper docstring
+    # for the formula).
+    cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=2)
+    BLOCK_M, num_warps = cfg.block_m, cfg.num_warps
 
-    Forward: one Triton kernel does add + RMSNorm + writes y and summed
-    (no separate y_norm tensor — it stays in registers during fwd).
+    # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
+    # valid placeholder pointer (Triton still requires the arg).
+    grid = (triton.cdiv(M, BLOCK_M),)
+    nw_arg = norm_weight if has_nw else x
+    _fused_add_norm_fwd_kernel[grid](
+        x,
+        residual,
+        nw_arg,
+        y,
+        summed,
+        rms_inv,
+        M,
+        D,
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        HAS_NW=has_nw,
+        HAS_RESIDUAL=True,
+        num_warps=num_warps,
+    )
+    return y, summed, rms_inv
 
-    Backward dispatches between two kernel paths based on whether the
-    inline kernel's per-program tile fits the 255-reg/thread cap (see
-    `TileConfig.fits_reg_budget`):
-      Primary: `_fused_add_norm_bwd_inline_kernel` — single-pass, full
-        row in one tile, inner reduction in registers, no precompute
-        kernel. Wins 1.5–2.4× kernel-only at typical nanchat shapes.
-      Fallback: `_fused_add_norm_inner_kernel` + `_fused_add_norm_bwd_kernel`
-        — 2-kernel D-split path used when inline would spill (HAS_NW=True
-        at D ≥ 24K).
-    Both reconstruct y_norm = summed * rms_inv on the fly (the extra
-    multiply runs on otherwise-idle FP32 cores; bwd is bandwidth-bound),
-    so the net win is saving the 2·M·D fwd HBM write of y_norm. summed
-    is saved anyway for the caller's residual stream.
 
-    `norm_weight` may be None → no per-channel affine scale (plain
-    `summed / RMS(summed)`); gradient w.r.t. norm_weight is then also
-    None and the dnw_partials reduction is skipped entirely.
+def _fused_add_norm_bwd_impl(
+    dy: torch.Tensor,
+    d_summed_external: torch.Tensor,
+    ynorm_src: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_inv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Backward kernel call for FusedAddNorm. Returns (d_summed, dnw);
+    caller fans out d_summed → (d_x, d_residual) (both grads alias since
+    `summed = x + residual`). dnw is None when norm_weight is None.
 
-    Identity passthroughs:
-        d_summed = d_norm_from_kernel + d_summed_external
-        d_x = d_residual = d_summed
-    """
+    Dispatches between two paths based on inline-tile reg budget:
+      (A) inline single-kernel `_fused_add_norm_bwd_inline_kernel` —
+          full D in one tile, inner reduction in registers, no precompute.
+          Wins 1.5–2.4× on most shapes (kernel-only).
+      (B) 2-kernel D-split fallback `_fused_add_norm_inner_kernel` +
+          `_fused_add_norm_bwd_kernel` — used when inline tile would
+          exceed Ampere's 255 fp32 reg/thread cap (HAS_NW=True at D ≥ 16K).
 
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        norm_weight: torch.Tensor | None,
-        eps: float = 1e-6,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert x.is_cuda and x.is_contiguous()
-        assert residual.is_cuda and residual.is_contiguous()
-        M, D = x.shape
-        assert residual.shape == (M, D)
-        has_nw = norm_weight is not None
+    Both paths reconstruct y_norm = ynorm_src · rms_inv (when HAS_NW=True;
+    when HAS_NW=False ynorm_src IS y_norm). The fwd→bwd save strategy is
+    handled by setup_context: ynorm_src = summed when HAS_NW=True, y when
+    HAS_NW=False (since y == y_norm in the latter case)."""
+    M, D = ynorm_src.shape
+    has_nw = norm_weight is not None
+    dy = dy.contiguous()
+    d_summed_external = d_summed_external.contiguous()
+    d_summed = torch.empty_like(ynorm_src)
+
+    # Dispatch between (A) inline and (B) 2-kernel D-split paths.
+    # n_live_tiles=5 for HAS_NW=True (y_norm, g_eff, dy_t, d_ext,
+    # d_summed alive at peak), 4 for HAS_NW=False (y_norm and g_eff
+    # alias src and dy_t respectively when there's no per-channel
+    # weight). The `fits_reg_budget` check on the inline TileConfig
+    # tells us whether the chosen (BLOCK_M, num_warps) would spill
+    # past Ampere's 255 fp32 reg/thread hard cap — if so, fall back to
+    # the 2-kernel D-split path which uses a much smaller fixed tile.
+    BLOCK_D = triton.next_power_of_2(D)
+    inline_n_live = 5 if has_nw else 4
+    inline_cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=inline_n_live)
+    use_inline = inline_cfg.fits_reg_budget
+
+    if use_inline:
+        BLOCK_M, num_warps = inline_cfg.block_m, inline_cfg.num_warps
+        num_m_tiles = triton.cdiv(M, BLOCK_M)
+
         if has_nw:
-            assert norm_weight.is_cuda
-            assert norm_weight.shape == (D,)
-        y = torch.empty_like(x)
-        summed = torch.empty_like(x)
-        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+            dnw_partials = torch.empty(
+                (num_m_tiles, D), dtype=norm_weight.dtype, device=ynorm_src.device
+            )
+            nw_arg, dnw_arg = norm_weight, dnw_partials
+        else:
+            nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
 
-        # Triton's tl.arange requires power-of-2 BLOCK_D; non-pow2 D
-        # (e.g. d24's 1536) gets padded and the kernel's col_mask zeroes
-        # the trailing lanes so they don't affect the reduction.
-        BLOCK_D = triton.next_power_of_2(D)
-
-        # Tile sizing via the shared _pick_tile_config helper. fwd's
-        # hot path holds ~2 fp32 tiles alive simultaneously (summed_f32
-        # through the reduction; y_f32 during the final multiply). The
-        # helper translates that to BLOCK_M and num_warps under the
-        # Ampere 255 fp32 reg/thread spill cap (see helper docstring
-        # for the formula).
-        cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=2)
-        BLOCK_M, num_warps = cfg.block_m, cfg.num_warps
-
-        # HAS_NW=False path doesn't dereference nw_ptr; pass `x` as a
-        # valid placeholder pointer (Triton still requires the arg).
-        grid = (triton.cdiv(M, BLOCK_M),)
-        nw_arg = norm_weight if has_nw else x
-        _fused_add_norm_fwd_kernel[grid](
-            x,
-            residual,
-            nw_arg,
-            y,
-            summed,
+        _fused_add_norm_bwd_inline_kernel[(num_m_tiles,)](
+            ynorm_src,
             rms_inv,
+            nw_arg,
+            dy,
+            d_summed_external,
+            d_summed,
+            dnw_arg,
             M,
             D,
-            eps,
             BLOCK_M=BLOCK_M,
             BLOCK_D=BLOCK_D,
             HAS_NW=has_nw,
-            HAS_RESIDUAL=True,
             num_warps=num_warps,
         )
-        # ctx stash strategy depends on HAS_NW:
-        #  - HAS_NW=True : save `summed`; bwd recomputes y_norm = summed * rms_inv.
-        #  - HAS_NW=False: save `y` instead — since `y == y_norm` here
-        #    (no per-channel weight), bwd reads it directly with no multiply.
-        # summed is always returned forward-side for the residual stream.
-        ynorm_src = summed if has_nw else y
-        ctx.save_for_backward(ynorm_src, norm_weight, rms_inv)
-        ctx.M, ctx.D = M, D
-        ctx.has_nw = has_nw
-        return y, summed
-
-    @staticmethod
-    def backward(
-        ctx,
-        dy: torch.Tensor,
-        d_summed_external: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, None]:
-        ynorm_src, nw, rms_inv = ctx.saved_tensors
-        M, D = ctx.M, ctx.D
-        has_nw = ctx.has_nw
-        dy = dy.contiguous()
-        d_summed_external = d_summed_external.contiguous()
-        d_summed = torch.empty_like(ynorm_src)
-
-        # Dispatch between two bwd paths:
-        #   (A) inline single-kernel: full D in one tile, inner reduction
-        #       computed in registers, no precompute kernel. Wins
-        #       1.5–2.4× on most shapes (kernel-only); ties or slightly
-        #       wins even at large M·D where dnw_partials is huge.
-        #   (B) 2-kernel + 2D-tile fallback: splits D across programs.
-        #       Needed when HAS_NW=True and BLOCK_D is large enough
-        #       that the inline kernel's per-program tile exceeds the
-        #       255 fp32 reg/thread spill cap (measured: D > 16K
-        #       triggers ~10× slowdown from local-memory spill).
-        #
-        # n_live_tiles=5 for HAS_NW=True (y_norm, g_eff, dy_t, d_ext,
-        # d_summed alive at peak), 4 for HAS_NW=False (y_norm and g_eff
-        # alias src and dy_t respectively when there's no per-channel
-        # weight). The `fits_reg_budget` check on the inline TileConfig
-        # tells us whether the chosen (BLOCK_M, num_warps) would spill
-        # past Ampere's 255 fp32 reg/thread hard cap — if so, fall
-        # back to the 2-kernel D-split path which uses a much smaller
-        # fixed tile.
-        BLOCK_D = triton.next_power_of_2(D)
-        inline_n_live = 5 if has_nw else 4
-        inline_cfg = _pick_tile_config(M, BLOCK_D, n_live_tiles=inline_n_live)
-        use_inline = inline_cfg.fits_reg_budget
-
-        if use_inline:
-            BLOCK_M, num_warps = inline_cfg.block_m, inline_cfg.num_warps
-            num_m_tiles = triton.cdiv(M, BLOCK_M)
-
-            if has_nw:
-                dnw_partials = torch.empty(
-                    (num_m_tiles, D), dtype=nw.dtype, device=ynorm_src.device
-                )
-                nw_arg, dnw_arg = nw, dnw_partials
-            else:
-                nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
-
-            _fused_add_norm_bwd_inline_kernel[(num_m_tiles,)](
-                ynorm_src,
-                rms_inv,
-                nw_arg,
-                dy,
-                d_summed_external,
-                d_summed,
-                dnw_arg,
-                M,
-                D,
-                BLOCK_M=BLOCK_M,
-                BLOCK_D=BLOCK_D,
-                HAS_NW=has_nw,
-                num_warps=num_warps,
+    else:
+        # 2-kernel path (inline would spill). Fixed config for
+        # CUDA Graph capturability.
+        BLOCK_M_BWD, BLOCK_D_BWD, NUM_WARPS_BWD = 32, 64, 4
+        num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
+        inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
+        if has_nw:
+            dnw_partials = torch.empty(
+                (num_m_tiles, D), dtype=norm_weight.dtype, device=ynorm_src.device
             )
+            nw_arg, dnw_arg = norm_weight, dnw_partials
         else:
-            # 2-kernel path (inline would spill). Fixed config for
-            # CUDA Graph capturability.
-            BLOCK_M_BWD, BLOCK_D_BWD, NUM_WARPS_BWD = 32, 64, 4
-            num_m_tiles = triton.cdiv(M, BLOCK_M_BWD)
-            inner_buf = torch.empty((M,), dtype=torch.float32, device=ynorm_src.device)
-            if has_nw:
-                dnw_partials = torch.empty(
-                    (num_m_tiles, D), dtype=nw.dtype, device=ynorm_src.device
-                )
-                nw_arg, dnw_arg = nw, dnw_partials
-            else:
-                nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
+            nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
 
-            # Stage 1: pre-compute inner[m]. fwd-style sizing
-            # (n_live_tiles=2: y_norm and g_eff alive together briefly).
-            INNER_BLOCK_D = triton.next_power_of_2(D)
-            inner_cfg = _pick_tile_config(M, INNER_BLOCK_D, n_live_tiles=2)
-            _fused_add_norm_inner_kernel[(triton.cdiv(M, inner_cfg.block_m),)](
-                ynorm_src,
-                rms_inv,
-                nw_arg,
-                dy,
-                inner_buf,
-                M,
-                D,
-                BLOCK_M=inner_cfg.block_m,
-                BLOCK_D=INNER_BLOCK_D,
-                HAS_NW=has_nw,
-                num_warps=inner_cfg.num_warps,
-            )
+        # Stage 1: pre-compute inner[m]. fwd-style sizing
+        # (n_live_tiles=2: y_norm and g_eff alive together briefly).
+        INNER_BLOCK_D = triton.next_power_of_2(D)
+        inner_cfg = _pick_tile_config(M, INNER_BLOCK_D, n_live_tiles=2)
+        _fused_add_norm_inner_kernel[(triton.cdiv(M, inner_cfg.block_m),)](
+            ynorm_src,
+            rms_inv,
+            nw_arg,
+            dy,
+            inner_buf,
+            M,
+            D,
+            BLOCK_M=inner_cfg.block_m,
+            BLOCK_D=INNER_BLOCK_D,
+            HAS_NW=has_nw,
+            num_warps=inner_cfg.num_warps,
+        )
 
-            # Stage 2: bwd reads pre-computed inner; 2D grid splits D.
-            _fused_add_norm_bwd_kernel[(num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))](
-                ynorm_src,
-                rms_inv,
-                nw_arg,
-                dy,
-                d_summed_external,
-                inner_buf,
-                d_summed,
-                dnw_arg,
-                M,
-                D,
-                BLOCK_M=BLOCK_M_BWD,
-                BLOCK_D=BLOCK_D_BWD,
-                HAS_NW=has_nw,
-                num_warps=NUM_WARPS_BWD,
-            )
+        # Stage 2: bwd reads pre-computed inner; 2D grid splits D.
+        _fused_add_norm_bwd_kernel[(num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))](
+            ynorm_src,
+            rms_inv,
+            nw_arg,
+            dy,
+            d_summed_external,
+            inner_buf,
+            d_summed,
+            dnw_arg,
+            M,
+            D,
+            BLOCK_M=BLOCK_M_BWD,
+            BLOCK_D=BLOCK_D_BWD,
+            HAS_NW=has_nw,
+            num_warps=NUM_WARPS_BWD,
+        )
 
-        dnw = dnw_partials.sum(dim=0) if has_nw else None
+    dnw = dnw_partials.sum(dim=0) if has_nw else None
+    return d_summed, dnw
 
-        # x + residual: d_x = d_residual = d_summed
-        # (d_summed already includes d_summed_external — fused in kernel).
-        d_x = d_summed
-        d_residual = d_summed
-        return d_x, d_residual, dnw, None
+
+# ── torch.library.custom_op wrapping — opaque to dynamo, same rationale
+# as FusedMLPBlock above. Without this, calling fused_add_norm under
+# torch.compile would either graph-break (autograd.Function) or attempt
+# to trace into the Triton kernels with FakeTensors and crash on
+# .data_ptr() (allow_in_graph). custom_op tells dynamo "opaque op,
+# here's its shape via register_fake, here's its autograd". ──
+
+@torch.library.custom_op(
+    "nanoops::fused_add_norm_fwd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _fused_add_norm_fwd_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _fused_add_norm_fwd_impl(x, residual, norm_weight, eps)
+
+
+@_fused_add_norm_fwd_op.register_fake
+def _fused_add_norm_fwd_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, _D = x.shape
+    return (
+        torch.empty_like(x),  # y
+        torch.empty_like(x),  # summed
+        torch.empty((M,), dtype=torch.float32, device=x.device),  # rms_inv
+    )
+
+
+# custom_op return types can't be Optional[Tensor], so we always return
+# two tensors and use a 1-elem placeholder for dnw when norm_weight is
+# None. The autograd wrapper below substitutes that placeholder back to
+# None before returning to autograd (autograd requires None grad for a
+# None input).
+
+@torch.library.custom_op(
+    "nanoops::fused_add_norm_bwd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _fused_add_norm_bwd_op(
+    dy: torch.Tensor,
+    d_summed_external: torch.Tensor,
+    ynorm_src: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_inv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    d_summed, dnw = _fused_add_norm_bwd_impl(
+        dy, d_summed_external, ynorm_src, norm_weight, rms_inv
+    )
+    if dnw is None:
+        dnw = torch.empty(1, dtype=ynorm_src.dtype, device=ynorm_src.device)
+    return d_summed, dnw
+
+
+@_fused_add_norm_bwd_op.register_fake
+def _fused_add_norm_bwd_fake(
+    dy: torch.Tensor,
+    d_summed_external: torch.Tensor,
+    ynorm_src: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_inv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if norm_weight is not None:
+        dnw = torch.empty_like(norm_weight)
+    else:
+        dnw = torch.empty(1, dtype=ynorm_src.dtype, device=ynorm_src.device)
+    return torch.empty_like(ynorm_src), dnw
+
+
+def _fused_add_norm_setup_context(ctx, inputs, output):
+    _x, _residual, norm_weight, _eps = inputs
+    y, summed, rms_inv = output
+    # ynorm_src is `summed` when norm_weight exists (bwd needs to multiply
+    # by rms_inv to reconstruct y_norm), else `y` directly (which equals
+    # y_norm in the no-affine case). Saving only one tensor avoids an
+    # extra M·D ref-count for the duration of the bwd graph.
+    ynorm_src = summed if norm_weight is not None else y
+    ctx.save_for_backward(ynorm_src, norm_weight, rms_inv)
+
+
+def _fused_add_norm_op_backward(ctx, grad_y, grad_summed, grad_rms_inv):
+    # grad_rms_inv is always None — no downstream consumer.
+    # grad_summed IS the d_summed_external from the residual stream.
+    ynorm_src, norm_weight, rms_inv = ctx.saved_tensors
+    d_summed, dnw = _fused_add_norm_bwd_op(
+        grad_y, grad_summed, ynorm_src, norm_weight, rms_inv
+    )
+    if norm_weight is None:
+        dnw = None
+    # d_x = d_residual = d_summed (both alias — autograd accumulates correctly).
+    return d_summed, d_summed, dnw, None
+
+
+_fused_add_norm_fwd_op.register_autograd(
+    _fused_add_norm_op_backward,
+    setup_context=_fused_add_norm_setup_context,
+)
 
 
 def fused_add_norm(
@@ -739,8 +793,16 @@ def fused_add_norm(
     The canonical block-boundary fusion: between an attn block's output
     and the mlp block's norm-input (or symmetrically between mlp output
     and the next layer's attn norm-input).
-    """
-    return FusedAddNorm.apply(x, residual, norm_weight, eps)
+
+    Implemented as a `torch.library.custom_op` (with register_fake +
+    register_autograd) so torch.compile keeps the op as an opaque FX node
+    instead of breaking the graph at the call — see
+    `_fused_add_norm_fwd_impl` / `_fused_add_norm_bwd_impl` for the actual
+    kernel call sequences."""
+    # custom_op returns (y, summed, rms_inv); rms_inv is saved-for-backward
+    # only, so we drop it here and return the original (y, summed) shape.
+    y, summed, _rms_inv = _fused_add_norm_fwd_op(x, residual, norm_weight, eps)
+    return y, summed
 
 
 # ─────────────────────────────────────────────────────────────────────
