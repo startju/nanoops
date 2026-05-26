@@ -763,9 +763,9 @@ def fused_add_norm(
 
 if _HAS_TRITON:
     # c_fc matmul with inline weight cast: z = x @ W_fc.T, but W_fc is
-    # loaded in its native dtype (fp32 master) and cast to x's dtype
-    # (bf16) on load — avoids materializing a bf16 cast weight tile in
-    # HBM. Replaces `torch.matmul(x_hat, fc_weight.t())` in fwd step 1.
+    # loaded in its native dtype (fp32 master) and cast to x's dtype on
+    # load — avoids materializing a cast weight tile in HBM. Replaces
+    # `torch.matmul(x_hat, fc_weight.t())` in fwd step 1.
     # Trade: lose cuBLAS's tensor-core efficiency (~70% peak) for
     # Triton's (~60% peak), gain 1 launch + ~75 μs HBM round-trip
     # (36 MB write+read at d24).
@@ -1520,10 +1520,8 @@ def fused_mlp_block(
     weight — no wrapper-level `.to()` and no autograd routing needed.
 
     See `FusedMLPBlock` for the kernel breakdown and ctx contents."""
-    # fc_weight + proj_weight stay in their native dtype (fp32 master in
-    # nanchat) — the fwd/bwd Triton kernels cast on load. norm_weight is
-    # passed through as-is; `_fused_add_norm_fwd_kernel` handles either
-    # dtype (the bf16·fp32 multiply auto-promotes inside the kernel).
+    # norm_weight: passed through to `_fused_add_norm_fwd_kernel` in its
+    # native dtype (the bf16·fp32 multiply auto-promotes inside the kernel).
     return FusedMLPBlock.apply(x, norm_weight, fc_weight, proj_weight, eps)
 
 
