@@ -73,3 +73,44 @@ def test_fused_add_norm_backward(M, has_nw):
     for name, ref, got in checks:
         assert torch.allclose(ref, got, atol=atol), \
             f"{name} max diff {(ref - got).abs().max():.4e}"
+
+
+def test_fused_add_norm_backward_large_d_fallback():
+    """D=16384 with affine weight exceeds the inline reg budget and uses fallback."""
+    torch.manual_seed(0)
+    M, D = 2, 16384
+    x0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
+    r0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
+    nw0 = torch.randn(D, dtype=torch.float32, device="cuda")
+    gy = torch.randn(M, D, dtype=torch.float32, device="cuda")
+    gs = torch.randn(M, D, dtype=torch.float32, device="cuda")
+
+    x1, r1 = (t.clone().requires_grad_() for t in (x0, r0))
+    nw1 = nw0.clone().requires_grad_()
+    y_ref, s_ref = _reference(x1, r1, nw1)
+    (y_ref * gy + s_ref * gs).sum().backward()
+
+    x2, r2 = (t.clone().requires_grad_() for t in (x0, r0))
+    nw2 = nw0.clone().requires_grad_()
+    y_triton, s_triton = fused_add_norm(x2, r2, nw2)
+    (y_triton * gy + s_triton * gs).sum().backward()
+
+    for name, ref, got in (
+        ("x.grad", x1.grad, x2.grad),
+        ("res.grad", r1.grad, r2.grad),
+        ("nw.grad", nw1.grad, nw2.grad),
+    ):
+        assert torch.allclose(ref, got, atol=5e-2), \
+            f"{name} max diff {(ref - got).abs().max():.4e}"
+
+
+def test_fused_add_norm_rejects_noncontiguous_norm_weight():
+    D = 128
+    x = torch.randn(4, D, dtype=torch.float32, device="cuda")
+    res = torch.randn(4, D, dtype=torch.float32, device="cuda")
+    nw_base = torch.randn(D, 2, dtype=torch.float32, device="cuda")
+    nw = nw_base[:, 0]
+    assert not nw.is_contiguous()
+
+    with pytest.raises(AssertionError):
+        fused_add_norm(x, res, nw)

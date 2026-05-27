@@ -1,7 +1,5 @@
 """Triton kernels for nanoops (Tier 3 — opt-in CUDA kernel rewrites).
 
-⚠️  WIP — skip for code review.
-
 Each kernel here mirrors the math of the corresponding Python op in
 `functional.py` but fuses multiple passes into a single GPU kernel.
 Wins come from:
@@ -10,10 +8,11 @@ Wins come from:
     3× HBM traffic; fused is 1× input read + 1× output write)
   - smaller working set (no intermediate buffers between ops)
 
-Activated via env var per op (e.g. `NANOOPS_FUSED_MLP_BLOCK=1` for the
-production-wired FusedMLPBlock — see `nanoops/integration.py` for the
-flag list). If triton isn't installed or the env var isn't set, callers
-fall back to the eager Python implementation in `functional.py`.
+The training integration activates selected kernels via env var per op
+(e.g. `NANOOPS_FUSED_MLP_BLOCK=1` for the production-wired
+FusedMLPBlock — see `nanoops/integration.py` for the flag list). That
+integration layer falls back to eager Python when a kernel is unavailable
+or disabled; this module itself is only a direct re-export shim.
 
 The actual code lives in three feature-split sibling modules:
   - `triton_fused_add_norm.py` — FusedAddNorm + shared TileConfig helper

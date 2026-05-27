@@ -60,9 +60,9 @@ if _HAS_TRITON:
         x_ptr,  # (M, K) bf16
         w_ptr,  # (N, K) fp32 (cast to x's dtype on load)
         z_ptr,  # (M, N) bf16 — output
-        M,
-        N,
-        K,
+        M,  # int — row count
+        N,  # int — output width / fc hidden width
+        K,  # int — input width / residual width
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -110,13 +110,13 @@ if _HAS_TRITON:
     # locked: (BLOCK_M=128, BLOCK_K_OUT=64, BLOCK_N=32, nw=8, st=2).
     @triton.jit
     def _relu_sq_linear_residual_fwd_kernel(
-        z_ptr,
-        proj_w_ptr,
-        residual_ptr,
-        y_ptr,
-        M,
-        N,
-        K_out,
+        z_ptr,  # (M, N) activation dtype — c_fc output
+        proj_w_ptr,  # (K_out, N) fp32 master or activation dtype — c_proj weight
+        residual_ptr,  # (M, K_out) activation dtype — residual stream x
+        y_ptr,  # (M, K_out) activation dtype — output y
+        M,  # int — row count
+        N,  # int — c_fc output width / c_proj input width
+        K_out,  # int — c_proj output width, equals residual width K
         BLOCK_M: tl.constexpr,
         BLOCK_K_OUT: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -205,9 +205,9 @@ if _HAS_TRITON:
         proj_w_ptr,  # (K_out, N) fp32 master or bf16 — W_proj (cast to dy.dtype on load)
         dz_ptr,  # (M, N) bf16 — output (gradient w.r.t. z)
         inner_buf_ptr,  # (M,) fp32 — side-output Σ_n(dz·z)/norm_dim; caller zero-inits
-        M,
-        N,
-        K_out,
+        M,  # int — row count
+        N,  # int — c_fc output width / c_proj input width
+        K_out,  # int — c_proj output width / norm dimension
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K_OUT: tl.constexpr,
@@ -276,9 +276,9 @@ if _HAS_TRITON:
         dy_ptr,  # (M, K_out) bf16
         z_ptr,  # (M, N) bf16 — saved from fwd
         dW_proj_ptr,  # (K_out, N) — output (dtype = W_proj.dtype, typically fp32 master)
-        M,
-        N,
-        K_out,
+        M,  # int — row count / reduction dimension
+        N,  # int — c_proj input width
+        K_out,  # int — c_proj output width
         BLOCK_K_OUT: tl.constexpr,  # output tile along K_out (c_proj's output dim)
         BLOCK_N: tl.constexpr,  # output tile along N (= N_fc)
         BLOCK_M: tl.constexpr,  # reduction tile along M
@@ -337,9 +337,9 @@ if _HAS_TRITON:
         rms_inv_ptr,  # (M,) fp32
         nw_ptr,  # (K,) bf16 — unused when HAS_NW=False (placeholder)
         dW_fc_ptr,  # (N_fc, K) — output (dtype = W_fc.dtype, typically fp32 master)
-        M,
-        N_fc,
-        K,
+        M,  # int — row count / reduction dimension
+        N_fc,  # int — c_fc output width
+        K,  # int — residual width / norm dimension / c_fc input width
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -418,9 +418,9 @@ if _HAS_TRITON:
         inner_buf_ptr,  # (M,) fp32 — Σ_n(dz·z) / norm_dim from A (= inner)
         dx_ptr,  # (M, K) bf16 — output
         dnw_partial_ptr,  # (num_m_tiles, K) bf16 — output (only used if HAS_NW)
-        M,
-        N_fc,
-        K,
+        M,  # int — row count
+        N_fc,  # int — c_fc output width / dx_hat reduction dimension
+        K,  # int — residual width / norm dimension
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -505,6 +505,23 @@ def _fused_mlp_block_fwd_impl(
     """Forward kernel sequence for FusedMLPBlock. Returns (y, rms_inv, z);
     rms_inv and z are saved for the backward pass.
 
+    Args:
+      x:           (M, K) CUDA contiguous activation tensor. dtype is the
+                   activation dtype (bf16 in training, fp32 in parity tests).
+      norm_weight: (K,) CUDA tensor or None. When None, RMSNorm has no affine
+                   scale and the Triton kernels receive x as an unused
+                   placeholder.
+      fc_weight:   (N_fc, K) CUDA tensor. Typically fp32 master weights; loaded
+                   and cast inline to x.dtype for tensor-core matmuls.
+      proj_weight: (K, N_fc) CUDA tensor. c_proj weight; output width must equal
+                   K so the residual add is shape-valid.
+      eps:         Python float RMSNorm epsilon.
+
+    Returns:
+      y:       (M, K) tensor, dtype=x.dtype.
+      rms_inv: (M,) fp32 tensor, saved for RMSNorm backward.
+      z:       (M, N_fc) tensor, dtype=x.dtype, saved for relu²/backward.
+
     Standard transformer mlp sub-block + outer residual:
         x_hat = norm(x) * norm_weight              (RMSNorm)
         z     = x_hat @ W_fc.T                      (Linear: c_fc)
@@ -522,14 +539,17 @@ def _fused_mlp_block_fwd_impl(
       2. `_relu_sq_linear_residual_fwd_kernel` — relu² + c_proj +
          residual_add(x) → y in one Triton pass."""
     assert x.is_cuda and x.is_contiguous()
-    assert fc_weight.is_cuda and proj_weight.is_cuda
+    assert fc_weight.is_cuda and fc_weight.is_contiguous()
+    assert proj_weight.is_cuda and proj_weight.is_contiguous()
     has_nw = norm_weight is not None
     if has_nw:
-        assert norm_weight.is_cuda
+        assert norm_weight.is_cuda and norm_weight.is_contiguous()
     M, K = x.shape
     N_fc, K_w = fc_weight.shape
     K_proj_out, N_proj_in = proj_weight.shape
     assert K == K_w, f"x last dim {K} != fc_weight in dim {K_w}"
+    if has_nw:
+        assert norm_weight.shape == (K,)
     assert N_fc == N_proj_in, f"fc out dim {N_fc} != proj in dim {N_proj_in}"
     assert K_proj_out == K, (
         f"c_proj out dim {K_proj_out} must equal x's K {K} (residual stream width)"
@@ -626,6 +646,21 @@ def _fused_mlp_block_bwd_impl(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Backward kernel sequence for FusedMLPBlock. Returns
     (dx, dnw, dW_fc, dW_proj); dnw is None when norm_weight is None.
+
+    Args:
+      dy:          (M, K) gradient w.r.t. y. Made contiguous before kernel use.
+      x:           (M, K) original forward input / residual stream.
+      norm_weight: (K,) affine RMSNorm weight, or None.
+      fc_weight:   (N_fc, K) c_fc weight.
+      proj_weight: (K, N_fc) c_proj weight.
+      rms_inv:     (M,) fp32 RMS inverse saved from forward.
+      z:           (M, N_fc) c_fc pre-activation saved from forward.
+
+    Returns:
+      dx:      (M, K), dtype=x.dtype.
+      dnw:     (K,), dtype=norm_weight.dtype, or None when norm_weight is None.
+      dW_fc:   (N_fc, K), dtype=fc_weight.dtype.
+      dW_proj: (K, N_fc), dtype=proj_weight.dtype.
 
     Four Triton kernels (no cuBLAS):
       A. `_mlp_dz_bwd_kernel` — dz = 2·relu(z) · (dy @ W_proj). Side-output
@@ -800,6 +835,12 @@ def _fused_mlp_block_fwd_op(
     proj_weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Custom-op forward wrapper.
+
+    Shapes mirror `_fused_mlp_block_fwd_impl`:
+      x (M, K), norm_weight (K,) or None, fc_weight (N_fc, K),
+      proj_weight (K, N_fc) -> (y (M, K), rms_inv (M,), z (M, N_fc)).
+    """
     return _fused_mlp_block_fwd_impl(x, norm_weight, fc_weight, proj_weight, eps)
 
 
@@ -811,7 +852,11 @@ def _fused_mlp_block_fwd_fake(
     proj_weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Shape/dtype inference for dynamo — must mirror _fwd_impl's outputs.
+    """Fake/meta kernel for Dynamo shape inference.
+
+    Returns empty tensors with the same shapes/dtypes as the real forward:
+      y (M, K_proj_out), rms_inv (M,) fp32, z (M, N_fc).
+    """
     M, _K = x.shape
     N_fc = fc_weight.shape[0]
     K_proj_out = proj_weight.shape[0]
@@ -846,6 +891,17 @@ def _fused_mlp_block_bwd_op(
     rms_inv: torch.Tensor,
     z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Custom-op backward wrapper.
+
+    Inputs:
+      dy (M, K), x (M, K), norm_weight (K,) or None, fc_weight (N_fc, K),
+      proj_weight (K, N_fc), rms_inv (M,), z (M, N_fc).
+
+    Returns:
+      dx (M, K), dnw (K,) or a 1-elem placeholder, dW_fc (N_fc, K),
+      dW_proj (K, N_fc). custom_op cannot return Optional[Tensor], so the
+      autograd wrapper converts the placeholder dnw back to None.
+    """
     dx, dnw, dW_fc, dW_proj = _fused_mlp_block_bwd_impl(
         dy, x, norm_weight, fc_weight, proj_weight, rms_inv, z
     )
@@ -864,6 +920,12 @@ def _fused_mlp_block_bwd_fake(
     rms_inv: torch.Tensor,
     z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake/meta kernel for backward shape inference.
+
+    Mirrors `_fused_mlp_block_bwd_op` output shapes:
+      dx (M, K), dnw (K,) or placeholder (1,), dW_fc (N_fc, K),
+      dW_proj same shape as proj_weight.
+    """
     N_fc, K = fc_weight.shape
     if norm_weight is not None:
         dnw = torch.empty_like(norm_weight)
@@ -882,6 +944,12 @@ def _fused_mlp_block_setup_context(
     inputs: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, float],
     output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
+    """Save forward inputs/outputs needed by custom-op autograd.
+
+    `inputs` is (x, norm_weight, fc_weight, proj_weight, eps).
+    `output` is (y, rms_inv, z); y has no backward-only use, while rms_inv
+    and z are the saved tensors that avoid recomputing the forward.
+    """
     x, norm_weight, fc_weight, proj_weight, _eps = inputs
     _y, rms_inv, z = output
     ctx.save_for_backward(norm_weight, fc_weight, proj_weight, x, rms_inv, z)
@@ -893,6 +961,17 @@ def _fused_mlp_block_autograd_backward(
     grad_rms_inv: torch.Tensor,
     grad_z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, None]:
+    """Autograd callback for `nanoops::fused_mlp_block_fwd`.
+
+    Receives gradients for the three forward outputs:
+      grad_y (M, K), grad_rms_inv (M,), grad_z (M, N_fc).
+    Only grad_y is meaningful to users; rms_inv/z are hidden saved-state
+    outputs, so their incoming grads are ignored.
+
+    Returns one gradient per forward input:
+      dx (M, K), dnw (K,) or None, dW_fc (N_fc, K), dW_proj (K, N_fc), None
+      for the Python float eps.
+    """
     # grad_rms_inv / grad_z are zeros: rms_inv and z exist only to
     # plumb fwd→bwd state inside this op, no downstream consumer.
     norm_w, W_fc, W_proj, x, rms_inv, z = ctx.saved_tensors
@@ -922,6 +1001,17 @@ def fused_mlp_block(
 ) -> torch.Tensor:
     """Full MLP sub-block + residual add with pre-norm:
         y = x + relu²(norm(x)·norm_weight @ W_fc.T) @ W_proj.T
+
+    Args:
+      x:           (M, K) contiguous CUDA activation tensor.
+      norm_weight: (K,) CUDA tensor or None. None means plain RMSNorm.
+      fc_weight:   (N_fc, K) c_fc weight tensor.
+      proj_weight: (K, N_fc) c_proj weight tensor. Its output dim must match
+                   x's K so the outer residual add is valid.
+      eps:         RMSNorm epsilon.
+
+    Returns:
+      y: (M, K) tensor with dtype=x.dtype.
 
     Standard transformer mlp side: `y = x + mlp(norm(x))`. If the caller
     needs to pre-sum with an attention residual, do it outside.

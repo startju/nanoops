@@ -148,9 +148,9 @@ if _HAS_TRITON:
         y_ptr,  # (M, D) bf16 — out: y = norm(x + res) [* nw]
         summed_ptr,  # (M, D) bf16 — out: x + res (untouched when HAS_RESIDUAL=False; pass x as placeholder)
         rms_inv_ptr,  # (M,) fp32 — out: 1/RMS(summed) row-wise, saved for bwd
-        M,
-        D,
-        eps,
+        M,  # int — row count after flattening leading dims
+        D,  # int — normalized hidden width
+        eps,  # float — RMSNorm epsilon
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
@@ -232,8 +232,8 @@ if _HAS_TRITON:
         d_ext_ptr,  # (M, D) bf16 — in: ∂L/∂summed from caller's other usage (folded into d_summed)
         d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
         dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False; pass ynorm_src as placeholder)
-        M,
-        D,
+        M,  # int — row count after flattening leading dims
+        D,  # int — normalized hidden width
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
@@ -311,8 +311,8 @@ if _HAS_TRITON:
         nw_ptr,  # (D,) bf16 — in: norm_weight (untouched when HAS_NW=False; pass ynorm_src as placeholder)
         dy_ptr,  # (M, D) bf16 — in: ∂L/∂y
         inner_ptr,  # (M,) fp32 — out: per-row (1/D) Σ_d(g_eff · y_norm)
-        M,
-        D,
+        M,  # int — row count after flattening leading dims
+        D,  # int — normalized hidden width
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
@@ -381,8 +381,8 @@ if _HAS_TRITON:
         inner_ptr,  # (M,) fp32 — in: precomputed by `_fused_add_norm_inner_kernel`
         d_summed_ptr,  # (M, D) bf16 — out: ∂L/∂summed total (norm-bwd + d_ext)
         dnw_partial_ptr,  # (num_m_tiles, D) bf16 — out: per-m-tile dnw partials (untouched when HAS_NW=False; pass ynorm_src as placeholder)
-        M,
-        D,
+        M,  # int — row count after flattening leading dims
+        D,  # int — normalized hidden width
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_NW: tl.constexpr,
@@ -501,14 +501,24 @@ def _fused_add_norm_fwd_impl(
     One Triton kernel does add + RMSNorm and writes y + summed (no separate
     y_norm tensor — it stays in registers during fwd). The kernel's
     constexpr HAS_NW branch skips the per-channel scale entirely when
-    norm_weight is None."""
+    norm_weight is None.
+
+    Args:
+      x: (M, D) contiguous CUDA tensor, typically bf16.
+      residual: (M, D) contiguous CUDA tensor added to x.
+      norm_weight: optional (D,) CUDA tensor for per-channel scale.
+      eps: RMSNorm epsilon.
+
+    Returns:
+      (y, summed, rms_inv), where y and summed are (M, D) with x.dtype,
+      and rms_inv is (M,) fp32."""
     assert x.is_cuda and x.is_contiguous()
     assert residual.is_cuda and residual.is_contiguous()
     M, D = x.shape
     assert residual.shape == (M, D)
     has_nw = norm_weight is not None
     if has_nw:
-        assert norm_weight.is_cuda
+        assert norm_weight.is_cuda and norm_weight.is_contiguous()
         assert norm_weight.shape == (D,)
     y = torch.empty_like(x)
     summed = torch.empty_like(x)
@@ -574,7 +584,18 @@ def _fused_add_norm_bwd_impl(
     Both paths reconstruct y_norm = ynorm_src · rms_inv (when HAS_NW=True;
     when HAS_NW=False ynorm_src IS y_norm). The fwd→bwd save strategy is
     handled by setup_context: ynorm_src = summed when HAS_NW=True, y when
-    HAS_NW=False (since y == y_norm in the latter case)."""
+    HAS_NW=False (since y == y_norm in the latter case).
+
+    Args:
+      dy: (M, D) gradient of y.
+      d_summed_external: (M, D) gradient flowing directly into summed.
+      ynorm_src: (M, D) saved `summed` if affine, otherwise saved `y`.
+      norm_weight: optional (D,) RMSNorm scale.
+      rms_inv: (M,) fp32 saved forward inverse RMS.
+
+    Returns:
+      d_summed: (M, D) gradient shared by x and residual.
+      dnw: optional (D,) gradient of norm_weight."""
     M, D = ynorm_src.shape
     has_nw = norm_weight is not None
     dy = dy.contiguous()
@@ -694,6 +715,16 @@ def _fused_add_norm_fwd_op(
     norm_weight: torch.Tensor | None,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Custom op wrapper for `_fused_add_norm_fwd_impl`.
+
+    Args:
+      x: (M, D) contiguous CUDA tensor.
+      residual: (M, D) contiguous CUDA tensor.
+      norm_weight: optional (D,) CUDA tensor.
+      eps: RMSNorm epsilon.
+
+    Returns:
+      (y, summed, rms_inv) with shapes (M, D), (M, D), and (M,)."""
     return _fused_add_norm_fwd_impl(x, residual, norm_weight, eps)
 
 
@@ -704,6 +735,9 @@ def _fused_add_norm_fwd_fake(
     norm_weight: torch.Tensor | None,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake tensor shape function for fused_add_norm_fwd.
+
+    Returns tensors shaped like `_fused_add_norm_fwd_op` without touching CUDA."""
     M, _D = x.shape
     return (
         torch.empty_like(x),  # y
@@ -731,6 +765,18 @@ def _fused_add_norm_bwd_op(
     norm_weight: torch.Tensor | None,
     rms_inv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Custom op wrapper for `_fused_add_norm_bwd_impl`.
+
+    Args:
+      dy: (M, D) gradient of y.
+      d_summed_external: (M, D) external gradient of summed.
+      ynorm_src: (M, D) saved tensor used to reconstruct y_norm.
+      norm_weight: optional (D,) RMSNorm scale.
+      rms_inv: (M,) fp32 inverse RMS.
+
+    Returns:
+      (d_summed, dnw_or_placeholder), both tensors for custom_op schema
+      compatibility."""
     d_summed, dnw = _fused_add_norm_bwd_impl(
         dy, d_summed_external, ynorm_src, norm_weight, rms_inv
     )
@@ -747,6 +793,10 @@ def _fused_add_norm_bwd_fake(
     norm_weight: torch.Tensor | None,
     rms_inv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fake tensor shape function for fused_add_norm_bwd.
+
+    Returns d_summed shaped like ynorm_src and dnw shaped like norm_weight
+    when present, otherwise the custom op's 1-element placeholder."""
     if norm_weight is not None:
         dnw = torch.empty_like(norm_weight)
     else:
@@ -759,6 +809,7 @@ def _fused_add_norm_setup_context(
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float],
     output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
+    """Save the minimum tensors needed by the custom op autograd formula."""
     _x, _residual, norm_weight, _eps = inputs
     y, summed, rms_inv = output
     # ynorm_src is `summed` when norm_weight exists (bwd needs to multiply
@@ -775,6 +826,15 @@ def _fused_add_norm_autograd_backward(
     grad_summed: torch.Tensor,
     grad_rms_inv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, None]:
+    """Autograd formula for `_fused_add_norm_fwd_op`.
+
+    Args:
+      grad_y: (M, D) gradient of normalized output.
+      grad_summed: (M, D) direct gradient of residual stream output.
+      grad_rms_inv: (M,) unused gradient for the saved auxiliary output.
+
+    Returns:
+      Gradients for (x, residual, norm_weight, eps)."""
     # grad_rms_inv is zeros — no downstream consumer of rms_inv.
     # grad_summed IS the d_summed_external from the residual stream.
     ynorm_src, norm_weight, rms_inv = ctx.saved_tensors
@@ -815,7 +875,16 @@ def fused_add_norm(
     register_autograd) so torch.compile keeps the op as an opaque FX node
     instead of breaking the graph at the call — see
     `_fused_add_norm_fwd_impl` / `_fused_add_norm_bwd_impl` for the actual
-    kernel call sequences."""
+    kernel call sequences.
+
+    Args:
+      x: (M, D) contiguous CUDA tensor.
+      residual: (M, D) contiguous CUDA tensor.
+      norm_weight: optional (D,) RMSNorm scale.
+      eps: RMSNorm epsilon.
+
+    Returns:
+      (y, summed), both (M, D) tensors with x.dtype."""
     # custom_op returns (y, summed, rms_inv); rms_inv is saved-for-backward
     # only, so we drop it here and return the original (y, summed) shape.
     y, summed, _rms_inv = _fused_add_norm_fwd_op(x, residual, norm_weight, eps)

@@ -78,3 +78,24 @@ def test_backward_parity(has_nw):
         max_diff = (r - g_).abs().max().item()
         assert torch.allclose(r, g_, atol=atol), \
             f"{name}.grad mismatch (max {max_diff:.4e}, has_nw={has_nw})"
+
+
+def test_fused_mlp_block_rejects_noncontiguous_inputs():
+    M, K, N_fc = 8, 16, 32
+    x = torch.randn(M, K, dtype=torch.float32, device="cuda")
+    norm_w = torch.randn(2, K, dtype=torch.float32, device="cuda")[0]
+    W_fc = torch.randn(K, N_fc, dtype=torch.float32, device="cuda").t()
+    W_proj = torch.randn(N_fc, K, dtype=torch.float32, device="cuda").t()
+
+    assert not norm_w.is_contiguous()
+    assert not W_fc.is_contiguous()
+    assert not W_proj.is_contiguous()
+
+    with pytest.raises(AssertionError):
+        fused_mlp_block(x, norm_w, W_fc.contiguous(), W_proj.contiguous())
+
+    with pytest.raises(AssertionError):
+        fused_mlp_block(x, norm_w.contiguous(), W_fc, W_proj.contiguous())
+
+    with pytest.raises(AssertionError):
+        fused_mlp_block(x, norm_w.contiguous(), W_fc.contiguous(), W_proj)

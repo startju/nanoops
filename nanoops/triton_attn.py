@@ -15,6 +15,8 @@ kernels in `triton_fused_add_norm.py`, which fuse the residual-add path).
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
@@ -52,20 +54,20 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rms_norm_bwd_kernel(
-        x_ptr,
-        rms_inv_ptr,
-        nw_ptr,
-        dxhat_ptr,
-        dx_ptr,
-        dnw_partial_ptr,
-        M,
-        K,
-        stride_xm,
-        stride_xk,
-        stride_dxhat_m,
-        stride_dxhat_k,
-        stride_dx_m,
-        stride_dx_k,
+        x_ptr,  # (M, K) — in: original RMSNorm input
+        rms_inv_ptr,  # (M,) fp32 — in: saved inverse RMS
+        nw_ptr,  # (K,) — in: RMSNorm scale
+        dxhat_ptr,  # (M, K) — in: grad wrt normalized/scaled activation
+        dx_ptr,  # (M, K) — out: grad wrt x
+        dnw_partial_ptr,  # (ceil(M/BLOCK_M), K) — out: per-row-tile dnw
+        M,  # int — row count after flattening leading dims
+        K,  # int — normalized hidden width
+        stride_xm,  # int — x stride along M
+        stride_xk,  # int — x stride along K
+        stride_dxhat_m,  # int — dxhat stride along M
+        stride_dxhat_k,  # int — dxhat stride along K
+        stride_dx_m,  # int — dx stride along M
+        stride_dx_k,  # int — dx stride along K
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
@@ -157,21 +159,21 @@ if _HAS_TRITON:
 
     @triton.jit
     def _norm_qkv_fwd_kernel(
-        x_ptr,
-        norm_w_ptr,
-        qkv_w_ptr,
-        out_ptr,
-        rms_inv_ptr,
-        M,
-        N_qkv,
-        K,
-        eps,
-        stride_xm,
-        stride_xk,
-        stride_wn,
-        stride_wk,
-        stride_om,
-        stride_on,
+        x_ptr,  # (M, K) — in: activation before RMSNorm
+        norm_w_ptr,  # (K,) — in: RMSNorm scale
+        qkv_w_ptr,  # (N_qkv, K) — in: concatenated Q/K/V projection weight
+        out_ptr,  # (M, N_qkv) — out: concatenated Q/K/V projection
+        rms_inv_ptr,  # (M,) fp32 — out: saved inverse RMS for bwd
+        M,  # int — row count after flattening leading dims
+        N_qkv,  # int — concatenated Q/K/V output width
+        K,  # int — input hidden width
+        eps,  # float — RMSNorm epsilon
+        stride_xm,  # int — x stride along M
+        stride_xk,  # int — x stride along K
+        stride_wn,  # int — qkv_weight stride along N_qkv
+        stride_wk,  # int — qkv_weight stride along K
+        stride_om,  # int — out stride along M
+        stride_on,  # int — out stride along N_qkv
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -246,7 +248,23 @@ class NormQKVProjection(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, norm_weight, qkv_weight, eps=1e-6):
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        qkv_weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Run fused RMSNorm + QKV projection.
+
+        Args:
+          x: (M, K) contiguous CUDA tensor.
+          norm_weight: (K,) RMSNorm scale.
+          qkv_weight: (N_qkv, K) concatenated projection weight.
+          eps: RMSNorm epsilon.
+
+        Returns:
+          (M, N_qkv) concatenated Q/K/V projection."""
         assert x.is_cuda and x.is_contiguous()
         assert norm_weight.is_cuda and qkv_weight.is_cuda
         M, K = x.shape
@@ -283,7 +301,17 @@ class NormQKVProjection(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, d_out):
+    def backward(
+        ctx: Any,
+        d_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        """Backprop for fused RMSNorm + QKV projection.
+
+        Args:
+          d_out: (M, N_qkv) gradient of concatenated output.
+
+        Returns:
+          Gradients for (x, norm_weight, qkv_weight, eps)."""
         x, norm_w, qkv_w, rms_inv = ctx.saved_tensors
         M, N_qkv, K = ctx.M, ctx.N_qkv, ctx.K
         d_out = d_out.contiguous()
@@ -340,6 +368,15 @@ def norm_qkv_projection(
     Caller stacks `c_q.weight, c_k.weight, c_v.weight` along dim 0 into
     `qkv_weight` and splits the output along dim -1. See
     `causal_self_attention_triton` for the canonical orchestration.
+
+    Args:
+      x: (M, K) contiguous CUDA tensor.
+      norm_weight: (K,) RMSNorm scale.
+      qkv_weight: (N_qkv, K) concatenated Q/K/V projection weight.
+      eps: RMSNorm epsilon.
+
+    Returns:
+      (M, N_qkv) concatenated Q/K/V projection.
     """
     return NormQKVProjection.apply(x, norm_weight, qkv_weight, eps)
 
@@ -373,35 +410,35 @@ if _HAS_TRITON:
 
     @triton.jit
     def _flash_attn_fwd_kernel(
-        Q,
-        K,
-        V,
-        sm_scale,
-        LSE,
-        O,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        stride_vb,
-        stride_vh,
-        stride_vn,
-        stride_vd,
-        stride_ob,
-        stride_oh,
-        stride_om,
-        stride_od,
-        stride_lb,
-        stride_lh,
-        stride_lm,
-        B,
-        H,
-        M,
-        N,
+        Q,  # (B, H, M, D) — in: query
+        K,  # (B, H, N, D) — in: key
+        V,  # (B, H, N, D) — in: value
+        sm_scale,  # float — attention scale, usually D**-0.5
+        LSE,  # (B, H, M) fp32 — out: row log-sum-exp for bwd
+        O,  # (B, H, M, D) — out: attention output
+        stride_qb,  # int — Q stride along B
+        stride_qh,  # int — Q stride along H
+        stride_qm,  # int — Q stride along M
+        stride_qd,  # int — Q stride along D
+        stride_kb,  # int — K stride along B
+        stride_kh,  # int — K stride along H
+        stride_kn,  # int — K stride along N
+        stride_kd,  # int — K stride along D
+        stride_vb,  # int — V stride along B
+        stride_vh,  # int — V stride along H
+        stride_vn,  # int — V stride along N
+        stride_vd,  # int — V stride along D
+        stride_ob,  # int — O stride along B
+        stride_oh,  # int — O stride along H
+        stride_om,  # int — O stride along M
+        stride_od,  # int — O stride along D
+        stride_lb,  # int — LSE stride along B
+        stride_lh,  # int — LSE stride along H
+        stride_lm,  # int — LSE stride along M
+        B,  # int — batch size
+        H,  # int — number of attention heads
+        M,  # int — query sequence length
+        N,  # int — key/value sequence length
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -499,19 +536,19 @@ if _HAS_TRITON:
 
     @triton.jit
     def _flash_attn_bwd_preprocess_kernel(
-        O,
-        dO,
-        D,
-        stride_ob,
-        stride_oh,
-        stride_om,
-        stride_od,
-        stride_db,
-        stride_dh,
-        stride_dm,
-        B,
-        H,
-        M,
+        O,  # (B, H, M, D) — in: forward output
+        dO,  # (B, H, M, D) — in: gradient of output
+        D,  # (B, H, M) fp32 — out: row dot(O, dO)
+        stride_ob,  # int — O/dO stride along B
+        stride_oh,  # int — O/dO stride along H
+        stride_om,  # int — O/dO stride along M
+        stride_od,  # int — O/dO stride along D
+        stride_db,  # int — D stride along B
+        stride_dh,  # int — D stride along H
+        stride_dm,  # int — D stride along M
+        B,  # int — batch size
+        H,  # int — number of attention heads
+        M,  # int — query sequence length
         BLOCK_M: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,
     ):
@@ -537,42 +574,42 @@ if _HAS_TRITON:
 
     @triton.jit
     def _flash_attn_bwd_kernel(
-        Q,
-        K,
-        V,
-        sm_scale,
-        LSE,
-        D,
-        dO,
-        dQ,
-        dK,
-        dV,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        stride_vb,
-        stride_vh,
-        stride_vn,
-        stride_vd,
-        stride_ob,
-        stride_oh,
-        stride_om,
-        stride_od,
-        stride_lb,
-        stride_lh,
-        stride_lm,
-        stride_db,
-        stride_dh,
-        stride_dm,
-        B,
-        H,
-        M,
-        N,
+        Q,  # (B, H, M, D) — in: query
+        K,  # (B, H, N, D) — in: key
+        V,  # (B, H, N, D) — in: value
+        sm_scale,  # float — attention scale
+        LSE,  # (B, H, M) fp32 — in: saved row log-sum-exp
+        D,  # (B, H, M) fp32 — in: row dot(O, dO)
+        dO,  # (B, H, M, D) — in: grad wrt output
+        dQ,  # (B, H, M, D) — out: grad wrt query
+        dK,  # (B, H, N, D) — out: grad wrt key, atomic accumulated
+        dV,  # (B, H, N, D) — out: grad wrt value, atomic accumulated
+        stride_qb,  # int — Q/dQ stride along B
+        stride_qh,  # int — Q/dQ stride along H
+        stride_qm,  # int — Q/dQ stride along M
+        stride_qd,  # int — Q/dQ stride along D
+        stride_kb,  # int — K/dK stride along B
+        stride_kh,  # int — K/dK stride along H
+        stride_kn,  # int — K/dK stride along N
+        stride_kd,  # int — K/dK stride along D
+        stride_vb,  # int — V/dV stride along B
+        stride_vh,  # int — V/dV stride along H
+        stride_vn,  # int — V/dV stride along N
+        stride_vd,  # int — V/dV stride along D
+        stride_ob,  # int — O/dO stride along B
+        stride_oh,  # int — O/dO stride along H
+        stride_om,  # int — O/dO stride along M
+        stride_od,  # int — O/dO stride along D
+        stride_lb,  # int — LSE stride along B
+        stride_lh,  # int — LSE stride along H
+        stride_lm,  # int — LSE stride along M
+        stride_db,  # int — D stride along B
+        stride_dh,  # int — D stride along H
+        stride_dm,  # int — D stride along M
+        B,  # int — batch size
+        H,  # int — number of attention heads
+        M,  # int — query sequence length
+        N,  # int — key/value sequence length
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -678,7 +715,23 @@ class FlashSDPA(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, window_size):
+    def forward(
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        window_size: int,
+    ) -> torch.Tensor:
+        """Run sliding-causal scaled dot-product attention.
+
+        Args:
+          q: (B, H, M, D) contiguous CUDA query tensor.
+          k: (B, H, N, D) contiguous CUDA key tensor; v1 requires N == M.
+          v: (B, H, N, D) contiguous CUDA value tensor.
+          window_size: number of keys visible to each query.
+
+        Returns:
+          (B, H, M, D) attention output."""
         assert q.is_cuda and k.is_cuda and v.is_cuda
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert q.shape == k.shape == v.shape, (
@@ -737,7 +790,17 @@ class FlashSDPA(torch.autograd.Function):
         return o
 
     @staticmethod
-    def backward(ctx, do):
+    def backward(
+        ctx: Any,
+        do: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        """Backprop for sliding-causal attention.
+
+        Args:
+          do: (B, H, M, D) gradient of attention output.
+
+        Returns:
+          Gradients for (q, k, v, window_size)."""
         q, k, v, o, lse = ctx.saved_tensors
         do = do.contiguous()
         sm_scale = ctx.sm_scale
@@ -828,6 +891,15 @@ def flash_sdpa(
     """Flash-style sliding-causal SDPA. q, k, v: (B, H, L, D), H_q == H_kv.
 
     window_size: total keys each query attends to (= nanchat's window+1).
+
+    Args:
+      q: (B, H, L, D) contiguous CUDA query tensor.
+      k: (B, H, L, D) contiguous CUDA key tensor.
+      v: (B, H, L, D) contiguous CUDA value tensor.
+      window_size: total visible keys per query.
+
+    Returns:
+      (B, H, L, D) attention output.
     """
     return FlashSDPA.apply(q, k, v, window_size)
 
@@ -845,25 +917,25 @@ if _HAS_TRITON:
 
     @triton.jit
     def _value_gate_kernel(
-        v_ptr,
-        ve_ptr,
-        x_ptr,
-        gate_w_ptr,
-        out_ptr,
-        M,
-        D_x,
-        D_v,
-        ve_gate_ch,
-        stride_vm,
-        stride_vd,
-        stride_vem,
-        stride_ved,
-        stride_xm,
-        stride_xd,
-        stride_gw_d_out,
-        stride_gw_d_in,
-        stride_om,
-        stride_od,
+        v_ptr,  # (M, D_v) — in: base value
+        ve_ptr,  # (M, D_v) — in: value embedding to gate in
+        x_ptr,  # (M, ve_gate_ch) — in: contiguous gate input slice
+        gate_w_ptr,  # (D_v, ve_gate_ch) — in: gate projection weight
+        out_ptr,  # (M, D_v) — out: v + gate * ve
+        M,  # int — row count after flattening leading dims
+        D_x,  # int — original x width, kept for call-site shape context
+        D_v,  # int — value width
+        ve_gate_ch,  # int — number of x columns used by the gate
+        stride_vm,  # int — v stride along M
+        stride_vd,  # int — v stride along D_v
+        stride_vem,  # int — ve stride along M
+        stride_ved,  # int — ve stride along D_v
+        stride_xm,  # int — x gate slice stride along M
+        stride_xd,  # int — x gate slice stride along gate channel
+        stride_gw_d_out,  # int — gate_w stride along D_v
+        stride_gw_d_in,  # int — gate_w stride along gate channel
+        stride_om,  # int — out stride along M
+        stride_od,  # int — out stride along D_v
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -932,19 +1004,19 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rotary_qk_norm_scale_kernel(
-        qk_ptr,
-        cos_ptr,
-        sin_ptr,
-        out_ptr,
-        rms_inv_ptr,
-        M,
-        D,
-        scale,
-        eps,
-        stride_qm,
-        stride_qd,
-        stride_om,
-        stride_od,
+        qk_ptr,  # (M, D) — in: Q or K before rotary
+        cos_ptr,  # (M, D/2) — in: rotary cosine table
+        sin_ptr,  # (M, D/2) — in: rotary sine table
+        out_ptr,  # (M, D) — out: rotated, RMS-normalized, scaled tensor
+        rms_inv_ptr,  # (M,) fp32 — out: saved inverse RMS for bwd
+        M,  # int — row count after flattening batch/head/sequence dims
+        D,  # int — even head width
+        scale,  # float — post-norm scalar multiplier
+        eps,  # float — RMSNorm epsilon
+        stride_qm,  # int — qk stride along M
+        stride_qd,  # int — qk stride along D
+        stride_om,  # int — out stride along M
+        stride_od,  # int — out stride along D
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
@@ -1010,21 +1082,21 @@ if _HAS_TRITON:
 
     @triton.jit
     def _output_proj_residual_kernel(
-        attn_out_ptr,
-        proj_w_ptr,
-        residual_ptr,
-        y_ptr,
-        M,
-        D_out,
-        D_in,
-        stride_am,
-        stride_ad,
-        stride_pw_dout,
-        stride_pw_din,
-        stride_rm,
-        stride_rd,
-        stride_ym,
-        stride_yd,
+        attn_out_ptr,  # (M, D_in) — in: attention output
+        proj_w_ptr,  # (D_out, D_in) — in: output projection weight
+        residual_ptr,  # (M, D_out) — in: residual stream
+        y_ptr,  # (M, D_out) — out: residual + attn_out @ W.T
+        M,  # int — row count after flattening leading dims
+        D_out,  # int — projection output width
+        D_in,  # int — projection input width
+        stride_am,  # int — attn_out stride along M
+        stride_ad,  # int — attn_out stride along D_in
+        stride_pw_dout,  # int — proj_weight stride along D_out
+        stride_pw_din,  # int — proj_weight stride along D_in
+        stride_rm,  # int — residual stride along M
+        stride_rd,  # int — residual stride along D_out
+        stride_ym,  # int — y stride along M
+        stride_yd,  # int — y stride along D_out
         BLOCK_M: tl.constexpr,
         BLOCK_DOUT: tl.constexpr,
         BLOCK_DIN: tl.constexpr,
@@ -1085,7 +1157,21 @@ class OutputProjResidual(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, attn_out, proj_weight, residual):
+    def forward(
+        ctx: Any,
+        attn_out: torch.Tensor,
+        proj_weight: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run output projection and residual add.
+
+        Args:
+          attn_out: (M, D_in) CUDA tensor.
+          proj_weight: (D_out, D_in) projection weight.
+          residual: (M, D_out) residual stream tensor.
+
+        Returns:
+          (M, D_out) projected residual output."""
         assert attn_out.is_cuda and proj_weight.is_cuda and residual.is_cuda
         M, D_in = attn_out.shape
         D_out, D_in_w = proj_weight.shape
@@ -1117,7 +1203,17 @@ class OutputProjResidual(torch.autograd.Function):
         return y
 
     @staticmethod
-    def backward(ctx, dy):
+    def backward(
+        ctx: Any,
+        dy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backprop for y = residual + attn_out @ proj_weight.T.
+
+        Args:
+          dy: (M, D_out) gradient of output.
+
+        Returns:
+          Gradients for (attn_out, proj_weight, residual)."""
         attn_out, proj_weight = ctx.saved_tensors
         dy = dy.contiguous()
         # y = residual + attn_out @ proj_weight.T
@@ -1135,7 +1231,16 @@ def output_proj_residual(
     proj_weight: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused `y = residual + attn_out @ proj_weight.T` (Triton forward + cuBLAS backward)."""
+    """Fused `y = residual + attn_out @ proj_weight.T`.
+
+    Args:
+      attn_out: (M, D_in) CUDA tensor.
+      proj_weight: (D_out, D_in) projection weight.
+      residual: (M, D_out) residual stream tensor.
+
+    Returns:
+      (M, D_out) projected residual output.
+    """
     return OutputProjResidual.apply(attn_out, proj_weight, residual)
 
 
@@ -1149,7 +1254,13 @@ def output_proj_residual(
 
 class ValueGate(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, v, ve, x, gate_w):
+    def forward(
+        ctx: Any,
+        v: torch.Tensor,
+        ve: torch.Tensor,
+        x: torch.Tensor,
+        gate_w: torch.Tensor,
+    ) -> torch.Tensor:
         """Args:
             v:      (M, D_v) — base value
             ve:     (M, D_v) — value embedding to mix in
@@ -1196,7 +1307,17 @@ class ValueGate(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, d_out):
+    def backward(
+        ctx: Any,
+        d_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backprop for ValueGate.
+
+        Args:
+          d_out: (M, D_v) gradient of output.
+
+        Returns:
+          Gradients for (v, ve, x, gate_w)."""
         v, ve, x_in, gate_w = ctx.saved_tensors
         ve_gate_ch = ctx.ve_gate_ch
         x_full_shape = ctx.x_full_shape
@@ -1230,7 +1351,17 @@ def value_gate(
     x: torch.Tensor,
     gate_w: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused ResFormer value gate: out = v + 3·sigmoid(x[:, :ch] @ gate_w.T) · ve."""
+    """Fused ResFormer value gate.
+
+    Args:
+      v: (M, D_v) base value tensor.
+      ve: (M, D_v) value embedding mixed by the gate.
+      x: (M, D_x) gate input; only the first `gate_w.shape[1]` columns are used.
+      gate_w: (D_v, ve_gate_ch) gate projection weight.
+
+    Returns:
+      (M, D_v) tensor `v + 3 * sigmoid(x[:, :ch] @ gate_w.T) * ve`.
+    """
     return ValueGate.apply(v, ve, x, gate_w)
 
 
@@ -1247,8 +1378,25 @@ def value_gate(
 
 class RotaryQKNormScale(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, qk, cos, sin, scale, eps=1e-6):
-        """qk: (M, D); cos, sin: (M, D/2). Returns: (M, D) rotated, normed, scaled."""
+    def forward(
+        ctx: Any,
+        qk: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        scale: float,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Run rotary embedding, RMSNorm, and scalar scale.
+
+        Args:
+          qk: (M, D) contiguous CUDA tensor; D must be even.
+          cos: (M, D/2) rotary cosine table.
+          sin: (M, D/2) rotary sine table.
+          scale: post-norm scalar multiplier.
+          eps: RMSNorm epsilon.
+
+        Returns:
+          (M, D) rotated, normalized, and scaled tensor."""
         assert qk.is_cuda and qk.is_contiguous()
         assert cos.is_contiguous() and sin.is_contiguous()
         M, D = qk.shape
@@ -1280,7 +1428,17 @@ class RotaryQKNormScale(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, d_out):
+    def backward(
+        ctx: Any,
+        d_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        """Backprop through rotary + unweighted RMSNorm + scalar scale.
+
+        Args:
+          d_out: (M, D) gradient of output.
+
+        Returns:
+          Gradients for (qk, cos, sin, scale, eps)."""
         qk, cos, sin, rms_inv = ctx.saved_tensors
         scale = ctx.scale
         D = ctx.D
@@ -1322,5 +1480,16 @@ def rotary_qk_norm_scale(
     scale: float = 1.2,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Fused rotary embedding + RMSNorm + multiplicative scale for Q or K."""
+    """Fused rotary embedding + RMSNorm + multiplicative scale for Q or K.
+
+    Args:
+      qk: (M, D) contiguous CUDA tensor; D must be even.
+      cos: (M, D/2) rotary cosine table.
+      sin: (M, D/2) rotary sine table.
+      scale: post-norm scalar multiplier.
+      eps: RMSNorm epsilon.
+
+    Returns:
+      (M, D) rotated, normalized, and scaled tensor.
+    """
     return RotaryQKNormScale.apply(qk, cos, sin, scale, eps)
