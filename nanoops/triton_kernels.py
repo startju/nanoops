@@ -18,8 +18,8 @@ The actual code lives in three feature-split sibling modules:
   - `triton_fused_add_norm.py` — FusedAddNorm + shared TileConfig helper
   - `triton_fused_mlp_block.py` — FusedMLPBlock (reuses Step 0 kernel
     from triton_fused_add_norm)
-  - `triton_attn_qkv.py` / `triton_attn_sdpa.py` /
-    `triton_attn_output.py` — attention-side kernels
+  - `triton_fused_attn_qkv.py` / `triton_fused_attn_sdpa.py` /
+    `triton_fused_attn_output.py` — attention-side kernels
 
 This module is a thin re-export shim so existing
 `from nanoops.triton_kernels import …` callers keep working unchanged.
@@ -50,13 +50,13 @@ from .triton_fused_mlp_block import (
 )
 
 # ── Attention-side kernels ──────────────────────────────────────────
-from .triton_attn_output import (
+from .triton_fused_attn_output import (
     OutputProjResidual,
     ValueGate,
     output_proj_residual,
     value_gate,
 )
-from .triton_attn_qkv import (
+from .triton_fused_attn_qkv import (
     NormQKVProjection,
     NormQKVRotaryProjection,
     RotaryQKNormScale,
@@ -64,7 +64,7 @@ from .triton_attn_qkv import (
     norm_qkv_rotary_projection,
     rotary_qk_norm_scale,
 )
-from .triton_attn_sdpa import (
+from .triton_fused_attn_sdpa import (
     FlashSDPA,
     flash_sdpa,
 )
