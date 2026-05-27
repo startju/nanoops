@@ -2,7 +2,7 @@
 
 A walkthrough of writing fused GPU kernels in Triton, targeting the
 RTX 3090. Written for someone new to Triton who wants to understand
-**why the fusion choices in `nanoops/triton_kernels.py` look the way
+**why the fusion choices in `nanoops/triton_*.py` look the way
 they do** — block sizes are picked against actual 3090 budgets,
 fusion boundaries follow from the chip's compute/bandwidth ratio,
 and what to keep in registers vs save in ctx vs recompute is driven
@@ -10,8 +10,9 @@ by the same arithmetic-intensity tradeoffs.
 
 The doc starts from raw hardware numbers (SM count, shared mem,
 register file) and works up to fused-kernel design. By the end you
-should be able to read any kernel in `triton_kernels.py` and see
-why every choice was made.
+should be able to read any kernel in the feature-split Triton modules
+and see why every choice was made. `triton_kernels.py` is now only the
+backward-compatible re-export shim.
 
 > 中文版：[TRITON_zh.md](TRITON_zh.md)
 
@@ -407,6 +408,13 @@ API returns both `y` and `summed` to the caller:
 - `summed` → the next block's residual stream (caller doesn't need to
   recompute `x + residual` later)
 
+Public API shape contract:
+```python
+def fused_add_norm(x, residual, norm_weight, eps=1e-6) -> (y, summed)
+# x, residual: contiguous CUDA tensors shaped (M, D)
+# norm_weight: optional contiguous CUDA tensor shaped (D,)
+```
+
 Four Triton kernels make this work end-to-end through autograd —
 one for fwd, plus a 3-kernel backward setup (primary inline kernel
 + a 2-kernel D-split fallback for large D where inline would spill):
@@ -431,7 +439,8 @@ def _fused_add_norm_fwd_kernel(x_ptr, res_ptr, nw_ptr,
                                M, D, eps,
                                BLOCK_M: tl.constexpr,
                                BLOCK_D: tl.constexpr,
-                               HAS_NW: tl.constexpr):
+                               HAS_NW: tl.constexpr,
+                               HAS_RESIDUAL: tl.constexpr):
     pid_m = tl.program_id(0)
     rows  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cols  = tl.arange(0, BLOCK_D)
@@ -907,7 +916,7 @@ the patterns pay off.
 
 ---
 
-## Chapter 3 — FusedMLPBlock: production-level, fwd+bwd all Triton
+## Chapter 3 — `fused_mlp_block`: production-level, fwd+bwd all Triton
 
 Chapter 2's `FusedAddNorm` was a teaching artifact. This chapter is
 nanchat's actual mlp-side fusion target — the standard transformer
@@ -927,6 +936,8 @@ API:
 ```python
 def fused_mlp_block(x, norm_weight, fc_weight, proj_weight, eps=1e-6) -> y
 #   norm_weight=None ⇒ plain RMSNorm without per-channel affine
+#   x, fc_weight, proj_weight, and norm_weight when present must be
+#   contiguous CUDA tensors
 ```
 
 The caller pre-sums any outer residual if needed; this block does the
@@ -1539,7 +1550,7 @@ Observations:
 
 ### 3.8 End-to-end landing
 
-FusedMLPBlock wins ~9% single-op fwd+bwd at d24 (micro-bench; higher
+`fused_mlp_block` wins ~9% single-op fwd+bwd at d24 (micro-bench; higher
 after cast fusion). Landing into nanchat training is via the
 `NANOOPS_FUSED_MLP_BLOCK=1` environment variable; `nanoops/integration.py`'s
 `patch_nanchat()` monkey-patches `nanchat.gpt.Block.forward` on the

@@ -40,9 +40,8 @@ except ImportError:
 #     mlp[m, p]    = sum_n r[m, n] * W_proj[p, n]                     (Linear: c_proj)
 #     y[m, p]      = x[m, p] + mlp[m, p]                              (Residual add)
 #
-# See `class FusedMLPBlock` for the kernel breakdown (3-step fwd, 4-step
-# all-Triton bwd) and ctx contents. The class docstring is the source of
-# truth — do not duplicate the flow description here.
+# See `fused_mlp_block` and the impl helper docstrings for the kernel
+# breakdown (3-step fwd, 4-step all-Triton bwd) and saved-state details.
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -538,6 +537,8 @@ def _fused_mlp_block_fwd_impl(
          HBM).
       2. `_relu_sq_linear_residual_fwd_kernel` — relu² + c_proj +
          residual_add(x) → y in one Triton pass."""
+    if not _HAS_TRITON:
+        raise RuntimeError("fused_mlp_block requires triton to be installed")
     assert x.is_cuda and x.is_contiguous()
     assert fc_weight.is_cuda and fc_weight.is_contiguous()
     assert proj_weight.is_cuda and proj_weight.is_contiguous()
@@ -684,6 +685,8 @@ def _fused_mlp_block_bwd_impl(
          where inner is the one A pre-divided by norm_dim. dx_hat is
          never written to HBM; (i)'s `+ dy` is folded into the store.
          Safe because kernel C uses x_hat, not dx_hat."""
+    if not _HAS_TRITON:
+        raise RuntimeError("fused_mlp_block backward requires triton to be installed")
     M, K = x.shape
     N_fc = fc_weight.shape[0]
     K_out = proj_weight.shape[0]

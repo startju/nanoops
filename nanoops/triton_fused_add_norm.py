@@ -512,6 +512,8 @@ def _fused_add_norm_fwd_impl(
     Returns:
       (y, summed, rms_inv), where y and summed are (M, D) with x.dtype,
       and rms_inv is (M,) fp32."""
+    if not _HAS_TRITON:
+        raise RuntimeError("fused_add_norm requires triton to be installed")
     assert x.is_cuda and x.is_contiguous()
     assert residual.is_cuda and residual.is_contiguous()
     M, D = x.shape
@@ -596,6 +598,8 @@ def _fused_add_norm_bwd_impl(
     Returns:
       d_summed: (M, D) gradient shared by x and residual.
       dnw: optional (D,) gradient of norm_weight."""
+    if not _HAS_TRITON:
+        raise RuntimeError("fused_add_norm backward requires triton to be installed")
     M, D = ynorm_src.shape
     has_nw = norm_weight is not None
     dy = dy.contiguous()

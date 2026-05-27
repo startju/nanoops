@@ -10,7 +10,7 @@ Wins come from:
 
 The training integration activates selected kernels via env var per op
 (e.g. `NANOOPS_FUSED_MLP_BLOCK=1` for the production-wired
-FusedMLPBlock — see `nanoops/integration.py` for the flag list). That
+`fused_mlp_block` custom op — see `nanoops/integration.py` for the flag list). That
 integration layer falls back to eager Python when a kernel is unavailable
 or disabled; this module itself is only a direct re-export shim.
 

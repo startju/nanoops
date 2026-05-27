@@ -7,6 +7,7 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
+from nanoops.triton_fused_add_norm import _pick_tile_config
 from nanoops.triton_kernels import fused_add_norm
 
 
@@ -78,7 +79,9 @@ def test_fused_add_norm_backward(M, has_nw):
 def test_fused_add_norm_backward_large_d_fallback():
     """D=16384 with affine weight exceeds the inline reg budget and uses fallback."""
     torch.manual_seed(0)
-    M, D = 2, 16384
+    M, D = 128, 16384
+    BLOCK_D = triton.next_power_of_2(D)
+    assert not _pick_tile_config(M, BLOCK_D, n_live_tiles=5).fits_reg_budget
     x0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
     r0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
     nw0 = torch.randn(D, dtype=torch.float32, device="cuda")
