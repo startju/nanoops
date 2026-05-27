@@ -10,9 +10,9 @@ here:
   - `triton_fused_mlp_block.py` imports `_pick_tile_config` (sizes its
     Step 0 RMSNorm) and `_fused_add_norm_fwd_kernel` (the kernel itself,
     reused with HAS_RESIDUAL=False).
-  - `triton_attn.py` is self-contained (own RMSNorm kernels) — no
-    imports from here yet, kept as an option for future cross-file
-    reuse.
+  - `triton_attn_qkv.py` is self-contained (own RMSNorm backward
+    helper) — no imports from here yet, kept as an option for future
+    cross-file reuse.
 
 Re-exported through `nanoops.triton_kernels` for backward-compat callers.
 """

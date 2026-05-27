@@ -10,16 +10,16 @@ Wins come from:
 
 The training integration activates selected kernels via env var per op
 (e.g. `NANOOPS_FUSED_MLP_BLOCK=1` for the production-wired
-`fused_mlp_block` custom op — see `nanoops/integration.py` for the flag list). That
-integration layer falls back to eager Python when a kernel is unavailable
-or disabled; this module itself is only a direct re-export shim.
+`fused_mlp_block` custom op — see `nanoops/integration.py` for the flag
+list). That integration layer falls back to eager Python when a kernel
+is unavailable or disabled; this module itself is only a direct re-export shim.
 
 The actual code lives in three feature-split sibling modules:
   - `triton_fused_add_norm.py` — FusedAddNorm + shared TileConfig helper
   - `triton_fused_mlp_block.py` — FusedMLPBlock (reuses Step 0 kernel
     from triton_fused_add_norm)
-  - `triton_attn.py` — the 5 attention-side classes (NormQKVProjection,
-    FlashSDPA, OutputProjResidual, ValueGate, RotaryQKNormScale)
+  - `triton_attn_qkv.py` / `triton_attn_sdpa.py` /
+    `triton_attn_output.py` — attention-side kernels
 
 This module is a thin re-export shim so existing
 `from nanoops.triton_kernels import …` callers keep working unchanged.
@@ -50,17 +50,23 @@ from .triton_fused_mlp_block import (
 )
 
 # ── Attention-side kernels ──────────────────────────────────────────
-from .triton_attn import (
-    FlashSDPA,
-    NormQKVProjection,
+from .triton_attn_output import (
     OutputProjResidual,
-    RotaryQKNormScale,
     ValueGate,
-    flash_sdpa,
-    norm_qkv_projection,
     output_proj_residual,
-    rotary_qk_norm_scale,
     value_gate,
+)
+from .triton_attn_qkv import (
+    NormQKVProjection,
+    NormQKVRotaryProjection,
+    RotaryQKNormScale,
+    norm_qkv_projection,
+    norm_qkv_rotary_projection,
+    rotary_qk_norm_scale,
+)
+from .triton_attn_sdpa import (
+    FlashSDPA,
+    flash_sdpa,
 )
 
 # Private @triton.jit kernels — re-exported for direct benchmark scripts
