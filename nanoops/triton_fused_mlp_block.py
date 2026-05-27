@@ -157,7 +157,7 @@ if _HAS_TRITON:
             if IEEE_PRECISION:
                 acc += tl.dot(r, tl.trans(proj_w), input_precision="ieee")
             else:
-                acc += tl.dot(r, tl.trans(proj_w).to(z.dtype))
+                acc += tl.dot(r, tl.trans(proj_w.to(z.dtype)))
 
         # Add residual, write y. Keep residual in native dtype; cast the
         # matmul acc to output dtype first, then add — saves a bf16→fp32
@@ -315,7 +315,7 @@ if _HAS_TRITON:
 
             # acc[k_out, n] += sum_m dy[m, k_out] * r[m, n]
             if IEEE_PRECISION:
-                acc += tl.dot(tl.trans(dy.to(tl.float32)), r, input_precision="ieee")
+                acc += tl.dot(tl.trans(dy.to(tl.float32)), r.to(tl.float32), input_precision="ieee")
             else:
                 acc += tl.dot(tl.trans(dy), r)
 
