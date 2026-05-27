@@ -97,15 +97,12 @@ if _HAS_TRITON:
             part,
             tl.where(is_k, part - n_head, part - n_head - n_kv_head),
         )
-        is_hi_col = (cols % 2) == 1
-        src_cols = (cols // 2) + tl.where(is_hi_col, BLOCK_D // 2, 0)
-        weight_rows = head * D + src_cols
+        weight_rows = head * D + cols
 
-        # Project one full head with a single dot. Weight rows are loaded in
-        # [lo0, hi0, lo1, hi1, ...] order so the accumulator can be reshaped
-        # into (BLOCK_M, BLOCK_D // 2, 2) and split into rotary pairs in
-        # registers.
-        acc_interleaved = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        # Project one full head with a single dot in ordinary column order:
+        # [lo0, lo1, ..., hi0, hi1, ...]. Q/K split the accumulator into
+        # rotary halves in registers; V can store the same order directly.
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
         for k_start in range(0, K, BLOCK_K):
             ks = k_start + tl.arange(0, BLOCK_K)
             k_mask = ks < K
@@ -124,10 +121,10 @@ if _HAS_TRITON:
                 else:
                     w_ptrs = v_w_ptr + weight_rows[:, None] * K + ks[None, :]
             w = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0).to(x_ptr.dtype.element_ty)
-            acc_interleaved += tl.dot(x, tl.trans(w))
+            acc += tl.dot(x, tl.trans(w))
 
         if is_v:
-            v_out = acc_interleaved
+            v_out = acc.to(x_ptr.dtype.element_ty)
             if HAS_VALUE_EMBEDDING:
                 gate_cols = tl.arange(0, VE_GATE_BLOCK)
                 gate_mask = gate_cols < VE_GATE_CH
@@ -135,7 +132,7 @@ if _HAS_TRITON:
                     x_ptr + rows[:, None] * K + gate_cols[None, :],
                     mask=row_mask[:, None] & gate_mask[None, :],
                     other=0.0,
-                ).to(x_ptr.dtype.element_ty)
+                )
                 gate_w = tl.load(
                     ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
                     mask=gate_mask,
@@ -148,7 +145,7 @@ if _HAS_TRITON:
                     ve_w_ptr
                     + token_ids[:, None] * n_kv_head * D
                     + head * D
-                    + src_cols[None, :]
+                    + cols[None, :]
                 )
                 ve = tl.load(
                     ve_ptrs,
@@ -160,71 +157,55 @@ if _HAS_TRITON:
                 v_ptr
                 + rows[:, None] * n_kv_head * D
                 + head * D
-                + src_cols[None, :]
+                + cols[None, :]
             )
             tl.store(
                 v_ptrs,
-                v_out.to(v_ptr.dtype.element_ty),
+                v_out,
                 mask=row_mask[:, None],
             )
             return
 
-        pair_axis = tl.arange(0, 2)
-        acc_pair = tl.reshape(acc_interleaved, (BLOCK_M, BLOCK_D // 2, 2))
-        acc_lo = tl.sum(tl.where(pair_axis[None, None, :] == 0, acc_pair, 0.0), axis=2)
-        acc_hi = tl.sum(tl.where(pair_axis[None, None, :] == 1, acc_pair, 0.0), axis=2)
+        acc_halves = tl.reshape(acc.to(x_ptr.dtype.element_ty), (BLOCK_M, 2, BLOCK_D // 2))
+        acc_lo, acc_hi = tl.split(tl.trans(acc_halves, 0, 2, 1))
         rotary_rows = rows % rotary_seq_len
 
         cos = tl.load(
             cos_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
             mask=row_mask[:, None],
             other=0.0,
-        ).to(tl.float32)
+        )
         sin = tl.load(
             sin_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
             mask=row_mask[:, None],
             other=0.0,
-        ).to(tl.float32)
+        )
         rot_lo = acc_lo * cos + acc_hi * sin
         rot_hi = -acc_lo * sin + acc_hi * cos
-        qk_sum_sq = tl.sum(rot_lo * rot_lo, axis=1) + tl.sum(rot_hi * rot_hi, axis=1)
+        rot_pair = tl.join(rot_lo, rot_hi)
+        qk_halves = tl.trans(rot_pair, 0, 2, 1)
+        qk = tl.reshape(qk_halves, (BLOCK_M, BLOCK_D))
+        qk_sum_sq = tl.sum(qk * qk, axis=1, dtype=tl.float32)
         qk_rms_inv = tl.rsqrt(qk_sum_sq / D + eps)
         norm_scale = qk_rms_inv * scale
-        qk_lo = rot_lo * norm_scale[:, None]
-        qk_hi = rot_hi * norm_scale[:, None]
+        qk = qk * norm_scale[:, None]
 
         if is_q:
-            q_lo_ptrs = (
+            q_ptrs = (
                 q_ptr
                 + rows[:, None] * n_head * D
                 + head * D
-                + half_cols[None, :]
+                + cols[None, :]
             )
-            q_hi_ptrs = (
-                q_ptr
-                + rows[:, None] * n_head * D
-                + head * D
-                + half_cols[None, :]
-                + (BLOCK_D // 2)
-            )
-            tl.store(q_lo_ptrs, qk_lo.to(q_ptr.dtype.element_ty), mask=row_mask[:, None])
-            tl.store(q_hi_ptrs, qk_hi.to(q_ptr.dtype.element_ty), mask=row_mask[:, None])
+            tl.store(q_ptrs, qk.to(q_ptr.dtype.element_ty), mask=row_mask[:, None])
         else:
-            k_lo_ptrs = (
+            k_ptrs = (
                 k_ptr
                 + rows[:, None] * n_kv_head * D
                 + head * D
-                + half_cols[None, :]
+                + cols[None, :]
             )
-            k_hi_ptrs = (
-                k_ptr
-                + rows[:, None] * n_kv_head * D
-                + head * D
-                + half_cols[None, :]
-                + (BLOCK_D // 2)
-            )
-            tl.store(k_lo_ptrs, qk_lo.to(k_ptr.dtype.element_ty), mask=row_mask[:, None])
-            tl.store(k_hi_ptrs, qk_hi.to(k_ptr.dtype.element_ty), mask=row_mask[:, None])
+            tl.store(k_ptrs, qk.to(k_ptr.dtype.element_ty), mask=row_mask[:, None])
 
     @triton.jit
     def _ve_weight_grad_scatter_bwd_kernel(
@@ -313,14 +294,12 @@ if _HAS_TRITON:
             tl.where(is_k, n_head * D, (n_head + n_kv_head) * D),
         )
 
-        is_hi_col = (cols % 2) == 1
-        src_cols = (cols // 2) + tl.where(is_hi_col, BLOCK_D // 2, 0)
-        weight_rows = head * D + src_cols
+        weight_rows = head * D + cols
         out_rows = weight_offset + weight_rows
 
         if is_v:
             d_v = tl.load(
-                d_v_ptr + rows[:, None] * n_kv_head * D + head * D + src_cols[None, :],
+                d_v_ptr + rows[:, None] * n_kv_head * D + head * D + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             ).to(tl.float32)
@@ -333,7 +312,7 @@ if _HAS_TRITON:
 
         x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
 
-        acc_interleaved = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
         for k_start in range(0, K, BLOCK_K):
             ks = k_start + tl.arange(0, BLOCK_K)
             k_mask = ks < K
@@ -353,12 +332,10 @@ if _HAS_TRITON:
             else:
                 w_ptrs = k_w_ptr + weight_rows[:, None] * K + ks[None, :]
             w = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0).to(tl.float32)
-            acc_interleaved += tl.dot(x_hat, tl.trans(w), input_precision="ieee")
+            acc += tl.dot(x_hat, tl.trans(w), input_precision="ieee")
 
-        pair_axis = tl.arange(0, 2)
-        acc_pair = tl.reshape(acc_interleaved, (BLOCK_M, BLOCK_D // 2, 2))
-        pre_lo = tl.sum(tl.where(pair_axis[None, None, :] == 0, acc_pair, 0.0), axis=2)
-        pre_hi = tl.sum(tl.where(pair_axis[None, None, :] == 1, acc_pair, 0.0), axis=2)
+        acc_halves = tl.reshape(acc, (BLOCK_M, 2, BLOCK_D // 2))
+        pre_lo, pre_hi = tl.split(tl.trans(acc_halves, 0, 2, 1))
 
         rotary_rows = rows % rotary_seq_len
         cos = tl.load(
@@ -1060,7 +1037,10 @@ def _norm_qkv_projection_fwd_impl(
     q = torch.empty((B, T, n_head, head_dim), dtype=x.dtype, device=x.device)
     k = torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device)
     v = torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device)
-    QKV_BLOCK_M, QKV_BLOCK_K = 64, 16
+    if has_value_embedding:
+        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS = 128, 32, 4
+    else:
+        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS = 64, 64, 4
     norm_block_d = triton.next_power_of_2(K)
     norm_cfg = _pick_tile_config(M, norm_block_d, n_live_tiles=2)
     x_hat = torch.empty_like(x_2d)
@@ -1110,7 +1090,7 @@ def _norm_qkv_projection_fwd_impl(
         HAS_VALUE_EMBEDDING=has_value_embedding,
         VE_GATE_CH=ve_gate_channels,
         VE_GATE_BLOCK=triton.next_power_of_2(ve_gate_channels),
-        num_warps=2,
+        num_warps=QKV_NUM_WARPS,
         num_stages=2,
     )
     return q, k, v, rms_inv
