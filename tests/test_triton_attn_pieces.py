@@ -13,7 +13,6 @@ from nanoops.triton_kernels import (
     norm_qkv_rotary_projection,
     output_proj_residual,
     value_gate,
-    rotary_qk_norm_scale,
 )
 
 
@@ -62,7 +61,7 @@ def _norm_qkv_rotary_projection_ref(
 
 def test_norm_qkv_rotary_projection_forward():
     torch.manual_seed(0)
-    M, K, n_head, n_kv_head, head_dim = 32, 64, 4, 2, 32
+    M, K, n_head, n_kv_head, head_dim = 32, 128, 4, 2, 128
     n_qkv = (n_head + 2 * n_kv_head) * head_dim
     x = torch.randn(M, K, dtype=torch.float32, device="cuda")
     norm_weight = torch.randn(K, dtype=torch.float32, device="cuda")
@@ -77,14 +76,56 @@ def test_norm_qkv_rotary_projection_forward():
         x, norm_weight, qkv_weight, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
 
-    for name, ref, got in [("q", q_ref, q_tri), ("k", k_ref, k_tri), ("v", v_ref, v_tri)]:
+    for name, ref, got in [
+        ("q", q_ref, q_tri),
+        ("k", k_ref, k_tri),
+        ("v", v_ref, v_tri),
+    ]:
+        assert torch.allclose(ref, got, atol=2e-3), \
+            f"{name} max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_broadcast_rotary_table():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 16, 128, 4, 2, 128
+    M = B * T
+    n_qkv = (n_head + 2 * n_kv_head) * head_dim
+    x = torch.randn(M, K, dtype=torch.float32, device="cuda")
+    norm_weight = torch.randn(K, dtype=torch.float32, device="cuda")
+    qkv_weight = torch.randn(n_qkv, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    cos_flat = cos.expand(B, T, 1, head_dim // 2).reshape(M, head_dim // 2)
+    sin_flat = sin.expand(B, T, 1, head_dim // 2).reshape(M, head_dim // 2)
+
+    q_ref, k_ref, v_ref = _norm_qkv_rotary_projection_ref(
+        x,
+        norm_weight,
+        qkv_weight,
+        cos_flat,
+        sin_flat,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+    )
+    q_tri, k_tri, v_tri = norm_qkv_rotary_projection(
+        x, norm_weight, qkv_weight, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+    )
+
+    for name, ref, got in [
+        ("q", q_ref, q_tri),
+        ("k", k_ref, k_tri),
+        ("v", v_ref, v_tri),
+    ]:
         assert torch.allclose(ref, got, atol=2e-3), \
             f"{name} max diff {(ref - got).abs().max():.4e}"
 
 
 def test_norm_qkv_rotary_projection_backward():
     torch.manual_seed(0)
-    M, K, n_head, n_kv_head, head_dim = 16, 32, 2, 1, 16
+    M, K, n_head, n_kv_head, head_dim = 16, 128, 2, 1, 128
     n_qkv = (n_head + 2 * n_kv_head) * head_dim
     x0 = torch.randn(M, K, dtype=torch.float32, device="cuda")
     nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
@@ -195,48 +236,3 @@ def test_value_gate_backward():
     ]:
         assert torch.allclose(ref, got, atol=atol), \
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
-
-
-# ─────────────────────────────────────────────────────────────────────
-# rotary_qk_norm_scale: rotary + RMSNorm + scale
-# ─────────────────────────────────────────────────────────────────────
-
-def _rotary_qk_norm_scale_ref(qk, cos, sin, scale, eps):
-    half = qk.shape[-1] // 2
-    x1, x2 = qk[..., :half], qk[..., half:]
-    y1 = x1 * cos + x2 * sin
-    y2 = -x1 * sin + x2 * cos
-    y = torch.cat([y1, y2], dim=-1)
-    rms_inv = torch.rsqrt((y.float() ** 2).mean(dim=-1, keepdim=True) + eps)
-    return (y * rms_inv * scale).to(qk.dtype)
-
-
-def test_rotary_qk_norm_scale_forward():
-    torch.manual_seed(0)
-    M, D = 32, 64
-    qk = torch.randn(M, D, dtype=torch.float32, device="cuda")
-    cos = torch.randn(M, D // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(M, D // 2, dtype=torch.float32, device="cuda")
-    scale = 1.2
-    out_ref = _rotary_qk_norm_scale_ref(qk, cos, sin, scale, eps=1e-6)
-    out_triton = rotary_qk_norm_scale(qk, cos, sin, scale, eps=1e-6)
-    assert torch.allclose(out_ref, out_triton, atol=1e-3), \
-        f"max diff {(out_ref - out_triton).abs().max():.4e}"
-
-
-def test_rotary_qk_norm_scale_backward():
-    torch.manual_seed(0)
-    M, D = 32, 64
-    qk0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
-    cos = torch.randn(M, D // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(M, D // 2, dtype=torch.float32, device="cuda")
-    g = torch.randn(M, D, dtype=torch.float32, device="cuda")
-
-    q1 = qk0.clone().requires_grad_(True)
-    _rotary_qk_norm_scale_ref(q1, cos, sin, 1.2, 1e-6).backward(g)
-
-    q2 = qk0.clone().requires_grad_(True)
-    rotary_qk_norm_scale(q2, cos, sin, 1.2, 1e-6).backward(g)
-
-    assert torch.allclose(q1.grad, q2.grad, atol=5e-3), \
-        f"qk.grad max diff {(q1.grad - q2.grad).abs().max():.4e}"

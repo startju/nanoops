@@ -198,7 +198,7 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 
 **这就是 fusion 设计的根源**：独立的 RMSNorm kernel 做 ~4·M·D 字节 HBM
 流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
-（mlp 走 `fused_mlp_block`，attn 走 `NormQKVProjection`），让归一化的中间值留在
+（mlp 走 `fused_mlp_block`，attn 走 `NormQKVRotaryProjection`），让归一化的中间值留在
 register 里，**省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入
 再读）——带宽 bound 的 op 上**纯赚**，没副作用。`fused_add_norm` 在
 block 边界也是一样的道理。
@@ -349,7 +349,7 @@ naive 的比值不变。
 
 本 repo 里最简单的 fused kernel。**纯学习用**——nanchat 生产 block
 里 RMSNorm 已经直接 fold 进相邻的 matmul kernel（attn 走
-`NormQKVProjection`，mlp 走 `fused_mlp_block`），所以根本不存在
+`NormQKVRotaryProjection`，mlp 走 `fused_mlp_block`），所以根本不存在
 独立的 `add → norm` op 边界让这个 kernel 上 hot path。但这个 kernel
 用到的每一个 pattern 都是更大 fused kernel 的基石，所以它是学这些
 patterns 最干净的样本。
@@ -845,7 +845,7 @@ framework overhead 的地方。
 更高，wall time 上还是赢。
 
 这也是为什么 nanchat 生产路径跳过这个 kernel：`fused_mlp_block`
-和 `NormQKVProjection` 把 norm 直接 fold 进 matmul kernel，根本不
+和 `NormQKVRotaryProjection` 把 norm 直接 fold 进 matmul kernel，根本不
 存在让这个 `add+norm` fusion 挂上去的 op 边界。这个 kernel 是来
 演示 patterns 的；真正让 patterns 体现价值的，是更大的生产 kernel。
 

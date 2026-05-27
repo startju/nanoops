@@ -85,12 +85,10 @@ adds optional fast-path variants.
       across the matmul); c_proj uses cuBLAS. Backward chains the two
       cuBLAS gradients with a small relu²-bwd Triton kernel and an
       RMSNorm-bwd Triton kernel.
-- [x] **`norm_qkv_projection`**: `RMSNorm(x) @ W_qkv.T` where W_qkv is
-      `concat([c_q.weight, c_k.weight, c_v.weight])` — the first half of
-      CausalSelfAttention. Same fusion pattern as the MLP forward; caller
-      splits the output into q/k/v and runs the rest (rotary, Q/K norm,
-      SDPA, c_proj) eagerly. Backward reuses the same RMSNorm-bwd kernel
-      as the MLP fusion.
+- [x] **`norm_qkv_rotary_projection`**: `RMSNorm(x) @ W_qkv.T` where W_qkv is
+      `concat([c_q.weight, c_k.weight, c_v.weight])`, with Q/K rotary,
+      QK RMSNorm, and scale applied before writeback. This covers the
+      QKV-side setup before SDPA.
 
 These two cover the heaviest "norm + linear chain" entries of the
 transformer block. Further fusions (full Flash-style SDPA, logit
