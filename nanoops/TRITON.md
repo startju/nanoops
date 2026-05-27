@@ -224,7 +224,7 @@ into the adjacent matmul kernel (`fused_mlp_block` on the mlp side)
 keeps the normalized intermediate in registers, saving **4·M·D bytes**
 of HBM traffic (norm output write + matmul input re-read) — pure
 bandwidth win on a bandwidth-bound op. The attn-side
-`NormQKVRotaryProjection` currently materializes `x_hat` with the shared
+`NormQKVProjection` currently materializes `x_hat` with the shared
 RMSNorm kernel before Q/K/V projection because that benchmarks slightly
 faster at d24.
 
@@ -391,7 +391,7 @@ A **warp** = 32 threads. The fundamental scheduling unit.
 
 The simplest fused kernel in this repo. It exists purely as a learning
 artifact — nanchat's production blocks fold the RMSNorm directly into
-the adjacent matmul (see `NormQKVRotaryProjection` on the attn side,
+the adjacent matmul (see `NormQKVProjection` on the attn side,
 `fused_mlp_block` on the mlp side), so a standalone `add → norm`
 op boundary doesn't actually appear in the hot path. But every
 pattern this kernel uses is a building block of those bigger fused
@@ -911,7 +911,7 @@ small kernels.
 
 That's also why nanchat's production path mostly skips this standalone
 op-boundary kernel: `fused_mlp_block` folds norm directly into its
-matmul path, and `NormQKVRotaryProjection` reuses only the RMSNorm
+matmul path, and `NormQKVProjection` reuses only the RMSNorm
 materialization sub-kernel before its Q/K/V projection. The bigger
 production kernels are where these patterns pay off.
 

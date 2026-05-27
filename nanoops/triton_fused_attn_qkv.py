@@ -718,10 +718,10 @@ def _norm_qkv_rotary_projection_triton_backward(
     eps: float,
     saved_rms_inv: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Closed-form Triton backward for `NormQKVRotaryProjection`.
+    """Closed-form Triton backward for `NormQKVProjection`.
 
     This helper launches Triton kernels for the fp32 algebra used by the
-    autograd.Function today. Rotary cos/sin are treated as constants; the
+    custom-op autograd callback. Rotary cos/sin are treated as constants; the
     returned gradients are for x, norm_weight, q_weight, k_weight, and v_weight.
 
     Forward math:
@@ -963,433 +963,685 @@ def _norm_qkv_rotary_projection_triton_backward(
     return dx, d_norm_weight, d_q_weight, d_k_weight, d_v_weight
 
 
-class NormQKVRotaryProjection(torch.autograd.Function):
-    """Fused outer RMSNorm + Q/K/V projection with Q/K rotary/QK-norm/scale.
+def _norm_qkv_projection_fwd_impl(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+    ve: torch.Tensor | None,
+    ve_gate_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward implementation for `nanoops::norm_qkv_projection_fwd`.
 
-    Forward writes:
-      q: (B, T, n_head, head_dim) after rotary + QK RMSNorm + scale.
-      k: (B, T, n_kv_head, head_dim) after rotary + QK RMSNorm + scale.
-      v: (B, T, n_kv_head, head_dim) projected values plus optional value embedding.
-
-    Backward uses Triton kernels for the same closed-form gradients.
+    Returns `(q, k, v, rms_inv)`. `rms_inv` is a hidden output used only by
+    the registered autograd callback.
     """
+    if not _HAS_TRITON:
+        raise RuntimeError("norm_qkv_projection requires triton")
+    assert x.is_cuda and x.ndim == 3 and x.is_contiguous()
+    B, T, K = x.size()
+    M = B * T
+    x_2d = x.view(M, K)
+    assert q_weight.is_cuda and k_weight.is_cuda and v_weight.is_cuda
+    has_norm_weight = norm_weight is not None
+    norm_weight_or_x = norm_weight if has_norm_weight else x_2d
+    assert norm_weight_or_x.is_cuda
+    assert (
+        norm_weight_or_x.is_contiguous()
+        and q_weight.is_contiguous()
+        and k_weight.is_contiguous()
+        and v_weight.is_contiguous()
+    )
+    assert head_dim % 2 == 0
+    q_n = n_head * head_dim
+    kv_n = n_kv_head * head_dim
+    assert q_weight.shape == (q_n, K), f"q_weight shape {tuple(q_weight.shape)} != {(q_n, K)}"
+    assert k_weight.shape == (kv_n, K), f"k_weight shape {tuple(k_weight.shape)} != {(kv_n, K)}"
+    assert v_weight.shape == (kv_n, K), f"v_weight shape {tuple(v_weight.shape)} != {(kv_n, K)}"
+    _validate_rotary_table_4d(cos, T, head_dim)
+    _validate_rotary_table_4d(sin, T, head_dim)
 
-    @staticmethod
-    def forward(
-        ctx: Any,
-        x: torch.Tensor,
-        norm_weight: torch.Tensor | None,
-        q_weight: torch.Tensor,
-        k_weight: torch.Tensor,
-        v_weight: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        n_head: int,
-        n_kv_head: int,
-        head_dim: int,
-        scale: float = 1.2,
-        eps: float = 1e-6,
-        ve: torch.Tensor | None = None,
-        ve_gate_weight: torch.Tensor | None = None,
-        ve_gate_channels: int = 12,
-        ve_ids: torch.Tensor | None = None,
-        ve_weight: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run fused QKV projection plus Q/K rotary, QK RMSNorm, and scale.
-
-        Args:
-          x: (B, T, C) CUDA tensor.
-          norm_weight: optional (K,) outer RMSNorm scale.
-          q_weight: (n_head * head_dim, C) query projection weight.
-          k_weight: (n_kv_head * head_dim, C) key projection weight.
-          v_weight: (n_kv_head * head_dim, C) value projection weight.
-          cos: (1, T, 1, head_dim/2) rotary table.
-          sin: (1, T, 1, head_dim/2) rotary table.
-          n_head: number of query heads.
-          n_kv_head: number of key/value heads.
-          head_dim: per-head width; must be even.
-          scale: post-QK-norm scalar multiplier.
-          eps: RMSNorm epsilon for both outer norm and QK norm.
-          ve: optional value embedding, shaped `(B, T, n_kv_head * head_dim)`
-            or `(B, T, n_kv_head, head_dim)`.
-          ve_gate_weight: optional `(n_kv_head, ve_gate_channels)` gate weight.
-          ve_gate_channels: number of normalized input channels used by the gate.
-          ve_ids: optional `(B, T)` token ids for fused value embedding lookup.
-          ve_weight: optional `(vocab, n_kv_head * head_dim)` value embedding table.
-
-        Returns:
-          Tuple `(q, k, v)` with shapes `(B, T, n_head, head_dim)`,
-          `(B, T, n_kv_head, head_dim)`, and `(B, T, n_kv_head, head_dim)`.
-        """
-        assert x.is_cuda and x.ndim == 3 and x.is_contiguous()
-        B, T, K = x.size()
-        M = B * T
-        x_2d = x.view(M, K)
-        assert q_weight.is_cuda and k_weight.is_cuda and v_weight.is_cuda
-        has_norm_weight = norm_weight is not None
-        norm_weight_or_x = norm_weight if has_norm_weight else x_2d
-        assert norm_weight_or_x.is_cuda
-        assert (
-            norm_weight_or_x.is_contiguous()
-            and q_weight.is_contiguous()
-            and k_weight.is_contiguous()
-            and v_weight.is_contiguous()
+    has_value_lookup = ve_ids is not None or ve_weight is not None
+    assert not (ve is not None and has_value_lookup), (
+        "pass either materialized ve or ve_ids + ve_weight, not both"
+    )
+    has_value_embedding = ve is not None or has_value_lookup
+    if has_value_embedding:
+        assert ve_gate_weight is not None, (
+            "ve_gate_weight is required when value embedding is provided"
         )
-        assert head_dim % 2 == 0
-        q_n = n_head * head_dim
-        kv_n = n_kv_head * head_dim
-        assert q_weight.shape == (q_n, K), f"q_weight shape {tuple(q_weight.shape)} != {(q_n, K)}"
-        assert k_weight.shape == (kv_n, K), f"k_weight shape {tuple(k_weight.shape)} != {(kv_n, K)}"
-        assert v_weight.shape == (kv_n, K), f"v_weight shape {tuple(v_weight.shape)} != {(kv_n, K)}"
-        _validate_rotary_table_4d(cos, T, head_dim)
-        _validate_rotary_table_4d(sin, T, head_dim)
-
-        has_value_lookup = ve_ids is not None or ve_weight is not None
-        assert not (ve is not None and has_value_lookup), (
-            "pass either materialized ve or ve_ids + ve_weight, not both"
+        assert ve_gate_weight.is_cuda and ve_gate_weight.is_contiguous()
+        assert 0 < ve_gate_channels <= K
+        assert ve_gate_weight.shape == (n_kv_head, ve_gate_channels), (
+            f"ve_gate_weight shape {tuple(ve_gate_weight.shape)} != "
+            f"{(n_kv_head, ve_gate_channels)}"
         )
-        has_value_embedding = ve is not None or has_value_lookup
-        if has_value_embedding:
-            assert ve_gate_weight is not None, (
-                "ve_gate_weight is required when value embedding is provided"
+        if has_value_lookup:
+            assert ve_ids is not None and ve_weight is not None, (
+                "ve_ids and ve_weight must be passed together"
             )
-            assert ve_gate_weight.is_cuda and ve_gate_weight.is_contiguous()
-            assert 0 < ve_gate_channels <= K
-            assert ve_gate_weight.shape == (n_kv_head, ve_gate_channels), (
-                f"ve_gate_weight shape {tuple(ve_gate_weight.shape)} != "
-                f"{(n_kv_head, ve_gate_channels)}"
+            assert ve_ids.is_cuda and ve_weight.is_cuda and ve_weight.is_contiguous()
+            assert ve_ids.shape == (B, T), f"ve_ids shape {tuple(ve_ids.shape)} != {(B, T)}"
+            assert ve_weight.ndim == 2 and ve_weight.shape[1] == kv_n, (
+                f"ve_weight shape {tuple(ve_weight.shape)} must be (vocab, {kv_n})"
             )
-            if has_value_lookup:
-                assert ve_ids is not None and ve_weight is not None, (
-                    "ve_ids and ve_weight must be passed together"
-                )
-                assert ve_ids.is_cuda and ve_weight.is_cuda and ve_weight.is_contiguous()
-                assert ve_ids.shape == (B, T), f"ve_ids shape {tuple(ve_ids.shape)} != {(B, T)}"
-                assert ve_weight.ndim == 2 and ve_weight.shape[1] == kv_n, (
-                    f"ve_weight shape {tuple(ve_weight.shape)} must be (vocab, {kv_n})"
-                )
-                ve_ids_for_kernel = ve_ids.reshape(M).contiguous()
-                ve_weight_for_kernel = ve_weight
-                ve_for_kernel = x_2d
-            else:
-                assert ve is not None and ve.is_cuda
-                if ve.ndim == 3:
-                    assert ve.shape == (B, T, kv_n), f"ve shape {tuple(ve.shape)} != {(B, T, kv_n)}"
-                    ve_for_kernel = ve.view(B, T, n_kv_head, head_dim)
-                else:
-                    assert ve.ndim == 4
-                    assert ve.shape == (B, T, n_kv_head, head_dim), (
-                        f"ve shape {tuple(ve.shape)} != {(B, T, n_kv_head, head_dim)}"
-                    )
-                    ve_for_kernel = ve
-                ve_for_kernel = ve_for_kernel.contiguous()
-                ve_ids_for_kernel = x_2d
-                ve_weight_for_kernel = x_2d
-        else:
+            ve_ids_for_kernel = ve_ids.reshape(M).contiguous()
+            ve_weight_for_kernel = ve_weight
             ve_for_kernel = x_2d
+        else:
+            assert ve is not None and ve.is_cuda
+            if ve.ndim == 3:
+                assert ve.shape == (B, T, kv_n), f"ve shape {tuple(ve.shape)} != {(B, T, kv_n)}"
+                ve_for_kernel = ve.view(B, T, n_kv_head, head_dim)
+            else:
+                assert ve.ndim == 4
+                assert ve.shape == (B, T, n_kv_head, head_dim), (
+                    f"ve shape {tuple(ve.shape)} != {(B, T, n_kv_head, head_dim)}"
+                )
+                ve_for_kernel = ve
+            ve_for_kernel = ve_for_kernel.contiguous()
             ve_ids_for_kernel = x_2d
             ve_weight_for_kernel = x_2d
-            ve_gate_weight = x_2d
-            ve_gate_channels = 1
+    else:
+        ve_for_kernel = x_2d
+        ve_ids_for_kernel = x_2d
+        ve_weight_for_kernel = x_2d
+        ve_gate_weight = x_2d
+        ve_gate_channels = 1
 
-        q = torch.empty((B, T, n_head, head_dim), dtype=x.dtype, device=x.device)
-        k = torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device)
-        v = torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device)
-        QKV_BLOCK_M, QKV_BLOCK_K = 64, 16
-        norm_block_d = triton.next_power_of_2(K)
-        norm_cfg = _pick_tile_config(M, norm_block_d, n_live_tiles=2)
-        x_hat = torch.empty_like(x_2d)
-        rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
-        _fused_add_norm_fwd_kernel[(triton.cdiv(M, norm_cfg.block_m),)](
-            x_2d,
-            x_2d,
-            norm_weight_or_x,
-            x_hat,
-            x_2d,
-            rms_inv,
-            M,
-            K,
-            eps,
-            BLOCK_M=norm_cfg.block_m,
-            BLOCK_D=norm_block_d,
-            HAS_NW=has_norm_weight,
-            HAS_RESIDUAL=False,
-            num_warps=norm_cfg.num_warps,
-        )
+    q = torch.empty((B, T, n_head, head_dim), dtype=x.dtype, device=x.device)
+    k = torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device)
+    v = torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device)
+    QKV_BLOCK_M, QKV_BLOCK_K = 64, 16
+    norm_block_d = triton.next_power_of_2(K)
+    norm_cfg = _pick_tile_config(M, norm_block_d, n_live_tiles=2)
+    x_hat = torch.empty_like(x_2d)
+    rms_inv = torch.empty((M,), dtype=torch.float32, device=x.device)
+    _fused_add_norm_fwd_kernel[(triton.cdiv(M, norm_cfg.block_m),)](
+        x_2d,
+        x_2d,
+        norm_weight_or_x,
+        x_hat,
+        x_2d,
+        rms_inv,
+        M,
+        K,
+        eps,
+        BLOCK_M=norm_cfg.block_m,
+        BLOCK_D=norm_block_d,
+        HAS_NW=has_norm_weight,
+        HAS_RESIDUAL=False,
+        num_warps=norm_cfg.num_warps,
+    )
 
-        grid = (triton.cdiv(M, QKV_BLOCK_M), n_head + 2 * n_kv_head)
-        _norm_qkv_rotary_fwd_kernel[grid](
-            x_hat,
-            q_weight,
-            k_weight,
-            v_weight,
-            ve_for_kernel,
-            ve_ids_for_kernel,
-            ve_weight_for_kernel,
-            ve_gate_weight,
-            cos,
-            sin,
-            q,
-            k,
-            v,
-            M,
-            K,
-            head_dim,
-            n_head,
-            n_kv_head,
-            T,
-            eps,
-            scale,
-            BLOCK_M=QKV_BLOCK_M,
-            BLOCK_D=head_dim,
-            BLOCK_K=QKV_BLOCK_K,
-            HAS_VALUE_EMBEDDING=has_value_embedding,
-            HAS_VALUE_LOOKUP=has_value_lookup,
-            VE_GATE_CH=ve_gate_channels,
-            VE_GATE_BLOCK=triton.next_power_of_2(ve_gate_channels),
-            num_warps=2,
-            num_stages=2,
-        )
+    grid = (triton.cdiv(M, QKV_BLOCK_M), n_head + 2 * n_kv_head)
+    _norm_qkv_rotary_fwd_kernel[grid](
+        x_hat,
+        q_weight,
+        k_weight,
+        v_weight,
+        ve_for_kernel,
+        ve_ids_for_kernel,
+        ve_weight_for_kernel,
+        ve_gate_weight,
+        cos,
+        sin,
+        q,
+        k,
+        v,
+        M,
+        K,
+        head_dim,
+        n_head,
+        n_kv_head,
+        T,
+        eps,
+        scale,
+        BLOCK_M=QKV_BLOCK_M,
+        BLOCK_D=head_dim,
+        BLOCK_K=QKV_BLOCK_K,
+        HAS_VALUE_EMBEDDING=has_value_embedding,
+        HAS_VALUE_LOOKUP=has_value_lookup,
+        VE_GATE_CH=ve_gate_channels,
+        VE_GATE_BLOCK=triton.next_power_of_2(ve_gate_channels),
+        num_warps=2,
+        num_stages=2,
+    )
+    return q, k, v, rms_inv
 
-        if has_norm_weight:
-            tensors = [x_2d, norm_weight, q_weight, k_weight, v_weight, cos, sin, rms_inv]
+
+def _norm_qkv_projection_bwd_impl(
+    d_q: torch.Tensor,
+    d_k: torch.Tensor,
+    d_v: torch.Tensor,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rms_inv: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+    ve: torch.Tensor | None,
+    ve_gate_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Backward implementation for `nanoops::norm_qkv_projection_bwd`."""
+    assert x.ndim == 3
+    B, T, K = x.shape
+    M = B * T
+    x_2d = x.view(M, K)
+    dx, dnw, dqw, dkw, dvw = _norm_qkv_rotary_projection_triton_backward(
+        x_2d,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        d_q,
+        d_k,
+        d_v,
+        n_head,
+        n_kv_head,
+        head_dim,
+        scale,
+        eps,
+        saved_rms_inv=rms_inv,
+    )
+
+    d_ve = None
+    d_ve_gate_weight = None
+    d_ve_weight = None
+    has_value_lookup = ve_ids is not None or ve_weight is not None
+    has_value_embedding = ve is not None or has_value_lookup
+    if has_value_embedding:
+        assert ve_gate_weight is not None
+        ch = ve_gate_channels
+        d_v_gate = d_v.contiguous().view(M, n_kv_head, head_dim)
+        if has_value_lookup:
+            assert ve_ids is not None and ve_weight is not None
+            ve_ids_flat = ve_ids.reshape(M).contiguous()
+            ve_3d = ve_weight.view(ve_weight.shape[0], n_kv_head, head_dim)[
+                ve_ids_flat.long()
+            ]
         else:
-            tensors = [x_2d, q_weight, k_weight, v_weight, cos, sin, rms_inv]
-        if has_value_embedding:
-            if has_value_lookup:
-                tensors.extend([ve_ids_for_kernel, ve_weight_for_kernel, ve_gate_weight])
-                ctx.ve_shape = None
-            else:
-                tensors.extend([ve_for_kernel, ve_gate_weight])
-                ctx.ve_shape = tuple(ve.shape)
-        else:
-            ctx.ve_shape = None
-        ctx.save_for_backward(*tensors)
-        ctx.has_norm_weight = has_norm_weight
-        ctx.input_shape = (B, T, K)
-        ctx.has_value_embedding = has_value_embedding
-        ctx.has_value_lookup = has_value_lookup
-        ctx.ve_gate_channels = ve_gate_channels
-        ctx.n_head = n_head
-        ctx.n_kv_head = n_kv_head
-        ctx.head_dim = head_dim
-        ctx.scale = scale
-        ctx.eps = eps
-        return q, k, v
+            assert ve is not None
+            ve_3d = ve.reshape(M, n_kv_head, head_dim)
 
-    @staticmethod
-    def backward(
-        ctx: Any,
-        d_q: torch.Tensor,
-        d_k: torch.Tensor,
-        d_v: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        None,
-        None,
-        torch.Tensor | None,
-    ]:
-        """Backprop via the closed-form Triton kernels."""
-        if ctx.has_norm_weight:
-            if ctx.has_value_embedding:
-                if ctx.has_value_lookup:
-                    (
-                        x_2d,
-                        norm_weight,
-                        q_weight,
-                        k_weight,
-                        v_weight,
-                        cos,
-                        sin,
-                        rms_inv,
-                        ve_ids,
-                        ve_weight,
-                        ve_gate_weight,
-                    ) = ctx.saved_tensors
-                    ve = None
-                else:
-                    (
-                        x_2d,
-                        norm_weight,
-                        q_weight,
-                        k_weight,
-                        v_weight,
-                        cos,
-                        sin,
-                        rms_inv,
-                        ve,
-                        ve_gate_weight,
-                    ) = ctx.saved_tensors
-                    ve_ids = None
-                    ve_weight = None
-            else:
-                x_2d, norm_weight, q_weight, k_weight, v_weight, cos, sin, rms_inv = ctx.saved_tensors
-                ve = None
-                ve_ids = None
-                ve_weight = None
-                ve_gate_weight = None
+        x_norm = x_2d.float() * rms_inv[:, None]
+        if norm_weight is not None:
+            x_hat = (x_norm * norm_weight.float()[None, :]).to(x_2d.dtype)
         else:
-            if ctx.has_value_embedding:
-                if ctx.has_value_lookup:
-                    (
-                        x_2d,
-                        q_weight,
-                        k_weight,
-                        v_weight,
-                        cos,
-                        sin,
-                        rms_inv,
-                        ve_ids,
-                        ve_weight,
-                        ve_gate_weight,
-                    ) = ctx.saved_tensors
-                    ve = None
-                else:
-                    (
-                        x_2d,
-                        q_weight,
-                        k_weight,
-                        v_weight,
-                        cos,
-                        sin,
-                        rms_inv,
-                        ve,
-                        ve_gate_weight,
-                    ) = ctx.saved_tensors
-                    ve_ids = None
-                    ve_weight = None
-            else:
-                x_2d, q_weight, k_weight, v_weight, cos, sin, rms_inv = ctx.saved_tensors
-                ve = None
-                ve_ids = None
-                ve_weight = None
-                ve_gate_weight = None
-            norm_weight = None
-        dx, dnw, dqw, dkw, dvw = _norm_qkv_rotary_projection_triton_backward(
-            x_2d,
+            x_hat = x_norm.to(x_2d.dtype)
+        x_gate = x_hat[:, :ch]
+        gate_logits = x_gate.float() @ ve_gate_weight.float().t()
+        sigmoid = torch.sigmoid(gate_logits)
+        gate = 3.0 * sigmoid
+
+        d_ve_3d = d_v_gate * gate.to(d_v_gate.dtype).view(M, n_kv_head, 1)
+        d_gate = (d_v_gate.float() * ve_3d.float()).sum(dim=-1)
+        d_gate_logits = 3.0 * d_gate * sigmoid * (1.0 - sigmoid)
+        d_ve_gate_weight = (d_gate_logits.t() @ x_gate.float()).to(ve_gate_weight.dtype)
+
+        d_x_hat_gate = torch.zeros((M, K), dtype=torch.float32, device=x_2d.device)
+        d_x_hat_gate[:, :ch] = d_gate_logits @ ve_gate_weight.float()
+        if norm_weight is not None:
+            dnw_gate = (d_x_hat_gate * x_norm).sum(dim=0).to(norm_weight.dtype)
+            dnw = dnw + dnw_gate if dnw is not None else dnw_gate
+            d_x_norm_gate = d_x_hat_gate * norm_weight.float()[None, :]
+        else:
+            d_x_norm_gate = d_x_hat_gate
+        row_inner = (d_x_norm_gate * x_norm).mean(dim=-1, keepdim=True)
+        dx_gate = rms_inv[:, None] * (d_x_norm_gate - x_norm * row_inner)
+        dx = dx + dx_gate.to(dx.dtype)
+        if has_value_lookup:
+            assert ve_ids is not None and ve_weight is not None
+            ve_ids_flat = ve_ids.reshape(M).contiguous()
+            d_ve_weight_accum = torch.zeros(
+                (ve_weight.shape[0], n_kv_head * head_dim),
+                dtype=torch.float32,
+                device=ve_weight.device,
+            )
+            VE_DW_BLOCK_M, VE_DW_BLOCK_D = 16, 64
+            _ve_weight_grad_scatter_bwd_kernel[
+                (
+                    triton.cdiv(M, VE_DW_BLOCK_M),
+                    n_kv_head,
+                    triton.cdiv(head_dim, VE_DW_BLOCK_D),
+                )
+            ](
+                ve_ids_flat,
+                d_ve_3d.contiguous(),
+                d_ve_weight_accum,
+                M,
+                head_dim,
+                n_kv_head,
+                BLOCK_M=VE_DW_BLOCK_M,
+                BLOCK_D=VE_DW_BLOCK_D,
+                num_warps=4,
+            )
+            d_ve_weight = d_ve_weight_accum.to(ve_weight.dtype).view_as(ve_weight)
+        else:
+            assert ve is not None
+            d_ve = d_ve_3d.reshape(ve.shape)
+    return dx.reshape_as(x), dnw, dqw, dkw, dvw, d_ve, d_ve_gate_weight, d_ve_weight
+
+
+@torch.library.custom_op(
+    "nanoops::norm_qkv_projection_fwd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _norm_qkv_projection_fwd_op(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+    ve: torch.Tensor | None,
+    ve_gate_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Custom-op forward wrapper for fused attention QKV projection."""
+    return _norm_qkv_projection_fwd_impl(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        scale,
+        eps,
+        ve,
+        ve_gate_weight,
+        ve_gate_channels,
+        ve_ids,
+        ve_weight,
+    )
+
+
+@_norm_qkv_projection_fwd_op.register_fake
+def _norm_qkv_projection_fwd_fake(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+    ve: torch.Tensor | None,
+    ve_gate_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake/meta kernel for Dynamo shape inference."""
+    B, T, _K = x.shape
+    return (
+        torch.empty((B, T, n_head, head_dim), dtype=x.dtype, device=x.device),
+        torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device),
+        torch.empty((B, T, n_kv_head, head_dim), dtype=x.dtype, device=x.device),
+        torch.empty((B * T,), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op(
+    "nanoops::norm_qkv_projection_bwd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _norm_qkv_projection_bwd_op(
+    d_q: torch.Tensor,
+    d_k: torch.Tensor,
+    d_v: torch.Tensor,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rms_inv: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+    ve: torch.Tensor | None,
+    ve_gate_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Custom-op backward wrapper.
+
+    custom_op returns cannot be Optional, so missing optional gradients use
+    1-element placeholders that the autograd callback converts back to None.
+    """
+    dx, dnw, dqw, dkw, dvw, d_ve, d_ve_gate_weight, d_ve_weight = (
+        _norm_qkv_projection_bwd_impl(
+            d_q,
+            d_k,
+            d_v,
+            x,
             norm_weight,
             q_weight,
             k_weight,
             v_weight,
             cos,
             sin,
-            d_q,
-            d_k,
-            d_v,
+            rms_inv,
+            n_head,
+            n_kv_head,
+            head_dim,
+            scale,
+            eps,
+            ve,
+            ve_gate_weight,
+            ve_gate_channels,
+            ve_ids,
+            ve_weight,
+        )
+    )
+    if dnw is None:
+        dnw = torch.empty(1, dtype=x.dtype, device=x.device)
+    if d_ve is None:
+        d_ve = torch.empty(1, dtype=x.dtype, device=x.device)
+    if d_ve_gate_weight is None:
+        d_ve_gate_weight = torch.empty(1, dtype=x.dtype, device=x.device)
+    if d_ve_weight is None:
+        d_ve_weight = torch.empty(1, dtype=x.dtype, device=x.device)
+    return dx, dnw, dqw, dkw, dvw, d_ve, d_ve_gate_weight, d_ve_weight
+
+
+@_norm_qkv_projection_bwd_op.register_fake
+def _norm_qkv_projection_bwd_fake(
+    d_q: torch.Tensor,
+    d_k: torch.Tensor,
+    d_v: torch.Tensor,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rms_inv: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+    ve: torch.Tensor | None,
+    ve_gate_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Fake/meta kernel for backward shape inference."""
+    dnw = torch.empty_like(norm_weight) if norm_weight is not None else torch.empty(
+        1, dtype=x.dtype, device=x.device
+    )
+    d_ve = torch.empty_like(ve) if ve is not None else torch.empty(
+        1, dtype=x.dtype, device=x.device
+    )
+    d_ve_gate_weight = (
+        torch.empty_like(ve_gate_weight)
+        if ve_gate_weight is not None
+        else torch.empty(1, dtype=x.dtype, device=x.device)
+    )
+    d_ve_weight = torch.empty_like(ve_weight) if ve_weight is not None else torch.empty(
+        1, dtype=x.dtype, device=x.device
+    )
+    return (
+        torch.empty_like(x),
+        dnw,
+        torch.empty_like(q_weight),
+        torch.empty_like(k_weight),
+        torch.empty_like(v_weight),
+        d_ve,
+        d_ve_gate_weight,
+        d_ve_weight,
+    )
+
+
+def _norm_qkv_projection_setup_context(
+    ctx: Any,
+    inputs: tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+        float,
+        float,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ],
+    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Save forward inputs and hidden `rms_inv` for custom-op autograd."""
+    (
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        scale,
+        eps,
+        ve,
+        ve_gate_weight,
+        ve_gate_channels,
+        ve_ids,
+        ve_weight,
+    ) = inputs
+    _q, _k, _v, rms_inv = output
+    ctx.save_for_backward(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        rms_inv,
+        ve,
+        ve_gate_weight,
+        ve_ids,
+        ve_weight,
+    )
+    ctx.n_head = n_head
+    ctx.n_kv_head = n_kv_head
+    ctx.head_dim = head_dim
+    ctx.scale = scale
+    ctx.eps = eps
+    ctx.ve_gate_channels = ve_gate_channels
+    ctx.has_value_embedding = ve is not None or ve_ids is not None or ve_weight is not None
+
+
+def _norm_qkv_projection_autograd_backward(
+    ctx: Any,
+    grad_q: torch.Tensor,
+    grad_k: torch.Tensor,
+    grad_v: torch.Tensor,
+    grad_rms_inv: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    None,
+    None,
+    torch.Tensor | None,
+]:
+    """Autograd callback for `nanoops::norm_qkv_projection_fwd`."""
+    (
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        rms_inv,
+        ve,
+        ve_gate_weight,
+        ve_ids,
+        ve_weight,
+    ) = ctx.saved_tensors
+    dx, dnw, dqw, dkw, dvw, d_ve, d_ve_gate_weight, d_ve_weight = (
+        _norm_qkv_projection_bwd_op(
+            grad_q,
+            grad_k,
+            grad_v,
+            x,
+            norm_weight,
+            q_weight,
+            k_weight,
+            v_weight,
+            cos,
+            sin,
+            rms_inv,
             ctx.n_head,
             ctx.n_kv_head,
             ctx.head_dim,
             ctx.scale,
             ctx.eps,
-            saved_rms_inv=rms_inv,
+            ve,
+            ve_gate_weight,
+            ctx.ve_gate_channels,
+            ve_ids,
+            ve_weight,
         )
+    )
+    if norm_weight is None:
+        dnw = None
+    if not ctx.has_value_embedding:
         d_ve = None
         d_ve_gate_weight = None
         d_ve_weight = None
-        if ctx.has_value_embedding:
-            assert ve_gate_weight is not None
-            M, K = x_2d.shape
-            ch = ctx.ve_gate_channels
-            d_v_gate = d_v.contiguous().view(M, ctx.n_kv_head, ctx.head_dim)
-            if ctx.has_value_lookup:
-                assert ve_ids is not None and ve_weight is not None
-                ve_ids_long = ve_ids.long()
-                ve_3d = ve_weight.view(
-                    ve_weight.shape[0], ctx.n_kv_head, ctx.head_dim
-                )[ve_ids_long]
-            else:
-                assert ve is not None
-                ve_3d = ve.view(M, ctx.n_kv_head, ctx.head_dim)
-
-            x_norm = x_2d.float() * rms_inv[:, None]
-            if norm_weight is not None:
-                x_hat = (x_norm * norm_weight.float()[None, :]).to(x_2d.dtype)
-            else:
-                x_hat = x_norm.to(x_2d.dtype)
-            x_gate = x_hat[:, :ch]
-            gate_logits = x_gate.float() @ ve_gate_weight.float().t()
-            sigmoid = torch.sigmoid(gate_logits)
-            gate = 3.0 * sigmoid
-
-            d_ve_3d = d_v_gate * gate.to(d_v_gate.dtype).view(M, ctx.n_kv_head, 1)
-            d_gate = (d_v_gate.float() * ve_3d.float()).sum(dim=-1)
-            d_gate_logits = 3.0 * d_gate * sigmoid * (1.0 - sigmoid)
-            d_ve_gate_weight = (d_gate_logits.t() @ x_gate.float()).to(ve_gate_weight.dtype)
-
-            d_x_hat_gate = torch.zeros((M, K), dtype=torch.float32, device=x_2d.device)
-            d_x_hat_gate[:, :ch] = d_gate_logits @ ve_gate_weight.float()
-            if norm_weight is not None:
-                dnw_gate = (d_x_hat_gate * x_norm).sum(dim=0).to(norm_weight.dtype)
-                dnw = dnw + dnw_gate if dnw is not None else dnw_gate
-                d_x_norm_gate = d_x_hat_gate * norm_weight.float()[None, :]
-            else:
-                d_x_norm_gate = d_x_hat_gate
-            row_inner = (d_x_norm_gate * x_norm).mean(dim=-1, keepdim=True)
-            dx_gate = rms_inv[:, None] * (d_x_norm_gate - x_norm * row_inner)
-            dx = dx + dx_gate.to(dx.dtype)
-            if ctx.has_value_lookup:
-                assert ve_ids is not None and ve_weight is not None
-                d_ve_weight_accum = torch.zeros(
-                    (ve_weight.shape[0], ctx.n_kv_head * ctx.head_dim),
-                    dtype=torch.float32,
-                    device=ve_weight.device,
-                )
-                VE_DW_BLOCK_M, VE_DW_BLOCK_D = 16, 64
-                _ve_weight_grad_scatter_bwd_kernel[
-                    (
-                        triton.cdiv(M, VE_DW_BLOCK_M),
-                        ctx.n_kv_head,
-                        triton.cdiv(ctx.head_dim, VE_DW_BLOCK_D),
-                    )
-                ](
-                    ve_ids,
-                    d_ve_3d.contiguous(),
-                    d_ve_weight_accum,
-                    M,
-                    ctx.head_dim,
-                    ctx.n_kv_head,
-                    BLOCK_M=VE_DW_BLOCK_M,
-                    BLOCK_D=VE_DW_BLOCK_D,
-                    num_warps=4,
-                )
-                d_ve_weight = d_ve_weight_accum.to(ve_weight.dtype).view_as(ve_weight)
-            else:
-                d_ve = d_ve_3d.reshape(ctx.ve_shape)
-        return (
-            dx.reshape(ctx.input_shape),
-            dnw,
-            dqw,
-            dkw,
-            dvw,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            d_ve,
-            d_ve_gate_weight,
-            None,
-            None,
-            d_ve_weight,
-        )
+    else:
+        if ve is None:
+            d_ve = None
+        if ve_gate_weight is None:
+            d_ve_gate_weight = None
+        if ve_weight is None:
+            d_ve_weight = None
+    return (
+        dx,
+        dnw,
+        dqw,
+        dkw,
+        dvw,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        d_ve,
+        d_ve_gate_weight,
+        None,
+        None,
+        d_ve_weight,
+    )
 
 
-def norm_qkv_rotary_projection(
+_norm_qkv_projection_fwd_op.register_autograd(
+    _norm_qkv_projection_autograd_backward,
+    setup_context=_norm_qkv_projection_setup_context,
+)
+
+
+def norm_qkv_projection(
     x: torch.Tensor,
     norm_weight: torch.Tensor | None,
     q_weight: torch.Tensor,
@@ -1434,7 +1686,7 @@ def norm_qkv_rotary_projection(
       Tuple `(q, k, v)` shaped for SDPA: `(B, T, n_head, head_dim)`,
       `(B, T, n_kv_head, head_dim)`, and `(B, T, n_kv_head, head_dim)`.
     """
-    return NormQKVRotaryProjection.apply(
+    q, k, v, _rms_inv = _norm_qkv_projection_fwd_op(
         x,
         norm_weight,
         q_weight,
@@ -1453,3 +1705,54 @@ def norm_qkv_rotary_projection(
         ve_ids,
         ve_weight,
     )
+    return q, k, v
+
+
+def norm_qkv_rotary_projection(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float = 1.2,
+    eps: float = 1e-6,
+    ve: torch.Tensor | None = None,
+    ve_gate_weight: torch.Tensor | None = None,
+    ve_gate_channels: int = 12,
+    ve_ids: torch.Tensor | None = None,
+    ve_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward-compatible alias for `norm_qkv_projection`."""
+    return norm_qkv_projection(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        scale,
+        eps,
+        ve,
+        ve_gate_weight,
+        ve_gate_channels,
+        ve_ids,
+        ve_weight,
+    )
+
+
+class NormQKVProjection:
+    """Compatibility namespace around the `nanoops::norm_qkv_projection_fwd` custom op.
+
+    New code should call `norm_qkv_projection` directly.
+    """
+
+    apply = staticmethod(norm_qkv_projection)
