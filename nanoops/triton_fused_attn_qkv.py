@@ -275,6 +275,111 @@ def _rotary_table_T(
     )
 
 
+def _norm_qkv_rotary_projection_manual_backward(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    d_q: torch.Tensor,
+    d_k: torch.Tensor,
+    d_v: torch.Tensor,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    scale: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-form PyTorch backward for `NormQKVRotaryProjection`.
+
+    This helper implements the fp32 algebra used by the autograd.Function today
+    and serves as scaffolding for a future Triton backward kernel. Rotary
+    cos/sin are treated as constants; the returned gradients are for x,
+    norm_weight, and qkv_weight.
+
+    Forward math:
+      s_x        = rsqrt(mean(x^2) + eps)
+      x_norm     = x * s_x
+      x_hat      = x_norm * norm_weight
+      z          = x_hat @ qkv_weight.T
+      q0, k0, v0 = split(z)
+
+      r_lo = lo * cos + hi * sin
+      r_hi = -lo * sin + hi * cos
+      y    = scale * rmsnorm(concat(r_lo, r_hi))
+
+    Backward math:
+      rmsnorm_no_weight_bwd(r, g):
+        y0 = r * s
+        dr = s * (g - y0 * mean(g * y0))
+
+      rotary_bwd:
+        d_lo = d_r_lo * cos - d_r_hi * sin
+        d_hi = d_r_lo * sin + d_r_hi * cos
+
+      linear_bwd:
+        d_x_hat = d_z @ qkv_weight
+        dW      = d_z.T @ x_hat
+
+      outer RMSNorm bwd:
+        d_x = s_x * (d_x_norm - x_norm * mean(d_x_norm * x_norm))
+    """
+    M, _ = x.shape
+    half = head_dim // 2
+    cos_flat = _flatten_rotary_table(cos, M, head_dim).float()
+    sin_flat = _flatten_rotary_table(sin, M, head_dim).float()
+    cos_b = cos_flat[:, None, :]
+    sin_b = sin_flat[:, None, :]
+
+    x_f = x.float()
+    norm_w_f = norm_weight.float()
+    qkv_w_f = qkv_weight.float()
+    x_rms_inv = torch.rsqrt((x_f * x_f).mean(dim=-1, keepdim=True) + eps)
+    x_norm = x_f * x_rms_inv
+    x_hat = x_norm * norm_w_f
+
+    qkv = x_hat @ qkv_w_f.t()
+    q_flat, k_flat, _ = qkv.split(
+        [n_head * head_dim, n_kv_head * head_dim, n_kv_head * head_dim],
+        dim=-1,
+    )
+    q0 = q_flat.view(M, n_head, head_dim).float()
+    k0 = k_flat.view(M, n_kv_head, head_dim).float()
+
+    def _qk_bwd(qk: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
+        lo = qk[..., :half]
+        hi = qk[..., half:]
+        rot_lo = lo * cos_b + hi * sin_b
+        rot_hi = -lo * sin_b + hi * cos_b
+        rotated = torch.cat([rot_lo, rot_hi], dim=-1)
+
+        rms_inv = torch.rsqrt((rotated * rotated).mean(dim=-1, keepdim=True) + eps)
+        y0 = rotated * rms_inv
+        g_eff = grad_out.contiguous().float() * scale
+        inner = (g_eff * y0).mean(dim=-1, keepdim=True)
+        d_rot = rms_inv * (g_eff - y0 * inner)
+
+        d_rot_lo = d_rot[..., :half]
+        d_rot_hi = d_rot[..., half:]
+        d_lo = d_rot_lo * cos_b - d_rot_hi * sin_b
+        d_hi = d_rot_lo * sin_b + d_rot_hi * cos_b
+        return torch.cat([d_lo, d_hi], dim=-1)
+
+    d_q0 = _qk_bwd(q0, d_q).reshape(M, n_head * head_dim)
+    d_k0 = _qk_bwd(k0, d_k).reshape(M, n_kv_head * head_dim)
+    d_v0 = d_v.contiguous().reshape(M, n_kv_head * head_dim).float()
+    d_z = torch.cat([d_q0, d_k0, d_v0], dim=-1)
+
+    d_x_hat = d_z @ qkv_w_f
+    d_qkv_weight = d_z.t() @ x_hat
+
+    d_norm_weight = torch.sum(d_x_hat * x_norm, dim=0)
+    d_x_norm = d_x_hat * norm_w_f
+    inner = (d_x_norm * x_norm).mean(dim=-1, keepdim=True)
+    d_x = x_rms_inv * (d_x_norm - x_norm * inner)
+    return d_x.to(x.dtype), d_norm_weight.to(norm_weight.dtype), d_qkv_weight.to(qkv_weight.dtype)
+
+
 class NormQKVRotaryProjection(torch.autograd.Function):
     """Fused outer RMSNorm + Q/K/V projection with Q/K rotary/QK-norm/scale.
 
@@ -283,9 +388,8 @@ class NormQKVRotaryProjection(torch.autograd.Function):
       k: (M, n_kv_head, head_dim) after rotary + QK RMSNorm + scale.
       v: (M, n_kv_head, head_dim) plain projected values.
 
-    Backward currently recomputes the reference PyTorch graph and uses
-    autograd for gradients. That keeps this experimental forward fusion
-    correct while leaving backward-performance work isolated.
+    Backward currently uses a PyTorch closed-form implementation of the same
+    math as scaffolding for a future Triton backward kernel.
     """
 
     @staticmethod
@@ -391,57 +495,23 @@ class NormQKVRotaryProjection(torch.autograd.Function):
         d_k: torch.Tensor,
         d_v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None, None, None]:
-        """Backprop via recomputation of the reference PyTorch graph."""
+        """Backprop via the closed-form PyTorch formula."""
         x, norm_weight, qkv_weight, cos, sin = ctx.saved_tensors
-        n_head = ctx.n_head
-        n_kv_head = ctx.n_kv_head
-        head_dim = ctx.head_dim
-        scale = ctx.scale
-        eps = ctx.eps
-        half = head_dim // 2
-        M = x.shape[0]
-        cos_flat = _flatten_rotary_table(cos, M, head_dim)
-        sin_flat = _flatten_rotary_table(sin, M, head_dim)
-
-        with torch.enable_grad():
-            x_req = x.detach().requires_grad_(True)
-            nw_req = norm_weight.detach().requires_grad_(True)
-            qw_req = qkv_weight.detach().requires_grad_(True)
-
-            x_rms_inv = torch.rsqrt((x_req.float() ** 2).mean(dim=-1, keepdim=True) + eps)
-            x_hat = x_req * x_rms_inv.to(x_req.dtype) * nw_req
-            qkv = x_hat @ qw_req.t()
-            q_flat, k_flat, v_flat = qkv.split(
-                [n_head * head_dim, n_kv_head * head_dim, n_kv_head * head_dim],
-                dim=-1,
-            )
-            q = q_flat.view(-1, n_head, head_dim)
-            k = k_flat.view(-1, n_kv_head, head_dim)
-            v = v_flat.view(-1, n_kv_head, head_dim)
-
-            cos_b = cos_flat[:, None, :]
-            sin_b = sin_flat[:, None, :]
-
-            def _rot_norm_scale(qk: torch.Tensor) -> torch.Tensor:
-                lo = qk[..., :half]
-                hi = qk[..., half:]
-                rot_lo = lo * cos_b + hi * sin_b
-                rot_hi = -lo * sin_b + hi * cos_b
-                rotated = torch.cat([rot_lo, rot_hi], dim=-1)
-                qk_rms_inv = torch.rsqrt(
-                    (rotated.float() ** 2).mean(dim=-1, keepdim=True) + eps
-                )
-                return rotated * qk_rms_inv.to(rotated.dtype) * scale
-
-            q = _rot_norm_scale(q)
-            k = _rot_norm_scale(k)
-            dx, dnw, dqw = torch.autograd.grad(
-                (q, k, v),
-                (x_req, nw_req, qw_req),
-                (d_q.contiguous(), d_k.contiguous(), d_v.contiguous()),
-                allow_unused=False,
-            )
-
+        dx, dnw, dqw = _norm_qkv_rotary_projection_manual_backward(
+            x,
+            norm_weight,
+            qkv_weight,
+            cos,
+            sin,
+            d_q,
+            d_k,
+            d_v,
+            ctx.n_head,
+            ctx.n_kv_head,
+            ctx.head_dim,
+            ctx.scale,
+            ctx.eps,
+        )
         return dx, dnw, dqw, None, None, None, None, None, None, None
 
 

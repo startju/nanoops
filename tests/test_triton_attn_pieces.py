@@ -9,6 +9,9 @@ triton = pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
+from nanoops.triton_fused_attn_qkv import (
+    _norm_qkv_rotary_projection_manual_backward,
+)
 from nanoops.triton_kernels import (
     norm_qkv_rotary_projection,
     output_proj_residual,
@@ -150,6 +153,51 @@ def test_norm_qkv_rotary_projection_backward():
     torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
 
     for name, ref, got in [("x", x1.grad, x2.grad), ("norm_weight", nw1.grad, nw2.grad), ("qkv_weight", qw1.grad, qw2.grad)]:
+        assert torch.allclose(ref, got, atol=5e-3), \
+            f"{name}.grad max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_manual_backward_formula():
+    torch.manual_seed(0)
+    M, K, n_head, n_kv_head, head_dim = 16, 128, 2, 1, 128
+    n_qkv = (n_head + 2 * n_kv_head) * head_dim
+    x0 = torch.randn(M, K, dtype=torch.float32, device="cuda")
+    nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_qkv, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
+
+    qg = torch.randn(M, n_head, head_dim, dtype=torch.float32, device="cuda")
+    kg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    vg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+
+    x1, nw1, qw1 = (t.clone().requires_grad_() for t in (x0, nw0, qw0))
+    q1, k1, v1 = _norm_qkv_rotary_projection_ref(
+        x1, nw1, qw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+    )
+    torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
+
+    dx, dnw, dqw = _norm_qkv_rotary_projection_manual_backward(
+        x0,
+        nw0,
+        qw0,
+        cos,
+        sin,
+        qg,
+        kg,
+        vg,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+    )
+
+    for name, ref, got in [
+        ("x", x1.grad, dx),
+        ("norm_weight", nw1.grad, dnw),
+        ("qkv_weight", qw1.grad, dqw),
+    ]:
         assert torch.allclose(ref, got, atol=5e-3), \
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
 
