@@ -198,10 +198,11 @@ nanchat d24 训练时各 matmul (M=2048, K=1536, N 不同)：
 
 **这就是 fusion 设计的根源**：独立的 RMSNorm kernel 做 ~4·M·D 字节 HBM
 流量，但算力收益接近 0。把 norm fuse 进邻接的 matmul kernel
-（mlp 走 `fused_mlp_block`，attn 走 `NormQKVRotaryProjection`），让归一化的中间值留在
-register 里，**省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入
-再读）——带宽 bound 的 op 上**纯赚**，没副作用。`fused_add_norm` 在
-block 边界也是一样的道理。
+（mlp 走 `fused_mlp_block`）能让归一化的中间值留在 register 里，
+**省下 4·M·D 字节 HBM 流量**（norm 输出写回 + matmul 输入再读）——带宽
+bound 的 op 上**纯赚**。attn 侧 `NormQKVRotaryProjection` 目前先用共享
+RMSNorm kernel 物化 `x_hat`，再做 Q/K/V projection；这个版本在 d24
+bench 里略快。
 
 **SDPA：为什么 Flash Attention 存在。** 同样的 AI 视角下，SDPA 有
 **两个** AI 数字，取决于 `(L, L)` 的 P 矩阵是否物化到 HBM。
@@ -844,10 +845,10 @@ framework overhead 的地方。
 常数，更长的 kernel 摊薄得多，哪怕 per-element 吞吐不比一串小 kernel
 更高，wall time 上还是赢。
 
-这也是为什么 nanchat 生产路径跳过这个 kernel：`fused_mlp_block`
-和 `NormQKVRotaryProjection` 把 norm 直接 fold 进 matmul kernel，根本不
-存在让这个 `add+norm` fusion 挂上去的 op 边界。这个 kernel 是来
-演示 patterns 的；真正让 patterns 体现价值的，是更大的生产 kernel。
+这也是为什么 nanchat 生产路径大多跳过这个 standalone op-boundary
+kernel：`fused_mlp_block` 把 norm 直接 fold 进自己的 matmul 路径；
+`NormQKVRotaryProjection` 只复用其中的 RMSNorm 物化子 kernel，然后接
+Q/K/V projection。真正让 patterns 体现价值的，是更大的生产 kernel。
 
 ---
 

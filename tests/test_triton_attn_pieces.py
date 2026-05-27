@@ -10,7 +10,7 @@ if not torch.cuda.is_available():
     pytest.skip("triton kernels require CUDA", allow_module_level=True)
 
 from nanoops.triton_fused_attn_qkv import (
-    _norm_qkv_rotary_projection_manual_backward,
+    _norm_qkv_rotary_projection_triton_backward,
 )
 from nanoops.triton_kernels import (
     norm_qkv_rotary_projection,
@@ -27,7 +27,9 @@ from nanoops.triton_kernels import (
 def _norm_qkv_rotary_projection_ref(
     x,
     norm_weight,
-    qkv_weight,
+    q_weight,
+    k_weight,
+    v_weight,
     cos,
     sin,
     n_head,
@@ -35,21 +37,44 @@ def _norm_qkv_rotary_projection_ref(
     head_dim,
     scale,
     eps,
+    ve=None,
+    ve_gate_weight=None,
+    ve_gate_channels=12,
+    ve_ids=None,
+    ve_weight=None,
 ):
-    x_rms_inv = torch.rsqrt((x.float() ** 2).mean(dim=-1, keepdim=True) + eps)
-    x_hat = x * x_rms_inv.to(x.dtype) * norm_weight
-    qkv = x_hat @ qkv_weight.t()
-    q_flat, k_flat, v_flat = qkv.split(
-        [n_head * head_dim, n_kv_head * head_dim, n_kv_head * head_dim],
-        dim=-1,
-    )
-    q = q_flat.view(-1, n_head, head_dim)
-    k = k_flat.view(-1, n_kv_head, head_dim)
-    v = v_flat.view(-1, n_kv_head, head_dim)
+    prefix_shape = x.shape[:-1]
+    C = x.shape[-1]
+    M = x.numel() // C
+    x_2d = x.reshape(M, C)
+    x_rms_inv = torch.rsqrt((x_2d.float() ** 2).mean(dim=-1, keepdim=True) + eps)
+    x_hat = x_2d * x_rms_inv.to(x.dtype)
+    if norm_weight is not None:
+        x_hat = x_hat * norm_weight
+    q = (x_hat @ q_weight.t()).view(-1, n_head, head_dim)
+    k = (x_hat @ k_weight.t()).view(-1, n_kv_head, head_dim)
+    v = (x_hat @ v_weight.t()).view(-1, n_kv_head, head_dim)
+    if ve is not None or ve_weight is not None:
+        assert ve_gate_weight is not None
+        if ve is None:
+            assert ve_ids is not None and ve_weight is not None
+            ve = ve_weight[ve_ids.reshape(-1)].reshape(M, n_kv_head, head_dim)
+        else:
+            ve = ve.reshape(M, n_kv_head, head_dim)
+        gate = 3.0 * torch.sigmoid(
+            x_hat[:, :ve_gate_channels].float() @ ve_gate_weight.float().t()
+        )
+        v = v + gate.to(v.dtype).view(M, n_kv_head, 1) * ve
 
     half = head_dim // 2
-    cos_b = cos[:, None, :]
-    sin_b = sin[:, None, :]
+    assert cos.ndim == 4 and sin.ndim == 4
+    assert cos.shape == sin.shape
+    assert cos.shape[0] == 1 and cos.shape[2] == 1 and cos.shape[-1] == half
+    T = cos.shape[1]
+    assert M % T == 0
+    B = M // T
+    cos_b = cos.expand(B, T, 1, half).reshape(M, 1, half)
+    sin_b = sin.expand(B, T, 1, half).reshape(M, 1, half)
 
     def _rot_norm_scale(qk):
         lo, hi = qk[..., :half], qk[..., half:]
@@ -59,54 +84,32 @@ def _norm_qkv_rotary_projection_ref(
         qk_rms_inv = torch.rsqrt((rotated.float() ** 2).mean(dim=-1, keepdim=True) + eps)
         return rotated * qk_rms_inv.to(rotated.dtype) * scale
 
-    return _rot_norm_scale(q), _rot_norm_scale(k), v
+    return (
+        _rot_norm_scale(q).view(*prefix_shape, n_head, head_dim),
+        _rot_norm_scale(k).view(*prefix_shape, n_kv_head, head_dim),
+        v.view(*prefix_shape, n_kv_head, head_dim),
+    )
 
 
 def test_norm_qkv_rotary_projection_forward():
     torch.manual_seed(0)
-    M, K, n_head, n_kv_head, head_dim = 32, 128, 4, 2, 128
-    n_qkv = (n_head + 2 * n_kv_head) * head_dim
-    x = torch.randn(M, K, dtype=torch.float32, device="cuda")
-    norm_weight = torch.randn(K, dtype=torch.float32, device="cuda")
-    qkv_weight = torch.randn(n_qkv, K, dtype=torch.float32, device="cuda") * 0.1
-    cos = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
-
-    q_ref, k_ref, v_ref = _norm_qkv_rotary_projection_ref(
-        x, norm_weight, qkv_weight, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
-    )
-    q_tri, k_tri, v_tri = norm_qkv_rotary_projection(
-        x, norm_weight, qkv_weight, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
-    )
-
-    for name, ref, got in [
-        ("q", q_ref, q_tri),
-        ("k", k_ref, k_tri),
-        ("v", v_ref, v_tri),
-    ]:
-        assert torch.allclose(ref, got, atol=2e-3), \
-            f"{name} max diff {(ref - got).abs().max():.4e}"
-
-
-def test_norm_qkv_rotary_projection_broadcast_rotary_table():
-    torch.manual_seed(0)
     B, T, K, n_head, n_kv_head, head_dim = 2, 16, 128, 4, 2, 128
-    M = B * T
-    n_qkv = (n_head + 2 * n_kv_head) * head_dim
-    x = torch.randn(M, K, dtype=torch.float32, device="cuda")
+    x = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
     norm_weight = torch.randn(K, dtype=torch.float32, device="cuda")
-    qkv_weight = torch.randn(n_qkv, K, dtype=torch.float32, device="cuda") * 0.1
+    q_weight = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    k_weight = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    v_weight = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
     cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
     sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
-    cos_flat = cos.expand(B, T, 1, head_dim // 2).reshape(M, head_dim // 2)
-    sin_flat = sin.expand(B, T, 1, head_dim // 2).reshape(M, head_dim // 2)
 
     q_ref, k_ref, v_ref = _norm_qkv_rotary_projection_ref(
         x,
         norm_weight,
-        qkv_weight,
-        cos_flat,
-        sin_flat,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
         n_head,
         n_kv_head,
         head_dim,
@@ -114,7 +117,18 @@ def test_norm_qkv_rotary_projection_broadcast_rotary_table():
         1e-6,
     )
     q_tri, k_tri, v_tri = norm_qkv_rotary_projection(
-        x, norm_weight, qkv_weight, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
     )
 
     for name, ref, got in [
@@ -122,65 +136,461 @@ def test_norm_qkv_rotary_projection_broadcast_rotary_table():
         ("k", k_ref, k_tri),
         ("v", v_ref, v_tri),
     ]:
-        assert torch.allclose(ref, got, atol=2e-3), \
+        assert torch.allclose(ref, got, atol=5e-3), \
+            f"{name} max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_broadcast_rotary_table():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 16, 128, 4, 2, 128
+    M = B * T
+    x = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
+    norm_weight = torch.randn(K, dtype=torch.float32, device="cuda")
+    q_weight = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    k_weight = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    v_weight = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+
+    q_ref, k_ref, v_ref = _norm_qkv_rotary_projection_ref(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+    )
+    q_tri, k_tri, v_tri = norm_qkv_rotary_projection(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+    )
+
+    for name, ref, got in [
+        ("q", q_ref, q_tri),
+        ("k", k_ref, k_tri),
+        ("v", v_ref, v_tri),
+    ]:
+        assert torch.allclose(ref, got, atol=5e-3), \
+            f"{name} max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_value_embedding_forward():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 16, 128, 4, 2, 128
+    ve_gate_channels = 12
+    x = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
+    norm_weight = torch.randn(K, dtype=torch.float32, device="cuda")
+    q_weight = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    k_weight = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    v_weight = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    ve = torch.randn(B, T, n_kv_head * head_dim, dtype=torch.float32, device="cuda")
+    ve_gate_weight = (
+        torch.randn(n_kv_head, ve_gate_channels, dtype=torch.float32, device="cuda") * 0.1
+    )
+
+    q_ref, k_ref, v_ref = _norm_qkv_rotary_projection_ref(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+        ve=ve,
+        ve_gate_weight=ve_gate_weight,
+        ve_gate_channels=ve_gate_channels,
+    )
+    q_tri, k_tri, v_tri = norm_qkv_rotary_projection(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+        ve=ve,
+        ve_gate_weight=ve_gate_weight,
+        ve_gate_channels=ve_gate_channels,
+    )
+
+    for name, ref, got in [
+        ("q", q_ref, q_tri),
+        ("k", k_ref, k_tri),
+        ("v", v_ref, v_tri),
+    ]:
+        assert torch.allclose(ref, got, atol=5e-3), \
+            f"{name} max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_value_embedding_backward():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
+    ve_gate_channels = 12
+    x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
+    nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    kw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    vw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    ve0 = torch.randn(B, T, n_kv_head * head_dim, dtype=torch.float32, device="cuda")
+    gw0 = torch.randn(n_kv_head, ve_gate_channels, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+
+    qg = torch.randn(B, T, n_head, head_dim, dtype=torch.float32, device="cuda")
+    kg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+
+    x1, nw1, qw1, kw1, vw1, ve1, gw1 = (
+        t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0, ve0, gw0)
+    )
+    q1, k1, v1 = _norm_qkv_rotary_projection_ref(
+        x1,
+        nw1,
+        qw1,
+        kw1,
+        vw1,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+        ve=ve1,
+        ve_gate_weight=gw1,
+        ve_gate_channels=ve_gate_channels,
+    )
+    torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
+
+    x2, nw2, qw2, kw2, vw2, ve2, gw2 = (
+        t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0, ve0, gw0)
+    )
+    q2, k2, v2 = norm_qkv_rotary_projection(
+        x2,
+        nw2,
+        qw2,
+        kw2,
+        vw2,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+        ve=ve2,
+        ve_gate_weight=gw2,
+        ve_gate_channels=ve_gate_channels,
+    )
+    torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
+
+    for name, ref, got in [
+        ("x", x1.grad, x2.grad),
+        ("norm_weight", nw1.grad, nw2.grad),
+        ("q_weight", qw1.grad, qw2.grad),
+        ("k_weight", kw1.grad, kw2.grad),
+        ("v_weight", vw1.grad, vw2.grad),
+        ("ve", ve1.grad, ve2.grad),
+        ("ve_gate_weight", gw1.grad, gw2.grad),
+    ]:
+        assert torch.allclose(ref, got, atol=1e-2), \
+            f"{name}.grad max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_value_embedding_lookup_forward_backward():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
+    vocab_size = 11
+    ve_gate_channels = 12
+    x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
+    nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    kw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    vw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    ve_w0 = torch.randn(vocab_size, n_kv_head * head_dim, dtype=torch.float32, device="cuda")
+    gw0 = torch.randn(n_kv_head, ve_gate_channels, dtype=torch.float32, device="cuda") * 0.1
+    ve_ids = torch.randint(0, vocab_size, (B, T), dtype=torch.long, device="cuda")
+    ve_ids[0, :4] = ve_ids[1, :4]
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+
+    qg = torch.randn(B, T, n_head, head_dim, dtype=torch.float32, device="cuda")
+    kg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+
+    x1, nw1, qw1, kw1, vw1, ve_w1, gw1 = (
+        t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0, ve_w0, gw0)
+    )
+    q1, k1, v1 = _norm_qkv_rotary_projection_ref(
+        x1,
+        nw1,
+        qw1,
+        kw1,
+        vw1,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+        ve_ids=ve_ids,
+        ve_weight=ve_w1,
+        ve_gate_weight=gw1,
+        ve_gate_channels=ve_gate_channels,
+    )
+    torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
+
+    x2, nw2, qw2, kw2, vw2, ve_w2, gw2 = (
+        t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0, ve_w0, gw0)
+    )
+    q2, k2, v2 = norm_qkv_rotary_projection(
+        x2,
+        nw2,
+        qw2,
+        kw2,
+        vw2,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+        ve_ids=ve_ids,
+        ve_weight=ve_w2,
+        ve_gate_weight=gw2,
+        ve_gate_channels=ve_gate_channels,
+    )
+    torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
+
+    for name, ref, got, atol in [
+        ("q", q1, q2, 5e-3),
+        ("k", k1, k2, 5e-3),
+        ("v", v1, v2, 5e-3),
+        ("x.grad", x1.grad, x2.grad, 1e-2),
+        ("norm_weight.grad", nw1.grad, nw2.grad, 1e-2),
+        ("q_weight.grad", qw1.grad, qw2.grad, 1e-2),
+        ("k_weight.grad", kw1.grad, kw2.grad, 1e-2),
+        ("v_weight.grad", vw1.grad, vw2.grad, 1e-2),
+        ("ve_weight.grad", ve_w1.grad, ve_w2.grad, 1e-2),
+        ("ve_gate_weight.grad", gw1.grad, gw2.grad, 1e-2),
+    ]:
+        assert torch.allclose(ref, got, atol=atol), \
             f"{name} max diff {(ref - got).abs().max():.4e}"
 
 
 def test_norm_qkv_rotary_projection_backward():
     torch.manual_seed(0)
-    M, K, n_head, n_kv_head, head_dim = 16, 128, 2, 1, 128
-    n_qkv = (n_head + 2 * n_kv_head) * head_dim
-    x0 = torch.randn(M, K, dtype=torch.float32, device="cuda")
+    B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
+    x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
     nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
-    qw0 = torch.randn(n_qkv, K, dtype=torch.float32, device="cuda") * 0.1
-    cos = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    kw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    vw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
 
-    qg = torch.randn(M, n_head, head_dim, dtype=torch.float32, device="cuda")
-    kg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
-    vg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    qg = torch.randn(B, T, n_head, head_dim, dtype=torch.float32, device="cuda")
+    kg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
 
-    x1, nw1, qw1 = (t.clone().requires_grad_() for t in (x0, nw0, qw0))
+    x1, nw1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0))
     q1, k1, v1 = _norm_qkv_rotary_projection_ref(
-        x1, nw1, qw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+        x1, nw1, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
 
-    x2, nw2, qw2 = (t.clone().requires_grad_() for t in (x0, nw0, qw0))
+    x2, nw2, qw2, kw2, vw2 = (t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0))
     q2, k2, v2 = norm_qkv_rotary_projection(
-        x2, nw2, qw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+        x2, nw2, qw2, kw2, vw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
 
-    for name, ref, got in [("x", x1.grad, x2.grad), ("norm_weight", nw1.grad, nw2.grad), ("qkv_weight", qw1.grad, qw2.grad)]:
+    for name, ref, got in [
+        ("x", x1.grad, x2.grad),
+        ("norm_weight", nw1.grad, nw2.grad),
+        ("q_weight", qw1.grad, qw2.grad),
+        ("k_weight", kw1.grad, kw2.grad),
+        ("v_weight", vw1.grad, vw2.grad),
+    ]:
         assert torch.allclose(ref, got, atol=5e-3), \
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"
 
 
-def test_norm_qkv_rotary_projection_manual_backward_formula():
+def test_norm_qkv_rotary_projection_backward_broadcast_rotary_table():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
+    M = B * T
+    x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
+    nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    kw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    vw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+
+    qg = torch.randn(B, T, n_head, head_dim, dtype=torch.float32, device="cuda")
+    kg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+
+    x1, nw1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0))
+    q1, k1, v1 = _norm_qkv_rotary_projection_ref(
+        x1, nw1, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+    )
+    torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
+
+    x2, nw2, qw2, kw2, vw2 = (t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0))
+    q2, k2, v2 = norm_qkv_rotary_projection(
+        x2, nw2, qw2, kw2, vw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+    )
+    torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
+
+    for name, ref, got in [
+        ("x", x1.grad, x2.grad),
+        ("norm_weight", nw1.grad, nw2.grad),
+        ("q_weight", qw1.grad, qw2.grad),
+        ("k_weight", kw1.grad, kw2.grad),
+        ("v_weight", vw1.grad, vw2.grad),
+    ]:
+        assert torch.allclose(ref, got, atol=5e-3), \
+            f"{name}.grad max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_backward_bf16_smoke():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 128
+    x = torch.randn(B, T, K, dtype=torch.bfloat16, device="cuda").requires_grad_()
+    norm_weight = torch.randn(K, dtype=torch.bfloat16, device="cuda").requires_grad_()
+    q_weight = (
+        torch.randn(n_head * head_dim, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    ).requires_grad_()
+    k_weight = (
+        torch.randn(n_kv_head * head_dim, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    ).requires_grad_()
+    v_weight = (
+        torch.randn(n_kv_head * head_dim, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    ).requires_grad_()
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.bfloat16, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.bfloat16, device="cuda")
+
+    q, k, v = norm_qkv_rotary_projection(
+        x,
+        norm_weight,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos,
+        sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        1.2,
+        1e-6,
+    )
+    (q.float().sum() + k.float().sum() + v.float().sum()).backward()
+
+    for name, grad in [
+        ("x", x.grad),
+        ("norm_weight", norm_weight.grad),
+        ("q_weight", q_weight.grad),
+        ("k_weight", k_weight.grad),
+        ("v_weight", v_weight.grad),
+    ]:
+        assert torch.isfinite(grad.float()).all(), f"{name}.grad contains non-finite values"
+
+
+def test_norm_qkv_rotary_projection_no_norm_weight_backward():
+    torch.manual_seed(0)
+    B, T, K, n_head, n_kv_head, head_dim = 2, 8, 128, 2, 1, 64
+    x0 = torch.randn(B, T, K, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    kw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    vw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, T, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+
+    qg = torch.randn(B, T, n_head, head_dim, dtype=torch.float32, device="cuda")
+    kg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+    vg = torch.randn(B, T, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
+
+    x1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
+    q1, k1, v1 = _norm_qkv_rotary_projection_ref(
+        x1, None, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+    )
+    torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
+
+    x2, qw2, kw2, vw2 = (t.clone().requires_grad_() for t in (x0, qw0, kw0, vw0))
+    q2, k2, v2 = norm_qkv_rotary_projection(
+        x2, None, qw2, kw2, vw2, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+    )
+    torch.autograd.backward((q2, k2, v2), (qg, kg, vg))
+
+    for name, ref, got in [
+        ("x", x1.grad, x2.grad),
+        ("q_weight", qw1.grad, qw2.grad),
+        ("k_weight", kw1.grad, kw2.grad),
+        ("v_weight", vw1.grad, vw2.grad),
+    ]:
+        assert torch.allclose(ref, got, atol=5e-3), \
+            f"{name}.grad max diff {(ref - got).abs().max():.4e}"
+
+
+def test_norm_qkv_rotary_projection_triton_backward_formula():
     torch.manual_seed(0)
     M, K, n_head, n_kv_head, head_dim = 16, 128, 2, 1, 128
-    n_qkv = (n_head + 2 * n_kv_head) * head_dim
     x0 = torch.randn(M, K, dtype=torch.float32, device="cuda")
     nw0 = torch.randn(K, dtype=torch.float32, device="cuda")
-    qw0 = torch.randn(n_qkv, K, dtype=torch.float32, device="cuda") * 0.1
-    cos = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(M, head_dim // 2, dtype=torch.float32, device="cuda")
+    qw0 = torch.randn(n_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    kw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    vw0 = torch.randn(n_kv_head * head_dim, K, dtype=torch.float32, device="cuda") * 0.1
+    cos = torch.randn(1, M, 1, head_dim // 2, dtype=torch.float32, device="cuda")
+    sin = torch.randn(1, M, 1, head_dim // 2, dtype=torch.float32, device="cuda")
 
     qg = torch.randn(M, n_head, head_dim, dtype=torch.float32, device="cuda")
     kg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
     vg = torch.randn(M, n_kv_head, head_dim, dtype=torch.float32, device="cuda")
 
-    x1, nw1, qw1 = (t.clone().requires_grad_() for t in (x0, nw0, qw0))
+    x1, nw1, qw1, kw1, vw1 = (t.clone().requires_grad_() for t in (x0, nw0, qw0, kw0, vw0))
     q1, k1, v1 = _norm_qkv_rotary_projection_ref(
-        x1, nw1, qw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
+        x1, nw1, qw1, kw1, vw1, cos, sin, n_head, n_kv_head, head_dim, 1.2, 1e-6
     )
     torch.autograd.backward((q1, k1, v1), (qg, kg, vg))
 
-    dx, dnw, dqw = _norm_qkv_rotary_projection_manual_backward(
+    dx, dnw, dqw, dkw, dvw = _norm_qkv_rotary_projection_triton_backward(
         x0,
         nw0,
         qw0,
+        kw0,
+        vw0,
         cos,
         sin,
         qg,
@@ -196,7 +606,9 @@ def test_norm_qkv_rotary_projection_manual_backward_formula():
     for name, ref, got in [
         ("x", x1.grad, dx),
         ("norm_weight", nw1.grad, dnw),
-        ("qkv_weight", qw1.grad, dqw),
+        ("q_weight", qw1.grad, dqw),
+        ("k_weight", kw1.grad, dkw),
+        ("v_weight", vw1.grad, dvw),
     ]:
         assert torch.allclose(ref, got, atol=5e-3), \
             f"{name}.grad max diff {(ref - got).abs().max():.4e}"

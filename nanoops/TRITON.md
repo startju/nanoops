@@ -220,11 +220,13 @@ Summary table (training-shape scale):
 
 **Why this motivates the fusion stack:** standalone RMSNorm kernel
 does ~4·M·D bytes of HBM traffic for ~0 compute return. Fusing norm
-into the adjacent matmul kernel (`fused_mlp_block` on the mlp side,
-`NormQKVRotaryProjection` on the attn side) keeps the normalized intermediate in registers,
-saving **4·M·D bytes** of HBM traffic (norm output write + matmul
-input re-read) — pure bandwidth win on a bandwidth-bound op, no
-downside. Same idea for fused_add_norm at block boundaries.
+into the adjacent matmul kernel (`fused_mlp_block` on the mlp side)
+keeps the normalized intermediate in registers, saving **4·M·D bytes**
+of HBM traffic (norm output write + matmul input re-read) — pure
+bandwidth win on a bandwidth-bound op. The attn-side
+`NormQKVRotaryProjection` currently materializes `x_hat` with the shared
+RMSNorm kernel before Q/K/V projection because that benchmarks slightly
+faster at d24.
 
 **SDPA: why Flash Attention exists.** Same AI lens shows the SDPA
 case has *two* numbers depending on whether the `(L, L)` P matrix
@@ -907,12 +909,11 @@ are constant per-op overhead, so longer kernels win on amortization
 even if their per-element throughput isn't faster than a chain of
 small kernels.
 
-That's also why nanchat's production path skips this kernel:
-`fused_mlp_block` and `NormQKVRotaryProjection` fold the norm directly
-into the matmul kernel, so there's no standalone op-boundary call
-that this `add+norm` fusion could attach to. This kernel exists to
-demonstrate the patterns; the bigger production kernels are where
-the patterns pay off.
+That's also why nanchat's production path mostly skips this standalone
+op-boundary kernel: `fused_mlp_block` folds norm directly into its
+matmul path, and `NormQKVRotaryProjection` reuses only the RMSNorm
+materialization sub-kernel before its Q/K/V projection. The bigger
+production kernels are where these patterns pay off.
 
 ---
 
