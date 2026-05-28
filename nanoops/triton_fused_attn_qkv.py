@@ -956,7 +956,16 @@ def _norm_qkv_projection_backward(
         q or k = scale * y0
 
       Saved for custom-op backward:
-        s_x as rms_inv, s_qk as qk_rms_inv, and final q/k outputs.
+        x, optional norm/VE tensors, q/k/v weights, and cos/sin are saved from
+        the forward inputs. The forward outputs used only by backward are:
+          rms_inv     = s_x                         # (M,), fp32
+          q, k        = final scaled Q/K outputs    # x.dtype
+          qk_rms_inv  = s_qk per Q/K head           # (M, n_head+n_kv_head)
+
+        Not saved: x_hat, q0, k0, v, q/k rotary pre-norm intermediates, or dz.
+        Backward recomputes x_hat from saved x and rms_inv, recovers Q/K
+        pre-projection grads from saved final q/k plus qk_rms_inv, and computes
+        d_z conceptually without materializing it.
 
     Backward math:
       Q/K RMSNorm backward receives g_y = d_q or d_k:
@@ -1836,9 +1845,16 @@ def _norm_qkv_projection_setup_context(
       q_weight (n_head*head_dim,K), k_weight/v_weight (n_kv_head*head_dim,K),
       cos/sin (1,T,1,head_dim/2), n_head, n_kv_head, head_dim, scale, eps.
 
-    `output` is `(q, k, v, rms_inv, qk_rms_inv)`. `rms_inv` is the fp32
-    `(B*T,)` outer RMSNorm inverse. `q`/`k` plus the fp32 per-head
-    `qk_rms_inv` let the bf16/fp16 backward avoid Q/K projection recompute.
+    Saved tensors are:
+      - forward inputs needed for recompute: x, optional norm/VE tensors,
+        q/k/v weights, and cos/sin;
+      - forward outputs needed only by backward: rms_inv, final q/k, qk_rms_inv.
+
+    `x` is saved because backward recomputes `x_hat = RMSNorm(x)` instead of
+    storing it. `v` is not saved: V backward uses `grad_v` and `v_weight`, and
+    VE backward recomputes its gate/lookup terms. `rms_inv` is the fp32 `(B*T,)`
+    outer RMSNorm inverse; `q`/`k` plus the fp32 per-head `qk_rms_inv` let the
+    bf16/fp16 backward avoid Q/K projection recompute.
     """
     (
         x,
