@@ -941,9 +941,10 @@ def _norm_qkv_projection_backward(
         z  = concat(q0, k0, v) conceptually; it is not materialized here.
 
       Optional value embedding:
-        x_g       = x_hat[:, :ve_gate_channels]
-        gate      = 3 * sigmoid(x_g @ ve_gate_weight.T)
-        v        += gate[..., None] * ve_weight[ve_ids]
+        x_g       = x_hat[:, :ve_gate_channels]            # (M, ch)
+        gate      = 3 * sigmoid(x_g @ ve_gate_weight.T)    # (M, n_kv_head)
+        ve        = ve_weight[ve_ids].view(M, n_kv_head, head_dim)
+        v        += gate[..., None] * ve
 
       Q/K rotary + QK RMSNorm + scale:
         lo, hi = split(q0 or k0)
@@ -984,11 +985,14 @@ def _norm_qkv_projection_backward(
 
       Optional value-embedding backward, accumulated before outer RMSNorm
       backward because the gate also consumes x_hat:
-        d_gate              = sum_d(d_v * ve_weight[ve_ids])
+        x_g                 = x_hat[:, :ve_gate_channels]
+        ve                  = ve_weight[ve_ids].view(M, n_kv_head, head_dim)
+        d_gate              = sum_d(d_v * ve)
         d_gate_logits       = 3 * d_gate * sigmoid * (1 - sigmoid)
-        d_x_hat[:, :ch]    += d_gate_logits @ ve_gate_weight
-        d_ve_weight[token] += d_v * gate
-        d_ve_gate_weight   += d_gate_logits.T @ x_g
+        d_x_g               = d_gate_logits @ ve_gate_weight
+        d_x_hat[:, :ve_gate_channels] += d_x_g
+        d_ve_weight[token]  += d_v * gate
+        d_ve_gate_weight    += d_gate_logits.T @ x_g
 
       Outer RMSNorm backward:
         if norm_weight is not None:
