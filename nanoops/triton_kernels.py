@@ -57,13 +57,11 @@ from .triton_fused_attn_output import (
     value_gate,
 )
 from .triton_fused_attn_qkv import (
-    NormQKVProjection,
     _norm_qkv_projection_bwd_impl,
     _norm_qkv_projection_bwd_op,
     _norm_qkv_projection_fwd_impl,
     _norm_qkv_projection_fwd_op,
     norm_qkv_projection,
-    norm_qkv_rotary_projection,
 )
 from .triton_fused_attn_sdpa import (
     FlashSDPA,
