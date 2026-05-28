@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
 
 from nanoops.triton_fused_attn_qkv import (
     _norm_qkv_projection_fwd_op,
-    _norm_qkv_projection_backward,
+    _norm_qkv_projection_bwd_impl,
 )
 from nanoops.triton_kernels import (
     norm_qkv_projection,
@@ -488,36 +488,41 @@ def test_norm_qkv_projection_backward_formula():
     (
         dx,
         d_norm_weight,
+        d_ve_weight,
+        d_ve_gate_weight,
         d_q_weight,
         d_k_weight,
         d_v_weight,
-        d_ve_weight,
-        d_ve_gate_weight,
-    ) = _norm_qkv_projection_backward(
-        x0,
+    ) = _norm_qkv_projection_bwd_impl(
+        qg.view(1, M, n_head, head_dim),
+        kg.view(1, M, n_kv_head, head_dim),
+        vg.view(1, M, n_kv_head, head_dim),
+        x0.view(1, M, K),
         nw0,
+        None,
+        None,
+        1,
+        None,
         qw0,
         kw0,
         vw0,
         cos,
         sin,
-        qg,
-        kg,
-        vg,
+        rms_inv,
+        q_saved,
+        k_saved,
+        qk_rms_inv,
         n_head,
         n_kv_head,
         head_dim,
         1.2,
-        saved_rms_inv=rms_inv,
-        saved_q=q_saved.view(M, n_head, head_dim),
-        saved_k=k_saved.view(M, n_kv_head, head_dim),
-        saved_qk_rms_inv=qk_rms_inv.view(M, n_head + n_kv_head),
+        1e-6,
     )
     assert d_ve_weight is None
     assert d_ve_gate_weight is None
 
     for name, ref, got in [
-        ("x", x1.grad, dx),
+        ("x", x1.grad, dx.view(M, K)),
         ("norm_weight", nw1.grad, d_norm_weight),
         ("q_weight", qw1.grad, d_q_weight),
         ("k_weight", kw1.grad, d_k_weight),

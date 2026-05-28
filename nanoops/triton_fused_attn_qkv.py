@@ -48,7 +48,7 @@ except ImportError:
 if _HAS_TRITON:
 
     @triton.jit
-    def _qkv_projection_rotary_fwd_kernel(
+    def _qkv_projection_fwd_kernel(
         x_ptr,  # (M, K), dtype=x.dtype — in: materialized outer RMSNorm output
         q_w_ptr,  # (n_head * D, K), dtype=q_weight.dtype — in: Q projection weight
         k_w_ptr,  # (n_kv_head * D, K), dtype=k_weight.dtype — in: K projection weight
@@ -221,7 +221,7 @@ if _HAS_TRITON:
             tl.store(k_ptrs, qk.to(k_ptr.dtype.element_ty), mask=row_mask[:, None])
 
     @triton.jit
-    def _qkv_dx_hat_inner_ve_bwd_kernel(
+    def _qkv_dx_hat_outer_rms_row_inner_ve_bwd_kernel(
         q_ptr,  # (M, n_head, D), dtype=x.dtype — in: final Q output
         k_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in: final K output
         qk_rms_inv_ptr,  # (M, n_head + n_kv_head), fp32 — in
@@ -236,7 +236,7 @@ if _HAS_TRITON:
         q_w_ptr,  # (n_head * D, K) — in
         k_w_ptr,  # (n_kv_head * D, K) — in
         v_w_ptr,  # (n_kv_head * D, K) — in
-        dx_hat_ptr,  # (M, K) fp32 — out/in-out when VE adds gate grad
+        dx_hat_ptr,  # (M, K), dtype=x.dtype — out: materialized d_x_hat
         x_ptr,  # (M, K) — in: original forward input
         rms_inv_ptr,  # (M,) fp32 — in: outer RMSNorm inverse
         norm_w_ptr,  # (K,) — in when HAS_NORM_WEIGHT
@@ -266,7 +266,7 @@ if _HAS_TRITON:
         Q/K slices are recovered from saved final Q/K plus saved QK RMS inverse.
 
         Grid: (ceil(M / BLOCK_M), ceil(K / BLOCK_K)).
-          - writes one (M, K) d_x_hat tile;
+          - writes one (M, K) d_x_hat tile materialized in x.dtype;
           - atomic-adds this K tile's outer RMSNorm row-inner contribution;
           - when VE is enabled, also computes value-embedding lookup/gate
             backward. VE table/gate-weight grads are only emitted by pid_k==0
@@ -288,26 +288,20 @@ if _HAS_TRITON:
             out_base = q_ptr + rows[:, None] * N_HEAD * D + head * D
             grad_base = d_q_ptr + rows[:, None] * N_HEAD * D + head * D
 
-            y0_lo = tl.load(
-                out_base + half_cols[None, :],
+            y0 = tl.load(
+                out_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             ).to(tl.float32) * inv_scale
-            y0_hi = tl.load(
-                out_base + (half_cols[None, :] + BLOCK_D // 2),
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32) * inv_scale
-            g_lo = tl.load(
-                grad_base + half_cols[None, :],
+            g = tl.load(
+                grad_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             ).to(tl.float32) * scale
-            g_hi = tl.load(
-                grad_base + (half_cols[None, :] + BLOCK_D // 2),
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32) * scale
+            y0_halves = tl.reshape(y0, (BLOCK_M, 2, BLOCK_D // 2))
+            g_halves = tl.reshape(g, (BLOCK_M, 2, BLOCK_D // 2))
+            y0_lo, y0_hi = tl.split(tl.trans(y0_halves, 0, 2, 1))
+            g_lo, g_hi = tl.split(tl.trans(g_halves, 0, 2, 1))
             qk_rms_inv = tl.load(
                 qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + head,
                 mask=row_mask,
@@ -331,45 +325,34 @@ if _HAS_TRITON:
             ).to(tl.float32)
             d_pre_lo = d_rot_lo * cos - d_rot_hi * sin
             d_pre_hi = d_rot_lo * sin + d_rot_hi * cos
-
-            w_lo = tl.load(
-                q_w_ptr + (head * D + half_cols)[:, None] * K + ks[None, :],
+            d_pre_pair = tl.join(d_pre_lo, d_pre_hi)
+            d_pre_halves = tl.trans(d_pre_pair, 0, 2, 1)
+            d_pre = tl.reshape(d_pre_halves, (BLOCK_M, BLOCK_D))
+            w = tl.load(
+                q_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
                 mask=k_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
-            w_hi = tl.load(
-                q_w_ptr
-                + (head * D + half_cols + BLOCK_D // 2)[:, None] * K
-                + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            dx_hat_tile += tl.dot(d_pre_lo, w_lo) + tl.dot(d_pre_hi, w_hi)
+            dx_hat_tile += tl.dot(d_pre, w)
 
         for head in range(0, N_KV_HEAD):
             out_base = k_ptr + rows[:, None] * N_KV_HEAD * D + head * D
             grad_base = d_k_ptr + rows[:, None] * N_KV_HEAD * D + head * D
 
-            y0_lo = tl.load(
-                out_base + half_cols[None, :],
+            y0 = tl.load(
+                out_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             ).to(tl.float32) * inv_scale
-            y0_hi = tl.load(
-                out_base + (half_cols[None, :] + BLOCK_D // 2),
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32) * inv_scale
-            g_lo = tl.load(
-                grad_base + half_cols[None, :],
+            g = tl.load(
+                grad_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
             ).to(tl.float32) * scale
-            g_hi = tl.load(
-                grad_base + (half_cols[None, :] + BLOCK_D // 2),
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32) * scale
+            y0_halves = tl.reshape(y0, (BLOCK_M, 2, BLOCK_D // 2))
+            g_halves = tl.reshape(g, (BLOCK_M, 2, BLOCK_D // 2))
+            y0_lo, y0_hi = tl.split(tl.trans(y0_halves, 0, 2, 1))
+            g_lo, g_hi = tl.split(tl.trans(g_halves, 0, 2, 1))
             qk_rms_inv = tl.load(
                 qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + N_HEAD + head,
                 mask=row_mask,
@@ -393,20 +376,15 @@ if _HAS_TRITON:
             ).to(tl.float32)
             d_pre_lo = d_rot_lo * cos - d_rot_hi * sin
             d_pre_hi = d_rot_lo * sin + d_rot_hi * cos
-
-            w_lo = tl.load(
-                k_w_ptr + (head * D + half_cols)[:, None] * K + ks[None, :],
+            d_pre_pair = tl.join(d_pre_lo, d_pre_hi)
+            d_pre_halves = tl.trans(d_pre_pair, 0, 2, 1)
+            d_pre = tl.reshape(d_pre_halves, (BLOCK_M, BLOCK_D))
+            w = tl.load(
+                k_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
                 mask=k_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
-            w_hi = tl.load(
-                k_w_ptr
-                + (head * D + half_cols + BLOCK_D // 2)[:, None] * K
-                + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            dx_hat_tile += tl.dot(d_pre_lo, w_lo) + tl.dot(d_pre_hi, w_hi)
+            dx_hat_tile += tl.dot(d_pre, w)
 
         for head in range(0, N_KV_HEAD):
             d_v = tl.load(
@@ -421,11 +399,6 @@ if _HAS_TRITON:
             ).to(tl.float32)
             dx_hat_tile += tl.dot(d_v, w)
 
-        tl.store(
-            dx_hat_ptr + rows[:, None] * K + ks[None, :],
-            dx_hat_tile,
-            mask=row_mask[:, None] & k_mask[None, :],
-        )
         x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
         x = tl.load(
             x_ptr + rows[:, None] * K + ks[None, :],
@@ -435,18 +408,6 @@ if _HAS_TRITON:
         x_norm = x * x_rms_inv[:, None]
         if HAS_NORM_WEIGHT:
             nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
-            d_x_norm_tile = dx_hat_tile * nw[None, :]
-        else:
-            d_x_norm_tile = dx_hat_tile
-        outer_rms_row_inner_partial = (
-            tl.sum(d_x_norm_tile * x_norm, axis=1, dtype=tl.float32) / K
-        )
-        tl.atomic_add(
-            outer_rms_row_inner_ptr + rows,
-            outer_rms_row_inner_partial,
-            sem="relaxed",
-            mask=row_mask,
-        )
 
         if HAS_VALUE_EMBEDDING:
             if pid_k * BLOCK_K < VE_GATE_CH:
@@ -536,32 +497,35 @@ if _HAS_TRITON:
                         other=0.0,
                     ).to(tl.float32)
                     d_x_hat_ve_tile = d_gate_logits[:, None] * gate_w_tile[None, :]
-                    tl.atomic_add(
-                        dx_hat_ptr + rows[:, None] * K + ks[None, :],
+                    dx_hat_tile += tl.where(
+                        tile_gate_mask[None, :],
                         d_x_hat_ve_tile,
-                        sem="relaxed",
-                        mask=row_mask[:, None] & tile_gate_mask[None, :],
-                    )
-                    if HAS_NORM_WEIGHT:
-                        ve_outer_rms_row_inner_partial = tl.sum(
-                            d_x_hat_ve_tile * nw[None, :] * x_norm,
-                            axis=1,
-                            dtype=tl.float32,
-                        ) / K
-                    else:
-                        ve_outer_rms_row_inner_partial = (
-                            tl.sum(d_x_hat_ve_tile * x_norm, axis=1, dtype=tl.float32)
-                            / K
-                        )
-                    tl.atomic_add(
-                        outer_rms_row_inner_ptr + rows,
-                        ve_outer_rms_row_inner_partial,
-                        sem="relaxed",
-                        mask=row_mask,
+                        0.0,
                     )
 
+        dx_hat_store = dx_hat_tile.to(dx_hat_ptr.dtype.element_ty)
+        tl.store(
+            dx_hat_ptr + rows[:, None] * K + ks[None, :],
+            dx_hat_store,
+            mask=row_mask[:, None] & k_mask[None, :],
+        )
+        dx_hat_for_inner = dx_hat_store.to(tl.float32)
+        if HAS_NORM_WEIGHT:
+            d_x_norm_tile = dx_hat_for_inner * nw[None, :]
+        else:
+            d_x_norm_tile = dx_hat_for_inner
+        outer_rms_row_inner_partial = (
+            tl.sum(d_x_norm_tile * x_norm, axis=1, dtype=tl.float32) / K
+        )
+        tl.atomic_add(
+            outer_rms_row_inner_ptr + rows,
+            outer_rms_row_inner_partial,
+            sem="relaxed",
+            mask=row_mask,
+        )
+
     @triton.jit
-    def _qkv_weight_grad_from_saved_qk_bwd_kernel(
+    def _qkv_weight_grad_bwd_kernel(
         q_ptr,  # (M, n_head, D), dtype=x.dtype — in: final Q output
         k_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in: final K output
         qk_rms_inv_ptr,  # (M, n_head + n_kv_head), fp32 — in
@@ -736,7 +700,7 @@ if _HAS_TRITON:
         x_ptr,  # (M, K) — in
         rms_inv_ptr,  # (M,) fp32 — in
         norm_w_ptr,  # (K,) — in
-        dx_hat_ptr,  # (M, K) fp32 — in
+        dx_hat_ptr,  # (M, K), dtype=x.dtype — in: materialized d_x_hat
         outer_rms_row_inner_ptr,  # (M,) fp32 — in
         dx_ptr,  # (M, K) — out
         M,  # int
@@ -788,7 +752,7 @@ if _HAS_TRITON:
     def _outer_rms_norm_weight_grad_bwd_kernel(
         x_ptr,  # (M, K) — in
         rms_inv_ptr,  # (M,) fp32 — in
-        dx_hat_ptr,  # (M, K) fp32 — in
+        dx_hat_ptr,  # (M, K), dtype=x.dtype — in
         d_norm_w_ptr,  # (K,) — out
         M,  # int
         K,  # int
@@ -848,85 +812,86 @@ def _validate_rotary_table_4d(
     )
 
 
-def _norm_qkv_projection_backward(
+def _norm_qkv_projection_bwd_impl(
+    d_q: torch.Tensor,
+    d_k: torch.Tensor,
+    d_v: torch.Tensor,
     x: torch.Tensor,
     norm_weight: torch.Tensor | None,
+    ve_ids: torch.Tensor | None,
+    ve_weight: torch.Tensor | None,
+    ve_gate_channels: int,
+    ve_gate_weight: torch.Tensor | None,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     v_weight: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    d_q: torch.Tensor,
-    d_k: torch.Tensor,
-    d_v: torch.Tensor,
+    rms_inv: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    qk_rms_inv: torch.Tensor,
     n_head: int,
     n_kv_head: int,
     head_dim: int,
     scale: float,
-    saved_rms_inv: torch.Tensor | None = None,
-    saved_q: torch.Tensor | None = None,
-    saved_k: torch.Tensor | None = None,
-    saved_qk_rms_inv: torch.Tensor | None = None,
-    ve_ids: torch.Tensor | None = None,
-    ve_weight: torch.Tensor | None = None,
-    ve_gate_channels: int = 1,
-    ve_gate_weight: torch.Tensor | None = None,
+    eps: float,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor | None,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
     torch.Tensor | None,
     torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
-    """Closed-form backward for `norm_qkv_projection`.
+    """Backward implementation for `nanoops::norm_qkv_projection_bwd`.
 
-    This helper launches Triton kernels for the fp32 algebra used by the
+    This function launches Triton kernels for the fp32 algebra used by the
     custom-op autograd callback. Rotary cos/sin are treated as constants.
-    Q/K RMSNorm backward uses `saved_q`/`saved_k`/`saved_qk_rms_inv` from the
-    forward custom op, recovering `y0 = q_or_k / scale` without recomputing
-    Q/K projection outputs. The return shape is fixed so callers do not need a
-    separate VE/no-VE dispatch path; VE gradients are None when VE is disabled.
-    Tensor inputs are expected to be CUDA contiguous tensors; M is B*T after
-    flattening the batch and sequence dimensions.
+    Q/K RMSNorm backward uses saved `q`/`k`/`qk_rms_inv` from the forward
+    custom op, recovering `y0 = q_or_k / scale` without recomputing Q/K
+    projection outputs. Optional VE gradients are None when VE is disabled.
+    Tensor inputs are expected to be CUDA contiguous tensors.
 
     Args:
-      x: (M, K), dtype=x.dtype, original forward input.
+      d_q: (B, T, n_head, head_dim), CUDA, grad of q output.
+      d_k: (B, T, n_kv_head, head_dim), CUDA, grad of k output.
+      d_v: (B, T, n_kv_head, head_dim), CUDA, grad of v output.
+      x: (B, T, K), dtype=x.dtype, original forward input.
       norm_weight: optional (K,), dtype=norm_weight.dtype, outer RMSNorm scale.
         nanochat normally passes None; this affine path is kept for compatibility
         and tests, not as the primary optimized path.
+      ve_ids: optional (B, T), CUDA integer token ids.
+      ve_weight: optional (vocab, n_kv_head * head_dim), value embedding table.
+      ve_gate_channels: int, leading normalized input channels used by the VE gate.
+      ve_gate_weight: optional (n_kv_head, ve_gate_channels), gate weight.
       q_weight: (n_head * head_dim, K), dtype=q_weight.dtype, Q projection weight.
       k_weight: (n_kv_head * head_dim, K), dtype=k_weight.dtype, K projection weight.
       v_weight: (n_kv_head * head_dim, K), dtype=v_weight.dtype, V projection weight.
       cos: (1, T, 1, head_dim/2), rotary cosine table.
       sin: (1, T, 1, head_dim/2), rotary sine table.
-      d_q: (M, n_head, head_dim), grad of final Q output.
-      d_k: (M, n_kv_head, head_dim), grad of final K output.
-      d_v: (M, n_kv_head, head_dim), grad of final V output.
+      rms_inv: (B*T,), fp32 outer RMSNorm inverse from forward.
+      q: (B, T, n_head, head_dim), dtype=x.dtype, final Q output.
+      k: (B, T, n_kv_head, head_dim), dtype=x.dtype, final K output.
+      qk_rms_inv: (B, T, n_head + n_kv_head), fp32 Q/K RMS inverse.
       n_head: int, number of query heads.
       n_kv_head: int, number of key/value heads.
       head_dim: int, per-head width; must be even.
       scale: float, post-Q/K RMSNorm scalar multiplier.
-      saved_rms_inv: required (M,), fp32 outer RMSNorm inverse from forward.
-      saved_q: required (M, n_head, head_dim), dtype=x.dtype, final Q output.
-      saved_k: required (M, n_kv_head, head_dim), dtype=x.dtype, final K output.
-      saved_qk_rms_inv: required (M, n_head + n_kv_head), fp32 Q/K RMS inverse.
-      ve_ids: optional (M,) CUDA integer token ids.
-      ve_weight: optional (vocab, n_kv_head * head_dim), value embedding table.
-      ve_gate_channels: int, leading normalized input channels used by the VE gate.
-      ve_gate_weight: optional (n_kv_head, ve_gate_channels), gate weight.
+      eps: float, kept to mirror the forward custom-op signature; saved
+        inverses already include epsilon.
 
     Returns:
-      dx: (M, K), dtype=x.dtype.
+      dx: (B, T, K), dtype=x.dtype.
       d_norm_weight: optional (K,), dtype=norm_weight.dtype. Present only for
         the non-primary affine norm path.
-      d_q_weight: (n_head * head_dim, K), dtype=q_weight.dtype.
-      d_k_weight: (n_kv_head * head_dim, K), dtype=k_weight.dtype.
-      d_v_weight: (n_kv_head * head_dim, K), dtype=v_weight.dtype.
       d_ve_weight: optional (vocab, n_kv_head * head_dim), dtype=ve_weight.dtype.
       d_ve_gate_weight: optional (n_kv_head, ve_gate_channels),
         dtype=ve_gate_weight.dtype.
+      d_q_weight: (n_head * head_dim, K), dtype=q_weight.dtype.
+      d_k_weight: (n_kv_head * head_dim, K), dtype=k_weight.dtype.
+      d_v_weight: (n_kv_head * head_dim, K), dtype=v_weight.dtype.
 
     Forward math:
       Outer RMSNorm:
@@ -988,9 +953,9 @@ def _norm_qkv_projection_backward(
         dW_v    = d_v.T @ x_hat
 
       In code, `d_z` is not stored. The dx_hat kernel recomputes each
-      Q/K/V slice, writes d_x_hat, and accumulates the outer RMSNorm inner
-      contribution directly; one fused dW kernel recomputes the same slices
-      and writes q/k/v weight gradients.
+      Q/K/V slice, materializes d_x_hat in x.dtype, and accumulates the
+      outer RMSNorm inner contribution from that materialized value; one fused
+      dW kernel recomputes the same slices and writes q/k/v weight gradients.
 
       Optional value-embedding backward, accumulated before outer RMSNorm
       backward because the gate also consumes x_hat:
@@ -1013,10 +978,13 @@ def _norm_qkv_projection_backward(
     """
     if not _HAS_TRITON:
         raise RuntimeError("norm_qkv_projection backward requires triton")
-    assert x.is_cuda and x.is_contiguous()
+    assert x.is_cuda and x.is_contiguous() and x.ndim == 3
     assert q_weight.is_cuda and k_weight.is_cuda and v_weight.is_cuda
+    B, T, K = x.shape
+    M = B * T
+    x_flat = x.view(M, K)
     has_norm_weight = norm_weight is not None
-    norm_weight_or_x = norm_weight if has_norm_weight else x
+    norm_weight_or_x = norm_weight if has_norm_weight else x_flat
     assert norm_weight_or_x.is_cuda
     assert (
         norm_weight_or_x.is_contiguous()
@@ -1026,19 +994,23 @@ def _norm_qkv_projection_backward(
     )
     assert head_dim % 2 == 0
 
-    d_q = d_q.contiguous()
-    d_k = d_k.contiguous()
-    d_v = d_v.contiguous()
-    M, K = x.shape
+    d_q = d_q.contiguous().reshape(M, n_head, head_dim)
+    d_k = d_k.contiguous().reshape(M, n_kv_head, head_dim)
+    d_v = d_v.contiguous().reshape(M, n_kv_head, head_dim)
+    saved_q = q.view(M, n_head, head_dim)
+    saved_k = k.view(M, n_kv_head, head_dim)
+    saved_qk_rms_inv = qk_rms_inv.view(M, n_head + n_kv_head)
     q_n = n_head * head_dim
     kv_n = n_kv_head * head_dim
+    assert q.shape == (B, T, n_head, head_dim)
+    assert k.shape == (B, T, n_kv_head, head_dim)
+    assert qk_rms_inv.shape == (B, T, n_head + n_kv_head)
     assert d_q.shape == (M, n_head, head_dim)
     assert d_k.shape == (M, n_kv_head, head_dim)
     assert d_v.shape == (M, n_kv_head, head_dim)
     assert q_weight.shape == (q_n, K)
     assert k_weight.shape == (kv_n, K)
     assert v_weight.shape == (kv_n, K)
-    assert saved_q is not None and saved_k is not None and saved_qk_rms_inv is not None
     assert saved_q.is_cuda and saved_k.is_cuda and saved_qk_rms_inv.is_cuda
     assert saved_q.is_contiguous() and saved_k.is_contiguous()
     assert saved_qk_rms_inv.is_contiguous()
@@ -1064,13 +1036,11 @@ def _norm_qkv_projection_backward(
         f"M={M} is not divisible by rotary T={rotary_seq_len}"
     )
 
-    assert saved_rms_inv is not None
-    assert saved_rms_inv.is_cuda and saved_rms_inv.is_contiguous()
-    assert saved_rms_inv.shape == (M,) and saved_rms_inv.dtype == torch.float32
-    rms_inv = saved_rms_inv
-    dx_hat = torch.empty((M, K), dtype=torch.float32, device=x.device)
+    assert rms_inv.is_cuda and rms_inv.is_contiguous()
+    assert rms_inv.shape == (M,) and rms_inv.dtype == torch.float32
+    dx_hat = torch.empty_like(x_flat)
     outer_rms_row_inner = torch.zeros((M,), dtype=torch.float32, device=x.device)
-    dx = torch.empty_like(x)
+    dx = torch.empty_like(x_flat)
     d_norm_weight = torch.empty_like(norm_weight) if has_norm_weight else None
     d_q_weight = torch.empty_like(q_weight)
     d_k_weight = torch.empty_like(k_weight)
@@ -1080,32 +1050,26 @@ def _norm_qkv_projection_backward(
 
     if has_value_embedding:
         assert ve_ids is not None and ve_weight is not None and ve_gate_weight is not None
-        ve_ids_kernel = ve_ids.reshape(M).contiguous()
-        ve_weight_kernel = ve_weight
-        ve_gate_weight_kernel = ve_gate_weight
-        d_ve_weight_accum = torch.zeros(
-            (ve_weight.shape[0], kv_n),
-            dtype=torch.float32,
-            device=ve_weight.device,
-        )
-        d_ve_gate_weight_accum = torch.zeros(
-            (n_kv_head, ve_gate_channels),
-            dtype=torch.float32,
-            device=ve_gate_weight.device,
-        )
+        ve_ids_for_kernel = ve_ids.reshape(M).contiguous()
+        ve_weight_for_kernel = ve_weight
+        ve_gate_weight_for_kernel = ve_gate_weight
+        d_ve_weight = torch.zeros_like(ve_weight)
+        d_ve_gate_weight = torch.zeros_like(ve_gate_weight)
+        d_ve_weight_for_kernel = d_ve_weight
+        d_ve_gate_weight_for_kernel = d_ve_gate_weight
     else:
-        ve_ids_kernel = x
-        ve_weight_kernel = x
-        ve_gate_weight_kernel = x
-        d_ve_weight_accum = x
-        d_ve_gate_weight_accum = x
+        ve_ids_for_kernel = x_flat
+        ve_weight_for_kernel = x_flat
+        ve_gate_weight_for_kernel = x_flat
+        d_ve_weight_for_kernel = x_flat
+        d_ve_gate_weight_for_kernel = x_flat
 
-    RMS_BLOCK_M, RMS_BLOCK_K = 32, 32
-    MM_BLOCK_M, MM_BLOCK_K = 16, 32
-    DW_BLOCK_N, DW_BLOCK_K, DW_BLOCK_M = 32, 32, 32
+    DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 16, 32
+    OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 32, 32
+    WEIGHT_GRAD_BLOCK_N, WEIGHT_GRAD_BLOCK_K, WEIGHT_GRAD_BLOCK_M = 32, 32, 32
 
-    _qkv_dx_hat_inner_ve_bwd_kernel[
-        (triton.cdiv(M, MM_BLOCK_M), triton.cdiv(K, MM_BLOCK_K))
+    _qkv_dx_hat_outer_rms_row_inner_ve_bwd_kernel[
+        (triton.cdiv(M, DX_HAT_BLOCK_M), triton.cdiv(K, DX_HAT_BLOCK_K))
     ](
         saved_q,
         saved_k,
@@ -1115,27 +1079,27 @@ def _norm_qkv_projection_backward(
         d_q,
         d_k,
         d_v,
-        ve_ids_kernel,
-        ve_weight_kernel,
-        ve_gate_weight_kernel,
+        ve_ids_for_kernel,
+        ve_weight_for_kernel,
+        ve_gate_weight_for_kernel,
         q_weight,
         k_weight,
         v_weight,
         dx_hat,
-        x,
+        x_flat,
         rms_inv,
         norm_weight_or_x,
         outer_rms_row_inner,
-        d_ve_weight_accum,
-        d_ve_gate_weight_accum,
+        d_ve_weight_for_kernel,
+        d_ve_gate_weight_for_kernel,
         M,
         K,
         head_dim,
         rotary_seq_len,
         scale,
         1.0 / scale,
-        BLOCK_M=MM_BLOCK_M,
-        BLOCK_K=MM_BLOCK_K,
+        BLOCK_M=DX_HAT_BLOCK_M,
+        BLOCK_K=DX_HAT_BLOCK_K,
         BLOCK_D=head_dim,
         N_HEAD=n_head,
         N_KV_HEAD=n_kv_head,
@@ -1146,13 +1110,10 @@ def _norm_qkv_projection_backward(
         num_warps=4,
         num_stages=3,
     )
-    if has_value_embedding:
-        d_ve_weight = d_ve_weight_accum.to(ve_weight.dtype).view_as(ve_weight)
-        d_ve_gate_weight = d_ve_gate_weight_accum.to(ve_gate_weight.dtype)
     _outer_rms_dx_from_dx_hat_bwd_kernel[
-        (triton.cdiv(M, RMS_BLOCK_M), triton.cdiv(K, RMS_BLOCK_K))
+        (triton.cdiv(M, OUTER_RMS_BLOCK_M), triton.cdiv(K, OUTER_RMS_BLOCK_K))
     ](
-        x,
+        x_flat,
         rms_inv,
         norm_weight_or_x,
         dx_hat,
@@ -1160,28 +1121,30 @@ def _norm_qkv_projection_backward(
         dx,
         M,
         K,
-        BLOCK_M=RMS_BLOCK_M,
-        BLOCK_K=RMS_BLOCK_K,
+        BLOCK_M=OUTER_RMS_BLOCK_M,
+        BLOCK_K=OUTER_RMS_BLOCK_K,
         HAS_NORM_WEIGHT=has_norm_weight,
         num_warps=4,
     )
     if has_norm_weight:
-        _outer_rms_norm_weight_grad_bwd_kernel[(triton.cdiv(K, RMS_BLOCK_K),)](
-            x,
+        _outer_rms_norm_weight_grad_bwd_kernel[
+            (triton.cdiv(K, OUTER_RMS_BLOCK_K),)
+        ](
+            x_flat,
             rms_inv,
             dx_hat,
             d_norm_weight,
             M,
             K,
-            BLOCK_M=RMS_BLOCK_M,
-            BLOCK_K=RMS_BLOCK_K,
+            BLOCK_M=OUTER_RMS_BLOCK_M,
+            BLOCK_K=OUTER_RMS_BLOCK_K,
             num_warps=4,
         )
-    _qkv_weight_grad_from_saved_qk_bwd_kernel[
+    _qkv_weight_grad_bwd_kernel[
         (
             n_head + 2 * n_kv_head,
-            triton.cdiv(head_dim, DW_BLOCK_N),
-            triton.cdiv(K, DW_BLOCK_K),
+            triton.cdiv(head_dim, WEIGHT_GRAD_BLOCK_N),
+            triton.cdiv(K, WEIGHT_GRAD_BLOCK_K),
         )
     ](
         saved_q,
@@ -1192,7 +1155,7 @@ def _norm_qkv_projection_backward(
         d_q,
         d_k,
         d_v,
-        x,
+        x_flat,
         rms_inv,
         norm_weight_or_x,
         d_q_weight,
@@ -1206,22 +1169,22 @@ def _norm_qkv_projection_backward(
         rotary_seq_len,
         scale,
         1.0 / scale,
-        BLOCK_N=DW_BLOCK_N,
-        BLOCK_K=DW_BLOCK_K,
-        BLOCK_M=DW_BLOCK_M,
+        BLOCK_N=WEIGHT_GRAD_BLOCK_N,
+        BLOCK_K=WEIGHT_GRAD_BLOCK_K,
+        BLOCK_M=WEIGHT_GRAD_BLOCK_M,
         BLOCK_D=head_dim,
         HAS_NORM_WEIGHT=has_norm_weight,
         num_warps=4,
         num_stages=3,
     )
     return (
-        dx,
+        dx.reshape_as(x),
         d_norm_weight,
+        d_ve_weight,
+        d_ve_gate_weight,
         d_q_weight,
         d_k_weight,
         d_v_weight,
-        d_ve_weight,
-        d_ve_gate_weight,
     )
 
 
@@ -1373,7 +1336,7 @@ def _norm_qkv_projection_fwd_impl(
     )
 
     grid = (triton.cdiv(M, QKV_BLOCK_M), n_head + 2 * n_kv_head)
-    _qkv_projection_rotary_fwd_kernel[grid](
+    _qkv_projection_fwd_kernel[grid](
         x_hat,
         q_weight,
         k_weight,
@@ -1405,136 +1368,6 @@ def _norm_qkv_projection_fwd_impl(
         num_stages=2,
     )
     return q, k, v, rms_inv, qk_rms_inv
-
-
-def _norm_qkv_projection_bwd_impl(
-    d_q: torch.Tensor,
-    d_k: torch.Tensor,
-    d_v: torch.Tensor,
-    x: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    ve_ids: torch.Tensor | None,
-    ve_weight: torch.Tensor | None,
-    ve_gate_channels: int,
-    ve_gate_weight: torch.Tensor | None,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    v_weight: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    rms_inv: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    qk_rms_inv: torch.Tensor,
-    n_head: int,
-    n_kv_head: int,
-    head_dim: int,
-    scale: float,
-    eps: float,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Backward implementation for `nanoops::norm_qkv_projection_bwd`.
-
-    The optional value-embedding backward is handled inside the Triton
-    backward helper: its d_x_hat contribution is accumulated before the
-    shared outer RMSNorm backward, so dx and d_norm_weight include both the
-    Q/K/V projection path and the VE gate path.
-
-    Args:
-      d_q: (B, T, n_head, head_dim), CUDA, grad of q output.
-      d_k: (B, T, n_kv_head, head_dim), CUDA, grad of k output.
-      d_v: (B, T, n_kv_head, head_dim), CUDA, grad of v output.
-      x: (B, T, K), CUDA, contiguous original forward input.
-      norm_weight: optional (K,), CUDA, contiguous RMSNorm scale. nanochat
-        normally uses None, so this affine branch is not the primary optimized
-        path.
-      ve_ids: optional (B, T), CUDA integer token ids for VE lookup.
-      ve_weight: optional (vocab, n_kv_head * head_dim), CUDA value embedding.
-      ve_gate_channels: int, number of gated leading channels.
-      ve_gate_weight: optional (n_kv_head, ve_gate_channels), CUDA gate weight.
-      q_weight: (n_head * head_dim, K), CUDA query projection weight.
-      k_weight: (n_kv_head * head_dim, K), CUDA key projection weight.
-      v_weight: (n_kv_head * head_dim, K), CUDA value projection weight.
-      cos: (1, T, 1, head_dim/2), CUDA rotary cosine table.
-      sin: (1, T, 1, head_dim/2), CUDA rotary sine table.
-      rms_inv: (B*T,), fp32 outer RMSNorm inverse saved from forward.
-      q: (B, T, n_head, head_dim), CUDA forward Q output.
-      k: (B, T, n_kv_head, head_dim), CUDA forward K output.
-      qk_rms_inv: (B, T, n_head + n_kv_head), fp32 hidden per-head Q/K
-        RMS inverse.
-      n_head: int, number of query heads.
-      n_kv_head: int, number of key/value heads.
-      head_dim: int, per-head width.
-      scale: float, post-Q/K RMSNorm scale.
-      eps: float, kept to mirror the forward custom-op signature; saved
-        inverses already include epsilon.
-
-    Returns:
-      dx: same shape/dtype as x.
-      d_norm_weight: same shape/dtype as norm_weight, or None.
-      d_ve_weight: same shape/dtype as ve_weight, or None.
-      d_ve_gate_weight: same shape/dtype as ve_gate_weight, or None.
-      d_q_weight: same shape/dtype as q_weight.
-      d_k_weight: same shape/dtype as k_weight.
-      d_v_weight: same shape/dtype as v_weight.
-    """
-    assert x.ndim == 3
-    B, T, K = x.shape
-    M = B * T
-    x_2d = x.view(M, K)
-    d_q_2d = d_q.reshape(M, n_head, head_dim)
-    d_k_2d = d_k.reshape(M, n_kv_head, head_dim)
-    d_v_2d = d_v.reshape(M, n_kv_head, head_dim)
-    (
-        dx,
-        d_norm_weight,
-        d_q_weight,
-        d_k_weight,
-        d_v_weight,
-        d_ve_weight,
-        d_ve_gate_weight,
-    ) = (
-        _norm_qkv_projection_backward(
-            x_2d,
-            norm_weight,
-            q_weight,
-            k_weight,
-            v_weight,
-            cos,
-            sin,
-            d_q_2d,
-            d_k_2d,
-            d_v_2d,
-            n_head,
-            n_kv_head,
-            head_dim,
-            scale,
-            saved_rms_inv=rms_inv,
-            saved_q=q.view(M, n_head, head_dim),
-            saved_k=k.view(M, n_kv_head, head_dim),
-            saved_qk_rms_inv=qk_rms_inv.view(M, n_head + n_kv_head),
-            ve_ids=ve_ids,
-            ve_weight=ve_weight,
-            ve_gate_channels=ve_gate_channels,
-            ve_gate_weight=ve_gate_weight,
-        )
-    )
-    return (
-        dx.reshape_as(x),
-        d_norm_weight,
-        d_ve_weight,
-        d_ve_gate_weight,
-        d_q_weight,
-        d_k_weight,
-        d_v_weight,
-    )
 
 
 @torch.library.custom_op(
