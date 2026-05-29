@@ -376,18 +376,12 @@ if _HAS_TRITON:
         )
         x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
         x_norm = (x * x_rms_inv[:, None]).to(x_ptr.dtype.element_ty)
-        if HAS_NORM_WEIGHT:
-            nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
 
         if HAS_VALUE_EMBEDDING:
-            gate_cols = tl.arange(0, VE_GATE_BLOCK)
-            gate_mask = gate_cols < VE_GATE_CH
-            tile_gate_mask = ks < VE_GATE_CH
-            token_ids = tl.zeros((BLOCK_M,), dtype=tl.int64)
-            x_hat_gate = tl.zeros((BLOCK_M, VE_GATE_BLOCK), dtype=tl.float32).to(
-                x_ptr.dtype.element_ty
-            )
             if pid_k * BLOCK_K < VE_GATE_CH:
+                gate_cols = tl.arange(0, VE_GATE_BLOCK)
+                gate_mask = gate_cols < VE_GATE_CH
+                tile_gate_mask = ks < VE_GATE_CH
                 token_ids = tl.load(ve_ids_ptr + rows, mask=row_mask, other=0)
                 x_gate = tl.load(
                     x_ptr + rows[:, None] * K + gate_cols[None, :],
@@ -407,21 +401,22 @@ if _HAS_TRITON:
                 else:
                     x_hat_gate = x_norm_gate.to(x_ptr.dtype.element_ty)
 
-        for head in range(0, N_KV_HEAD):
-            d_v = tl.load(
-                d_v_ptr + rows[:, None] * N_KV_HEAD * D + head * D + cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(x_ptr.dtype.element_ty)
-            w = tl.load(
-                v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(x_ptr.dtype.element_ty)
-            dx_hat_tile += tl.dot(d_v, w)
+                for head in range(0, N_KV_HEAD):
+                    d_v = tl.load(
+                        d_v_ptr
+                        + rows[:, None] * N_KV_HEAD * D
+                        + head * D
+                        + cols[None, :],
+                        mask=row_mask[:, None],
+                        other=0.0,
+                    ).to(x_ptr.dtype.element_ty)
+                    w = tl.load(
+                        v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
+                        mask=k_mask[None, :],
+                        other=0.0,
+                    ).to(x_ptr.dtype.element_ty)
+                    dx_hat_tile += tl.dot(d_v, w)
 
-            if HAS_VALUE_EMBEDDING:
-                if pid_k * BLOCK_K < VE_GATE_CH:
                     gate_w = tl.load(
                         ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
                         mask=gate_mask,
@@ -480,6 +475,35 @@ if _HAS_TRITON:
                         d_x_hat_ve_tile,
                         0.0,
                     )
+            else:
+                for head in range(0, N_KV_HEAD):
+                    d_v = tl.load(
+                        d_v_ptr
+                        + rows[:, None] * N_KV_HEAD * D
+                        + head * D
+                        + cols[None, :],
+                        mask=row_mask[:, None],
+                        other=0.0,
+                    ).to(x_ptr.dtype.element_ty)
+                    w = tl.load(
+                        v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
+                        mask=k_mask[None, :],
+                        other=0.0,
+                    ).to(x_ptr.dtype.element_ty)
+                    dx_hat_tile += tl.dot(d_v, w)
+        else:
+            for head in range(0, N_KV_HEAD):
+                d_v = tl.load(
+                    d_v_ptr + rows[:, None] * N_KV_HEAD * D + head * D + cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
+                ).to(x_ptr.dtype.element_ty)
+                w = tl.load(
+                    v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
+                    mask=k_mask[None, :],
+                    other=0.0,
+                ).to(x_ptr.dtype.element_ty)
+                dx_hat_tile += tl.dot(d_v, w)
 
         dx_hat_store = dx_hat_tile.to(dx_hat_ptr.dtype.element_ty)
         tl.store(
@@ -487,11 +511,11 @@ if _HAS_TRITON:
             dx_hat_store,
             mask=row_mask[:, None] & k_mask[None, :],
         )
-        dx_hat_for_inner = dx_hat_store.to(tl.float32)
         if HAS_NORM_WEIGHT:
-            d_x_norm_tile = dx_hat_for_inner * nw[None, :]
+            nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0)
+            d_x_norm_tile = dx_hat_store * nw[None, :]
         else:
-            d_x_norm_tile = dx_hat_for_inner
+            d_x_norm_tile = dx_hat_store
         outer_rms_row_inner_partial = (
             tl.sum(d_x_norm_tile * x_norm, axis=1, dtype=tl.float32) / K
         )
@@ -1042,7 +1066,7 @@ def _norm_qkv_projection_bwd_impl(
         d_ve_weight_for_kernel = x_flat
         d_ve_gate_weight_for_kernel = x_flat
 
-    DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 16, 32
+    DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 32, 128
     OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 32, 32
     WEIGHT_GRAD_BLOCK_N, WEIGHT_GRAD_BLOCK_K, WEIGHT_GRAD_BLOCK_M = 32, 32, 32
 
@@ -1086,7 +1110,7 @@ def _norm_qkv_projection_bwd_impl(
         VE_GATE_CH=ve_gate_channels,
         VE_GATE_BLOCK=triton.next_power_of_2(ve_gate_channels),
         num_warps=4,
-        num_stages=3,
+        num_stages=1,
     )
     _outer_rms_dx_from_dx_hat_bwd_kernel[
         (triton.cdiv(M, OUTER_RMS_BLOCK_M), triton.cdiv(K, OUTER_RMS_BLOCK_K))
