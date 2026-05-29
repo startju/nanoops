@@ -30,7 +30,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────
 # Fused RMSNorm + QKV projection (the first half of CausalSelfAttention).
 #
-# nanchat's attention forward looks like:
+# nanochat's attention forward looks like:
 #     x_norm = norm(x)                       (RMSNorm at Block level)
 #     q = c_q(x_norm); k = c_k(x_norm); v = c_v(x_norm)        ← FUSED HERE
 #     q, k = apply_rotary(q, k, cos_sin)
@@ -118,11 +118,10 @@ if _HAS_TRITON:
 
             if is_q:
                 w_ptrs = q_w_ptr + weight_rows[:, None] * K + ks[None, :]
+            elif is_k:
+                w_ptrs = k_w_ptr + weight_rows[:, None] * K + ks[None, :]
             else:
-                if is_k:
-                    w_ptrs = k_w_ptr + weight_rows[:, None] * K + ks[None, :]
-                else:
-                    w_ptrs = v_w_ptr + weight_rows[:, None] * K + ks[None, :]
+                w_ptrs = v_w_ptr + weight_rows[:, None] * K + ks[None, :]
             w = tl.load(w_ptrs, mask=k_mask[None, :], other=0.0).to(x_ptr.dtype.element_ty)
             acc += tl.dot(x, tl.trans(w))
 
@@ -227,7 +226,7 @@ if _HAS_TRITON:
     #   4. compute Q/K/V projection weight gradients from the materialized grads.
 
     @triton.jit
-    def _qk_pre_grad_ve_bwd_kernel(
+    def _qk_proj_grad_ve_bwd_kernel(
         q_ptr,  # (M, n_head, D), dtype=x.dtype — in: final Q output
         k_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in: final K output
         qk_rms_inv_ptr,  # (M, n_head + n_kv_head), fp32 — in
@@ -420,7 +419,7 @@ if _HAS_TRITON:
             )
 
     @triton.jit
-    def _qkv_dx_hat_from_pre_outer_rms_row_inner_bwd_kernel(
+    def _qkv_dx_hat_from_proj_grad_bwd_kernel(
         d_q_pre_ptr,  # (M, n_head, D), dtype=x.dtype — in
         d_k_pre_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in
         d_v_ptr,  # (M, n_kv_head, D) — in
@@ -550,7 +549,7 @@ if _HAS_TRITON:
         )
 
     @triton.jit
-    def _qkv_weight_grad_from_pre_bwd_kernel(
+    def _qkv_weight_grad_from_proj_grad_bwd_kernel(
         d_q_pre_ptr,  # (M, n_head, D), dtype=x.dtype — in
         d_k_pre_ptr,  # (M, n_kv_head, D), dtype=x.dtype — in
         d_v_ptr,  # (M, n_kv_head, D) — in
@@ -592,15 +591,15 @@ if _HAS_TRITON:
         for m_start in range(0, M, BLOCK_M):
             rows = m_start + tl.arange(0, BLOCK_M)
             row_mask = rows < M
-            x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+            x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
             x = tl.load(
                 x_ptr + rows[:, None] * K + ks[None, :],
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
             )
-            x_norm = x.to(tl.float32) * x_rms_inv[:, None]
+            x_norm = x * x_rms_inv[:, None]
             if HAS_NORM_WEIGHT:
-                nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+                nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0)
                 x_hat = (x_norm * nw[None, :]).to(x_ptr.dtype.element_ty)
             else:
                 x_hat = x_norm.to(x_ptr.dtype.element_ty)
@@ -610,48 +609,46 @@ if _HAS_TRITON:
                     d_v_ptr + rows[:, None] * n_kv_head * D + head * D + ns[None, :],
                     mask=row_mask[:, None] & n_mask[None, :],
                     other=0.0,
-                ).to(x_ptr.dtype.element_ty)
+                )
+            elif is_q:
+                d_part = tl.load(
+                    d_q_pre_ptr
+                    + rows[:, None] * n_head * D
+                    + head * D
+                    + ns[None, :],
+                    mask=row_mask[:, None] & n_mask[None, :],
+                    other=0.0,
+                )
             else:
-                if is_q:
-                    d_part = tl.load(
-                        d_q_pre_ptr
-                        + rows[:, None] * n_head * D
-                        + head * D
-                        + ns[None, :],
-                        mask=row_mask[:, None] & n_mask[None, :],
-                        other=0.0,
-                    ).to(x_ptr.dtype.element_ty)
-                else:
-                    d_part = tl.load(
-                        d_k_pre_ptr
-                        + rows[:, None] * n_kv_head * D
-                        + head * D
-                        + ns[None, :],
-                        mask=row_mask[:, None] & n_mask[None, :],
-                        other=0.0,
-                    ).to(x_ptr.dtype.element_ty)
+                d_part = tl.load(
+                    d_k_pre_ptr
+                    + rows[:, None] * n_kv_head * D
+                    + head * D
+                    + ns[None, :],
+                    mask=row_mask[:, None] & n_mask[None, :],
+                    other=0.0,
+                )
 
             d_weight_tile += tl.dot(tl.trans(d_part), x_hat)
 
         if is_q:
             tl.store(
                 d_q_w_ptr + (head * D + ns)[:, None] * K + ks[None, :],
-                d_weight_tile.to(d_q_w_ptr.dtype.element_ty),
+                d_weight_tile,
+                mask=n_mask[:, None] & k_mask[None, :],
+            )
+        elif is_k:
+            tl.store(
+                d_k_w_ptr + (head * D + ns)[:, None] * K + ks[None, :],
+                d_weight_tile,
                 mask=n_mask[:, None] & k_mask[None, :],
             )
         else:
-            if is_k:
-                tl.store(
-                    d_k_w_ptr + (head * D + ns)[:, None] * K + ks[None, :],
-                    d_weight_tile.to(d_k_w_ptr.dtype.element_ty),
-                    mask=n_mask[:, None] & k_mask[None, :],
-                )
-            else:
-                tl.store(
-                    d_v_w_ptr + (head * D + ns)[:, None] * K + ks[None, :],
-                    d_weight_tile.to(d_v_w_ptr.dtype.element_ty),
-                    mask=n_mask[:, None] & k_mask[None, :],
-                )
+            tl.store(
+                d_v_w_ptr + (head * D + ns)[:, None] * K + ks[None, :],
+                d_weight_tile,
+                mask=n_mask[:, None] & k_mask[None, :],
+            )
 
     @triton.jit
     def _outer_rms_dx_from_dx_hat_bwd_kernel(
@@ -675,25 +672,25 @@ if _HAS_TRITON:
         row_mask = rows < M
         k_mask = ks < K
 
-        x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+        x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
         outer_rms_row_inner = tl.load(
             outer_rms_row_inner_ptr + rows,
             mask=row_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
         x = tl.load(
             x_ptr + rows[:, None] * K + ks[None, :],
             mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
+        )
         dx_hat = tl.load(
             dx_hat_ptr + rows[:, None] * K + ks[None, :],
             mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
+        )
         x_norm = x * x_rms_inv[:, None]
         if HAS_NORM_WEIGHT:
-            nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+            nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0)
             d_x_norm = dx_hat * nw[None, :]
         else:
             d_x_norm = dx_hat
@@ -730,17 +727,17 @@ if _HAS_TRITON:
         for m_start in range(0, M, BLOCK_M):
             rows = m_start + tl.arange(0, BLOCK_M)
             row_mask = rows < M
-            x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+            x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
             x = tl.load(
                 x_ptr + rows[:, None] * K + ks[None, :],
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             dx_hat = tl.load(
                 dx_hat_ptr + rows[:, None] * K + ks[None, :],
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             d_norm_weight_tile += tl.sum(dx_hat * x * x_rms_inv[:, None], axis=0)
 
         tl.store(
@@ -887,7 +884,7 @@ def _norm_qkv_projection_bwd_impl(
 
         Not saved: x_hat, q0, k0, v, q/k rotary pre-norm intermediates, or dz.
         Backward recomputes x_hat from saved x and rms_inv, materializes Q/K
-        pre-projection grads from saved final q/k plus qk_rms_inv, and computes
+        projection-output grads from saved final q/k plus qk_rms_inv, and computes
         d_z conceptually without storing the full concatenated buffer.
 
     Backward math:
@@ -910,7 +907,7 @@ def _norm_qkv_projection_bwd_impl(
         dW_k    = d_k0.T @ x_hat
         dW_v    = d_v.T @ x_hat
 
-      In code, `d_z` is not stored. A Q/K/V-part pre kernel materializes
+      In code, `d_z` is not stored. A Q/K/V-part grad kernel materializes
       d_q0/d_k0 in x.dtype for the Q/K parts; when VE is enabled, its V parts
       also compute VE table/gate gradients and a small
       d_x_hat[:, :ve_gate_channels] contribution buffer. The dx_hat kernel
@@ -919,7 +916,7 @@ def _norm_qkv_projection_bwd_impl(
       accumulates the outer RMSNorm inner contribution from that materialized
       value.
 
-      Optional value-embedding backward, computed in the V parts of the pre
+      Optional value-embedding backward, computed in the V parts of the grad
       kernel before outer RMSNorm backward because the gate also consumes x_hat:
         x_g                 = x_hat[:, :ve_gate_channels]
         ve                  = ve_weight[ve_ids].view(M, n_kv_head, head_dim)
@@ -1035,18 +1032,30 @@ def _norm_qkv_projection_bwd_impl(
         d_ve_weight_for_kernel = x_flat
         d_ve_gate_weight_for_kernel = x_flat
 
-    DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 64, 128
-    QK_PRE_BLOCK_M = 64 if has_value_embedding else 32
-    OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 32, 32
-    WEIGHT_GRAD_BLOCK_N, WEIGHT_GRAD_BLOCK_K, WEIGHT_GRAD_BLOCK_M = 64, 128, 128
+    if has_value_embedding:
+        QK_PRE_BLOCK_M, QK_PRE_NUM_WARPS, QK_PRE_NUM_STAGES = 32, 8, 2
+        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 64, 128
+    else:
+        QK_PRE_BLOCK_M, QK_PRE_NUM_WARPS, QK_PRE_NUM_STAGES = 32, 4, 1
+        if x.dtype == torch.float32:
+            DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 64, 128
+        else:
+            DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 128, 64
+    DX_HAT_NUM_WARPS, DX_HAT_NUM_STAGES = 4, 2
+    OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 128, 64
+    OUTER_RMS_NUM_WARPS = 4
+    NORM_WEIGHT_GRAD_BLOCK_M, NORM_WEIGHT_GRAD_BLOCK_K = 128, 32
+    NORM_WEIGHT_GRAD_NUM_WARPS = 4
+    WEIGHT_GRAD_BLOCK_N, WEIGHT_GRAD_BLOCK_K, WEIGHT_GRAD_BLOCK_M = 64, 128, 32
+    WEIGHT_GRAD_NUM_WARPS, WEIGHT_GRAD_NUM_STAGES = 4, 2
     if has_value_embedding:
         assert ve_gate_channels <= DX_HAT_BLOCK_K, (
             f"ve_gate_channels={ve_gate_channels} must fit in "
             f"DX_HAT_BLOCK_K={DX_HAT_BLOCK_K}"
         )
 
-    # Phase 1: recover pre-projection Q/K grads and optional VE gradients.
-    _qk_pre_grad_ve_bwd_kernel[
+    # Phase 1: recover Q/K projection-output grads and optional VE gradients.
+    _qk_proj_grad_ve_bwd_kernel[
         (
             triton.cdiv(M, QK_PRE_BLOCK_M),
             n_head + n_kv_head + (n_kv_head if has_value_embedding else 0),
@@ -1085,11 +1094,11 @@ def _norm_qkv_projection_bwd_impl(
         HAS_VALUE_EMBEDDING=has_value_embedding,
         VE_GATE_CH=ve_gate_channels,
         VE_GATE_BLOCK=ve_gate_block,
-        num_warps=4,
-        num_stages=1,
+        num_warps=QK_PRE_NUM_WARPS,
+        num_stages=QK_PRE_NUM_STAGES,
     )
     # Phase 2: project Q/K/V grads back to x_hat and accumulate RMS row inner.
-    _qkv_dx_hat_from_pre_outer_rms_row_inner_bwd_kernel[
+    _qkv_dx_hat_from_proj_grad_bwd_kernel[
         (triton.cdiv(M, DX_HAT_BLOCK_M), triton.cdiv(K, DX_HAT_BLOCK_K))
     ](
         d_q_pre,
@@ -1116,8 +1125,8 @@ def _norm_qkv_projection_bwd_impl(
         HAS_VALUE_EMBEDDING=has_value_embedding,
         VE_GATE_CH=ve_gate_channels,
         VE_GATE_BLOCK=ve_gate_block,
-        num_warps=4,
-        num_stages=2,
+        num_warps=DX_HAT_NUM_WARPS,
+        num_stages=DX_HAT_NUM_STAGES,
     )
     # Phase 3: finish outer RMSNorm input gradient.
     _outer_rms_dx_from_dx_hat_bwd_kernel[
@@ -1134,11 +1143,11 @@ def _norm_qkv_projection_bwd_impl(
         BLOCK_M=OUTER_RMS_BLOCK_M,
         BLOCK_K=OUTER_RMS_BLOCK_K,
         HAS_NORM_WEIGHT=has_norm_weight,
-        num_warps=4,
+        num_warps=OUTER_RMS_NUM_WARPS,
     )
     if has_norm_weight:
         _outer_rms_norm_weight_grad_bwd_kernel[
-            (triton.cdiv(K, OUTER_RMS_BLOCK_K),)
+            (triton.cdiv(K, NORM_WEIGHT_GRAD_BLOCK_K),)
         ](
             x_flat,
             rms_inv,
@@ -1146,12 +1155,12 @@ def _norm_qkv_projection_bwd_impl(
             d_norm_weight,
             M,
             K,
-            BLOCK_M=OUTER_RMS_BLOCK_M,
-            BLOCK_K=OUTER_RMS_BLOCK_K,
-            num_warps=4,
+            BLOCK_M=NORM_WEIGHT_GRAD_BLOCK_M,
+            BLOCK_K=NORM_WEIGHT_GRAD_BLOCK_K,
+            num_warps=NORM_WEIGHT_GRAD_NUM_WARPS,
         )
     # Phase 4: compute projection weight gradients.
-    _qkv_weight_grad_from_pre_bwd_kernel[
+    _qkv_weight_grad_from_proj_grad_bwd_kernel[
         (
             n_head + 2 * n_kv_head,
             triton.cdiv(head_dim, WEIGHT_GRAD_BLOCK_N),
@@ -1176,8 +1185,8 @@ def _norm_qkv_projection_bwd_impl(
         BLOCK_K=WEIGHT_GRAD_BLOCK_K,
         BLOCK_M=WEIGHT_GRAD_BLOCK_M,
         HAS_NORM_WEIGHT=has_norm_weight,
-        num_warps=4,
-        num_stages=2,
+        num_warps=WEIGHT_GRAD_NUM_WARPS,
+        num_stages=WEIGHT_GRAD_NUM_STAGES,
     )
     return (
         dx.reshape_as(x),
@@ -1313,9 +1322,9 @@ def _norm_qkv_projection_fwd_impl(
         device=x.device,
     )
     if has_value_embedding:
-        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS = 128, 32, 4
+        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS, QKV_NUM_STAGES = 64, 64, 4, 2
     else:
-        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS = 64, 64, 4
+        QKV_BLOCK_M, QKV_BLOCK_K, QKV_NUM_WARPS, QKV_NUM_STAGES = 64, 32, 4, 3
     norm_block_d = triton.next_power_of_2(K)
     norm_cfg = _pick_tile_config(M, norm_block_d, n_live_tiles=2)
     x_hat = torch.empty_like(x_2d)
@@ -1367,7 +1376,7 @@ def _norm_qkv_projection_fwd_impl(
         VE_GATE_CH=ve_gate_channels,
         VE_GATE_BLOCK=triton.next_power_of_2(ve_gate_channels),
         num_warps=QKV_NUM_WARPS,
-        num_stages=2,
+        num_stages=QKV_NUM_STAGES,
     )
     return q, k, v, rms_inv, qk_rms_inv
 
