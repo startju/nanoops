@@ -271,86 +271,84 @@ if _HAS_TRITON:
         row_mask = rows < M
 
         is_q = part < N_HEAD
-        is_k = (part >= N_HEAD) & (part < N_HEAD + N_KV_HEAD)
         is_v = part >= N_HEAD + N_KV_HEAD
 
-        if is_v:
-            if HAS_VALUE_EMBEDDING:
-                head = part - N_HEAD - N_KV_HEAD
-                gate_cols = tl.arange(0, VE_GATE_BLOCK)
-                gate_mask = gate_cols < VE_GATE_CH
-                token_ids = tl.load(ve_ids_ptr + rows, mask=row_mask, other=0)
-                x_gate = tl.load(
-                    x_ptr + rows[:, None] * K + gate_cols[None, :],
-                    mask=row_mask[:, None] & gate_mask[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
-                x_norm_gate = x_gate * x_rms_inv[:, None]
-                if HAS_NORM_WEIGHT:
-                    norm_w_gate = tl.load(
-                        norm_w_ptr + gate_cols,
-                        mask=gate_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    x_hat_gate = (x_norm_gate * norm_w_gate[None, :]).to(
-                        x_ptr.dtype.element_ty
-                    )
-                else:
-                    x_hat_gate = x_norm_gate.to(x_ptr.dtype.element_ty)
-
-                d_v = tl.load(
-                    d_v_ptr
-                    + rows[:, None] * N_KV_HEAD * D
-                    + head * D
-                    + cols[None, :],
-                    mask=row_mask[:, None],
-                    other=0.0,
-                ).to(x_ptr.dtype.element_ty)
-                gate_w = tl.load(
-                    ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
+        if HAS_VALUE_EMBEDDING and is_v:
+            head = part - N_HEAD - N_KV_HEAD
+            gate_cols = tl.arange(0, VE_GATE_BLOCK)
+            gate_mask = gate_cols < VE_GATE_CH
+            token_ids = tl.load(ve_ids_ptr + rows, mask=row_mask, other=0)
+            x_gate = tl.load(
+                x_ptr + rows[:, None] * K + gate_cols[None, :],
+                mask=row_mask[:, None] & gate_mask[None, :],
+                other=0.0,
+            )
+            x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
+            x_norm_gate = x_gate * x_rms_inv[:, None]
+            if HAS_NORM_WEIGHT:
+                norm_w_gate = tl.load(
+                    norm_w_ptr + gate_cols,
                     mask=gate_mask,
                     other=0.0,
-                ).to(x_ptr.dtype.element_ty)
-                gate_logits = tl.sum(
-                    x_hat_gate * gate_w[None, :],
-                    axis=1,
-                    dtype=tl.float32,
                 )
-                sigmoid = tl.sigmoid(gate_logits)
-                gate = 3 * sigmoid
-                ve = tl.load(
-                    ve_w_ptr
-                    + token_ids[:, None] * N_KV_HEAD * D
-                    + head * D
-                    + cols[None, :],
-                    mask=row_mask[:, None],
-                    other=0.0,
+                x_hat_gate = (x_norm_gate * norm_w_gate[None, :]).to(
+                    x_ptr.dtype.element_ty
                 )
-                d_gate = tl.sum(d_v * ve, axis=1, dtype=tl.float32)
-                d_gate_logits = 3.0 * d_gate * sigmoid * (1.0 - sigmoid)
+            else:
+                x_hat_gate = x_norm_gate.to(x_ptr.dtype.element_ty)
 
-                tl.atomic_add(
-                    d_ve_w_ptr
-                    + token_ids[:, None] * N_KV_HEAD * D
-                    + head * D
-                    + cols[None, :],
-                    d_v * gate[:, None],
-                    sem="relaxed",
-                    mask=row_mask[:, None],
-                )
-                tl.atomic_add(
-                    d_ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
-                    tl.sum(d_gate_logits[:, None] * x_hat_gate, axis=0),
-                    sem="relaxed",
-                    mask=gate_mask,
-                )
-                tl.atomic_add(
-                    dx_hat_ve_ptr + rows[:, None] * VE_GATE_BLOCK + gate_cols[None, :],
-                    d_gate_logits[:, None] * gate_w[None, :],
-                    sem="relaxed",
-                    mask=row_mask[:, None] & gate_mask[None, :],
-                )
+            d_v = tl.load(
+                d_v_ptr
+                + rows[:, None] * N_KV_HEAD * D
+                + head * D
+                + cols[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            ).to(x_ptr.dtype.element_ty)
+            gate_w = tl.load(
+                ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
+                mask=gate_mask,
+                other=0.0,
+            ).to(x_ptr.dtype.element_ty)
+            gate_logits = tl.sum(
+                x_hat_gate * gate_w[None, :],
+                axis=1,
+                dtype=tl.float32,
+            )
+            sigmoid = tl.sigmoid(gate_logits)
+            gate = (3 * sigmoid).to(x_ptr.dtype.element_ty)
+            ve = tl.load(
+                ve_w_ptr
+                + token_ids[:, None] * N_KV_HEAD * D
+                + head * D
+                + cols[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            d_gate = tl.sum(d_v * ve, axis=1, dtype=tl.float32)
+            d_gate_logits = (3 * d_gate * sigmoid * (1.0 - sigmoid)).to(x_ptr.dtype.element_ty)
+
+            tl.atomic_add(
+                d_ve_w_ptr
+                + token_ids[:, None] * N_KV_HEAD * D
+                + head * D
+                + cols[None, :],
+                d_v * gate[:, None],
+                sem="relaxed",
+                mask=row_mask[:, None],
+            )
+            tl.atomic_add(
+                d_ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
+                tl.sum(d_gate_logits[:, None] * x_hat_gate, axis=0, dtype=tl.float32),
+                sem="relaxed",
+                mask=gate_mask,
+            )
+            tl.atomic_add(
+                dx_hat_ve_ptr + rows[:, None] * VE_GATE_BLOCK + gate_cols[None, :],
+                d_gate_logits[:, None] * gate_w[None, :],
+                sem="relaxed",
+                mask=row_mask[:, None] & gate_mask[None, :],
+            )
         else:
             head = tl.where(is_q, part, part - N_HEAD)
             if is_q:
