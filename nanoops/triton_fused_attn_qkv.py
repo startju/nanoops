@@ -241,8 +241,8 @@ if _HAS_TRITON:
         rms_inv_ptr,  # (M,) fp32 — in: outer RMSNorm inverse
         norm_w_ptr,  # (K,) — in when HAS_NORM_WEIGHT
         outer_rms_row_inner_ptr,  # (M,) fp32 — in/out: outer RMSNorm row-inner
-        d_ve_w_ptr,  # (vocab, n_kv_head * D) fp32 — optional out via atomic_add
-        d_ve_gate_w_ptr,  # (n_kv_head, VE_GATE_CH) fp32 — optional out via atomic_add
+        d_ve_w_ptr,  # (vocab, n_kv_head * D), dtype=ve_weight.dtype — optional out
+        d_ve_gate_w_ptr,  # (n_kv_head, VE_GATE_CH), dtype=ve_gate_weight.dtype — optional out
         M,  # int
         K,  # int
         D,  # int
@@ -283,6 +283,19 @@ if _HAS_TRITON:
         rotary_rows = rows % rotary_seq_len
 
         dx_hat_tile = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        cos = tl.load(
+            cos_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+        sin = tl.load(
+            sin_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+
+        scale_for_qk = scale.to(x_ptr.dtype.element_ty)
+        inv_scale_for_qk = inv_scale.to(x_ptr.dtype.element_ty)
 
         for head in range(0, N_HEAD):
             out_base = q_ptr + rows[:, None] * N_HEAD * D + head * D
@@ -292,47 +305,32 @@ if _HAS_TRITON:
                 out_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
-            ).to(tl.float32) * inv_scale
+            ) * inv_scale_for_qk
             g = tl.load(
                 grad_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
-            ).to(tl.float32) * scale
-            y0_halves = tl.reshape(y0, (BLOCK_M, 2, BLOCK_D // 2))
-            g_halves = tl.reshape(g, (BLOCK_M, 2, BLOCK_D // 2))
-            y0_lo, y0_hi = tl.split(tl.trans(y0_halves, 0, 2, 1))
-            g_lo, g_hi = tl.split(tl.trans(g_halves, 0, 2, 1))
+            ) * scale_for_qk
             qk_rms_inv = tl.load(
                 qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + head,
                 mask=row_mask,
                 other=0.0,
-            ).to(tl.float32)
-            qk_inner = (
-                tl.sum(g_lo * y0_lo, axis=1) + tl.sum(g_hi * y0_hi, axis=1)
-            ) / D
-            d_rot_lo = qk_rms_inv[:, None] * (g_lo - y0_lo * qk_inner[:, None])
-            d_rot_hi = qk_rms_inv[:, None] * (g_hi - y0_hi * qk_inner[:, None])
-
-            cos = tl.load(
-                cos_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            sin = tl.load(
-                sin_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
+            )
+            qk_inner = tl.sum(g * y0, axis=1, dtype=tl.float32) / D
+            d_rot = (
+                qk_rms_inv[:, None] * (g - y0 * qk_inner[:, None])
+            ).to(x_ptr.dtype.element_ty)
+            d_rot_halves = tl.reshape(d_rot, (BLOCK_M, 2, BLOCK_D // 2))
+            d_rot_lo, d_rot_hi = tl.split(tl.trans(d_rot_halves, 0, 2, 1))
             d_pre_lo = d_rot_lo * cos - d_rot_hi * sin
             d_pre_hi = d_rot_lo * sin + d_rot_hi * cos
-            d_pre_pair = tl.join(d_pre_lo, d_pre_hi)
-            d_pre_halves = tl.trans(d_pre_pair, 0, 2, 1)
+            d_pre_halves = tl.trans(tl.join(d_pre_lo, d_pre_hi), 0, 2, 1)
             d_pre = tl.reshape(d_pre_halves, (BLOCK_M, BLOCK_D))
             w = tl.load(
                 q_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
                 mask=k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            ).to(x_ptr.dtype.element_ty)
             dx_hat_tile += tl.dot(d_pre, w)
 
         for head in range(0, N_KV_HEAD):
@@ -343,79 +341,54 @@ if _HAS_TRITON:
                 out_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
-            ).to(tl.float32) * inv_scale
+            ) * inv_scale_for_qk
             g = tl.load(
                 grad_base + cols[None, :],
                 mask=row_mask[:, None],
                 other=0.0,
-            ).to(tl.float32) * scale
-            y0_halves = tl.reshape(y0, (BLOCK_M, 2, BLOCK_D // 2))
-            g_halves = tl.reshape(g, (BLOCK_M, 2, BLOCK_D // 2))
-            y0_lo, y0_hi = tl.split(tl.trans(y0_halves, 0, 2, 1))
-            g_lo, g_hi = tl.split(tl.trans(g_halves, 0, 2, 1))
+            ) * scale_for_qk
             qk_rms_inv = tl.load(
                 qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + N_HEAD + head,
                 mask=row_mask,
                 other=0.0,
-            ).to(tl.float32)
-            qk_inner = (
-                tl.sum(g_lo * y0_lo, axis=1) + tl.sum(g_hi * y0_hi, axis=1)
-            ) / D
-            d_rot_lo = qk_rms_inv[:, None] * (g_lo - y0_lo * qk_inner[:, None])
-            d_rot_hi = qk_rms_inv[:, None] * (g_hi - y0_hi * qk_inner[:, None])
-
-            cos = tl.load(
-                cos_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            sin = tl.load(
-                sin_ptr + rotary_rows[:, None] * (BLOCK_D // 2) + half_cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
+            )
+            qk_inner = tl.sum(g * y0, axis=1, dtype=tl.float32) / D
+            d_rot = (
+                qk_rms_inv[:, None] * (g - y0 * qk_inner[:, None])
+            ).to(x_ptr.dtype.element_ty)
+            d_rot_halves = tl.reshape(d_rot, (BLOCK_M, 2, BLOCK_D // 2))
+            d_rot_lo, d_rot_hi = tl.split(tl.trans(d_rot_halves, 0, 2, 1))
             d_pre_lo = d_rot_lo * cos - d_rot_hi * sin
             d_pre_hi = d_rot_lo * sin + d_rot_hi * cos
-            d_pre_pair = tl.join(d_pre_lo, d_pre_hi)
-            d_pre_halves = tl.trans(d_pre_pair, 0, 2, 1)
+            d_pre_halves = tl.trans(tl.join(d_pre_lo, d_pre_hi), 0, 2, 1)
             d_pre = tl.reshape(d_pre_halves, (BLOCK_M, BLOCK_D))
             w = tl.load(
                 k_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
                 mask=k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            ).to(x_ptr.dtype.element_ty)
             dx_hat_tile += tl.dot(d_pre, w)
 
-        for head in range(0, N_KV_HEAD):
-            d_v = tl.load(
-                d_v_ptr + rows[:, None] * N_KV_HEAD * D + head * D + cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            w = tl.load(
-                v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            dx_hat_tile += tl.dot(d_v, w)
-
-        x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
         x = tl.load(
             x_ptr + rows[:, None] * K + ks[None, :],
             mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
-        x_norm = x * x_rms_inv[:, None]
+        )
+        x_rms_inv = tl.load(rms_inv_ptr + rows, mask=row_mask, other=0.0)
+        x_norm = (x * x_rms_inv[:, None]).to(x_ptr.dtype.element_ty)
         if HAS_NORM_WEIGHT:
             nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
 
         if HAS_VALUE_EMBEDDING:
+            gate_cols = tl.arange(0, VE_GATE_BLOCK)
+            gate_mask = gate_cols < VE_GATE_CH
+            tile_gate_mask = ks < VE_GATE_CH
+            token_ids = tl.zeros((BLOCK_M,), dtype=tl.int64)
+            x_hat_gate = tl.zeros((BLOCK_M, VE_GATE_BLOCK), dtype=tl.float32).to(
+                x_ptr.dtype.element_ty
+            )
             if pid_k * BLOCK_K < VE_GATE_CH:
-                gate_cols = tl.arange(0, VE_GATE_BLOCK)
-                gate_mask = gate_cols < VE_GATE_CH
-                tile_gate_mask = ks < VE_GATE_CH
                 token_ids = tl.load(ve_ids_ptr + rows, mask=row_mask, other=0)
-
                 x_gate = tl.load(
                     x_ptr + rows[:, None] * K + gate_cols[None, :],
                     mask=row_mask[:, None] & gate_mask[None, :],
@@ -434,7 +407,21 @@ if _HAS_TRITON:
                 else:
                     x_hat_gate = x_norm_gate.to(x_ptr.dtype.element_ty)
 
-                for head in range(0, N_KV_HEAD):
+        for head in range(0, N_KV_HEAD):
+            d_v = tl.load(
+                d_v_ptr + rows[:, None] * N_KV_HEAD * D + head * D + cols[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            ).to(x_ptr.dtype.element_ty)
+            w = tl.load(
+                v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
+                mask=k_mask[None, :],
+                other=0.0,
+            ).to(x_ptr.dtype.element_ty)
+            dx_hat_tile += tl.dot(d_v, w)
+
+            if HAS_VALUE_EMBEDDING:
+                if pid_k * BLOCK_K < VE_GATE_CH:
                     gate_w = tl.load(
                         ve_gate_w_ptr + head * VE_GATE_CH + gate_cols,
                         mask=gate_mask,
@@ -447,15 +434,6 @@ if _HAS_TRITON:
                     )
                     sigmoid = tl.sigmoid(gate_logits)
                     gate = 3 * sigmoid
-
-                    dv = tl.load(
-                        d_v_ptr
-                        + rows[:, None] * N_KV_HEAD * D
-                        + head * D
-                        + cols[None, :],
-                        mask=row_mask[:, None],
-                        other=0.0,
-                    ).to(tl.float32)
                     ve = tl.load(
                         ve_w_ptr
                         + token_ids[:, None] * N_KV_HEAD * D
@@ -465,11 +443,11 @@ if _HAS_TRITON:
                         other=0.0,
                     ).to(tl.float32)
 
-                    d_gate = tl.sum(dv * ve, axis=1)
+                    d_gate = tl.sum(d_v * ve, axis=1)
                     d_gate_logits = 3.0 * d_gate * sigmoid * (1.0 - sigmoid)
 
                     if pid_k == 0:
-                        d_ve_weight_tile = dv * gate[:, None]
+                        d_ve_weight_tile = d_v * gate[:, None]
                         tl.atomic_add(
                             d_ve_w_ptr
                             + token_ids[:, None] * N_KV_HEAD * D
