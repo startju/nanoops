@@ -350,15 +350,14 @@ if _HAS_TRITON:
                 mask=row_mask[:, None] & gate_mask[None, :],
             )
         else:
-            head = tl.where(is_q, part, part - N_HEAD)
             if is_q:
+                head = part
                 out_base = q_ptr + rows[:, None] * N_HEAD * D + head * D
                 grad_base = d_q_ptr + rows[:, None] * N_HEAD * D + head * D
-                inv_offset = head
             else:
+                head = part - N_HEAD
                 out_base = k_ptr + rows[:, None] * N_KV_HEAD * D + head * D
                 grad_base = d_k_ptr + rows[:, None] * N_KV_HEAD * D + head * D
-                inv_offset = N_HEAD + head
 
             scale_for_qk = scale.to(d_q_pre_ptr.dtype.element_ty)
             inv_scale_for_qk = inv_scale.to(d_q_pre_ptr.dtype.element_ty)
@@ -373,7 +372,7 @@ if _HAS_TRITON:
                 other=0.0,
             ) * scale_for_qk
             qk_rms_inv = tl.load(
-                qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + inv_offset,
+                qk_rms_inv_ptr + rows * (N_HEAD + N_KV_HEAD) + part,
                 mask=row_mask,
                 other=0.0,
             )
@@ -1037,7 +1036,7 @@ def _norm_qkv_projection_bwd_impl(
         d_ve_gate_weight_for_kernel = x_flat
 
     DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 64, 128
-    QK_PRE_BLOCK_M = 32
+    QK_PRE_BLOCK_M = 64 if has_value_embedding else 32
     OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 32, 32
     WEIGHT_GRAD_BLOCK_N, WEIGHT_GRAD_BLOCK_K, WEIGHT_GRAD_BLOCK_M = 64, 128, 128
     if has_value_embedding:
