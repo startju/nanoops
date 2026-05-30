@@ -503,6 +503,7 @@ if _HAS_TRITON:
         BLOCK_D: tl.constexpr,
         N_HEAD: tl.constexpr,
         N_KV_HEAD: tl.constexpr,
+        HEAD_SPLIT: tl.constexpr,
         HAS_VALUE_EMBEDDING: tl.constexpr,
         VE_GATE_CH: tl.constexpr,
         VE_GATE_BLOCK: tl.constexpr,
@@ -524,52 +525,58 @@ if _HAS_TRITON:
 
         dx_hat_tile = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
         for head in range(0, N_HEAD):
-            d_part = tl.load(
-                d_q_pre_ptr
-                + rows[:, None] * N_HEAD * D
-                + head * D
-                + cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-            w = tl.load(
-                q_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-            dx_hat_tile += tl.dot(d_part, w)
+            for split in range(0, HEAD_SPLIT):
+                head_cols = split * BLOCK_D + cols
+                d_part = tl.load(
+                    d_q_pre_ptr
+                    + rows[:, None] * N_HEAD * D
+                    + head * D
+                    + head_cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
+                ).to(x_norm_ptr.dtype.element_ty)
+                w = tl.load(
+                    q_w_ptr + (head * D + head_cols)[:, None] * K + ks[None, :],
+                    mask=k_mask[None, :],
+                    other=0.0,
+                ).to(x_norm_ptr.dtype.element_ty)
+                dx_hat_tile += tl.dot(d_part, w)
 
         for head in range(0, N_KV_HEAD):
-            d_part = tl.load(
-                d_k_pre_ptr
-                + rows[:, None] * N_KV_HEAD * D
-                + head * D
-                + cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-            w = tl.load(
-                k_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-            dx_hat_tile += tl.dot(d_part, w)
+            for split in range(0, HEAD_SPLIT):
+                head_cols = split * BLOCK_D + cols
+                d_part = tl.load(
+                    d_k_pre_ptr
+                    + rows[:, None] * N_KV_HEAD * D
+                    + head * D
+                    + head_cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
+                ).to(x_norm_ptr.dtype.element_ty)
+                w = tl.load(
+                    k_w_ptr + (head * D + head_cols)[:, None] * K + ks[None, :],
+                    mask=k_mask[None, :],
+                    other=0.0,
+                ).to(x_norm_ptr.dtype.element_ty)
+                dx_hat_tile += tl.dot(d_part, w)
 
         for head in range(0, N_KV_HEAD):
-            d_part = tl.load(
-                d_v_ptr
-                + rows[:, None] * N_KV_HEAD * D
-                + head * D
-                + cols[None, :],
-                mask=row_mask[:, None],
-                other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-            w = tl.load(
-                v_w_ptr + (head * D + cols)[:, None] * K + ks[None, :],
-                mask=k_mask[None, :],
-                other=0.0,
-            ).to(x_norm_ptr.dtype.element_ty)
-            dx_hat_tile += tl.dot(d_part, w)
+            for split in range(0, HEAD_SPLIT):
+                head_cols = split * BLOCK_D + cols
+                d_part = tl.load(
+                    d_v_ptr
+                    + rows[:, None] * N_KV_HEAD * D
+                    + head * D
+                    + head_cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
+                ).to(x_norm_ptr.dtype.element_ty)
+                w = tl.load(
+                    v_w_ptr + (head * D + head_cols)[:, None] * K + ks[None, :],
+                    mask=k_mask[None, :],
+                    other=0.0,
+                ).to(x_norm_ptr.dtype.element_ty)
+                dx_hat_tile += tl.dot(d_part, w)
 
         if HAS_VALUE_EMBEDDING:
             if pid_k == 0:
@@ -1104,12 +1111,16 @@ def _norm_qkv_projection_bwd_impl(
 
     if has_value_embedding:
         QK_PRE_BLOCK_M, QK_PRE_NUM_WARPS, QK_PRE_NUM_STAGES = 16, 8, 1
-        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 64, 64
+        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 128, 64
+        DX_HAT_HEAD_SPLIT = 2
+        DX_HAT_CAST_WEIGHTS = False
         DX_HAT_NUM_WARPS, DX_HAT_NUM_STAGES = 4, 1
     else:
         QK_PRE_BLOCK_M, QK_PRE_NUM_WARPS, QK_PRE_NUM_STAGES = 32, 4, 1
-        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 64, 64
-        DX_HAT_NUM_WARPS, DX_HAT_NUM_STAGES = 4, 1
+        DX_HAT_BLOCK_M, DX_HAT_BLOCK_K = 128, 64
+        DX_HAT_HEAD_SPLIT = 2
+        DX_HAT_CAST_WEIGHTS = False
+        DX_HAT_NUM_WARPS, DX_HAT_NUM_STAGES = 16, 1
     X_NORM_BLOCK_M, X_NORM_BLOCK_K = 128, 64
     X_NORM_NUM_WARPS = 4
     OUTER_RMS_BLOCK_M, OUTER_RMS_BLOCK_K = 128, 64
@@ -1121,6 +1132,7 @@ def _norm_qkv_projection_bwd_impl(
             f"ve_gate_channels={ve_gate_channels} must fit in "
             f"DX_HAT_BLOCK_K={DX_HAT_BLOCK_K}"
         )
+    assert head_dim % DX_HAT_HEAD_SPLIT == 0
 
     # Phase 1: rematerialize x_norm for backward reuse. We intentionally do
     # not save or materialize raw x_mix in backward; only RMSNorm(x_mix) is
@@ -1181,6 +1193,17 @@ def _norm_qkv_projection_bwd_impl(
         num_stages=QK_PRE_NUM_STAGES,
     )
     # Phase 3: project Q/K/V grads back to x_hat and accumulate RMS row inner.
+    # d24 uses half-head tiles with fp32 master weights loaded inline. This
+    # avoids full Q/K/V weight cast launches while keeping VE/no-VE tile shapes
+    # independently tunable.
+    if DX_HAT_CAST_WEIGHTS:
+        q_weight_for_dx_hat = q_weight.to(x_norm.dtype)
+        k_weight_for_dx_hat = k_weight.to(x_norm.dtype)
+        v_weight_for_dx_hat = v_weight.to(x_norm.dtype)
+    else:
+        q_weight_for_dx_hat = q_weight
+        k_weight_for_dx_hat = k_weight
+        v_weight_for_dx_hat = v_weight
     wrap_triton(_qkv_dx_hat_from_proj_grad_bwd_kernel)[
         (triton.cdiv(M, DX_HAT_BLOCK_M), triton.cdiv(K, DX_HAT_BLOCK_K))
     ](
@@ -1188,9 +1211,9 @@ def _norm_qkv_projection_bwd_impl(
         d_k_pre,
         d_v,
         dx_hat_ve_for_kernel,
-        q_weight,
-        k_weight,
-        v_weight,
+        q_weight_for_dx_hat,
+        k_weight_for_dx_hat,
+        v_weight_for_dx_hat,
         dx_hat,
         x_norm,
         outer_rms_row_inner,
@@ -1199,9 +1222,10 @@ def _norm_qkv_projection_bwd_impl(
         head_dim,
         BLOCK_M=DX_HAT_BLOCK_M,
         BLOCK_K=DX_HAT_BLOCK_K,
-        BLOCK_D=head_dim,
+        BLOCK_D=head_dim // DX_HAT_HEAD_SPLIT,
         N_HEAD=n_head,
         N_KV_HEAD=n_kv_head,
+        HEAD_SPLIT=DX_HAT_HEAD_SPLIT,
         HAS_VALUE_EMBEDDING=has_value_embedding,
         VE_GATE_CH=ve_gate_channels,
         VE_GATE_BLOCK=ve_gate_block,
