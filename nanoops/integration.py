@@ -57,6 +57,8 @@ import torch.nn.functional as F_orig
 import torch.utils.checkpoint as _ckpt
 
 import nanoops.functional as nF
+from nanochat.common import COMPUTE_DTYPE
+from nanochat.flash_attention import flash_attn as _flash_attn
 
 
 # Captured at _apply() time so the L-attn checkpoint wrapper can call the
@@ -171,6 +173,10 @@ _fused_mlp_block = None
 _fused_attn_qkv = None
 
 
+def _rms_norm_no_weight(x: torch.Tensor) -> torch.Tensor:
+    return nF.rms_norm(x, (x.size(-1),))
+
+
 def _attn_qkv_residual(self, x, ve_ids, ve_weight, cos_sin, window_size):
     """Attention residual using fused outer RMSNorm + QKV/rotary/QK-norm.
 
@@ -203,7 +209,7 @@ def _attn_qkv_residual(self, x, ve_ids, ve_weight, cos_sin, window_size):
         1.2,
         1e-6,
     )
-    y = _gpt_mod().flash_attn.flash_attn_func(
+    y = _flash_attn.flash_attn_func(
         q,
         k,
         v,
@@ -215,13 +221,9 @@ def _attn_qkv_residual(self, x, ve_ids, ve_weight, cos_sin, window_size):
     return x + y
 
 
-def _gpt_mod():
-    return importlib.import_module("nanochat.gpt")
-
-
 def _mlp_residual(self, x):
     if _fused_mlp_block is None:
-        return x + self.mlp(_gpt_mod().norm(x))
+        return x + self.mlp(_rms_norm_no_weight(x))
 
     B, T, C = x.shape
     x_2d = x.reshape(B * T, C).contiguous()
@@ -244,7 +246,6 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
     if kv_cache is not None or not idx.is_cuda:
         return _orig_gpt_forward(self, idx, targets, kv_cache, loss_reduction)
 
-    gpt_mod = _gpt_mod()
     B, T = idx.size()
 
     assert T <= self.cos.size(1), (
@@ -253,14 +254,14 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
     assert idx.device == self.cos.device, (
         f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
     )
-    assert self.cos.dtype == gpt_mod.COMPUTE_DTYPE, (
-        f"Rotary embeddings must be in {gpt_mod.COMPUTE_DTYPE}, got {self.cos.dtype}"
+    assert self.cos.dtype == COMPUTE_DTYPE, (
+        f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
     )
     cos_sin = self.cos[:, :T], self.sin[:, :T]
 
     x = self.transformer.wte(idx)
-    x = x.to(gpt_mod.COMPUTE_DTYPE)
-    x = gpt_mod.norm(x)
+    x = x.to(COMPUTE_DTYPE)
+    x = _rms_norm_no_weight(x)
 
     # Smear: same training path as nanochat.gpt.GPT.forward.
     assert T > 1, "Training forward pass should have T > 1"
@@ -307,7 +308,7 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
 
     if x_backout is not None:
         x = x - self.backout_lambda.to(x.dtype) * x_backout
-    x = gpt_mod.norm(x)
+    x = _rms_norm_no_weight(x)
 
     softcap = 15
     logits = self.lm_head(x)
@@ -316,7 +317,7 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
     logits = softcap * torch.tanh(logits / softcap)
 
     if targets is not None:
-        return gpt_mod.F.cross_entropy(
+        return nF.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,

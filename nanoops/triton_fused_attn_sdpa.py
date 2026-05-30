@@ -22,16 +22,44 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────
 # Flash-style sliding-window SDPA in Triton.
 #
-# Standard Flash Attention pattern, adapted for nanchat's
-# sliding-causal mask:
-#   - Forward: tile Q into BLOCK_M-sized chunks. For each Q tile,
-#     stream K/V in BLOCK_N chunks, maintaining (running max m, running
-#     normalizer ℓ) online so we never materialize the (L, L) P matrix.
-#     Output: o (B, H, L, D) and log-sum-exp ℓ (B, H, L) for backward.
-#   - Backward: re-derive P[i, j] = exp(s[i, j] - LSE[i]) from a fresh
-#     Q@K^T tile in fp32, then accumulate dQ, dK, dV via the same
-#     tiling. Uses D[i] = sum_j o[i, j] * dO[i, j] precomputed per row
-#     to skip the inner softmax-bwd reduction.
+# Standard Flash Attention pattern, adapted for nanchat's sliding-causal mask.
+#
+# Forward math for one (batch, head), with i indexing query rows and j key rows:
+#   visible(i, j) = max(0, i - WINDOW + 1) <= j <= i
+#   S_ij          = sm_scale * dot(Q_i, K_j)          if visible(i, j)
+#                 = -inf                             otherwise
+#   P_ij          = exp(S_ij - LSE_i)
+#   LSE_i         = log(sum_j exp(S_ij))
+#   O_i           = sum_j P_ij * V_j
+#
+# The kernel never materializes S or P as (L, L). It tiles Q by BLOCK_M rows and
+# streams K/V by BLOCK_N rows. For each Q row it maintains an online-softmax
+# triple `(m, l, acc)` where:
+#   m   = running max score
+#   l   = running sum exp(score - m)
+#   acc = running sum exp(score - m) * V
+# For a new score tile `s`:
+#   m_new   = max(m, max_j s_j)
+#   alpha   = exp(m - m_new)
+#   p_hat_j = exp(s_j - m_new)
+#   l_new   = alpha * l + sum_j p_hat_j
+#   acc_new = alpha * acc + p_hat @ V_tile
+# Final output is `O = acc / l`; saved backward state is
+# `LSE = m + log(l)` per query row.
+#
+# Backward math, given G = dO:
+#   Delta_i = sum_d O_id * G_id
+#   P_ij    = exp(S_ij - LSE_i)              # recomputed from Q/K/LSE
+#   dV_j   += sum_i P_ij * G_i
+#   dP_ij   = dot(G_i, V_j)
+#   dS_ij   = P_ij * (dP_ij - Delta_i)
+#   dQ_i   += sm_scale * sum_j dS_ij * K_j
+#   dK_j   += sm_scale * sum_i dS_ij * Q_i
+#
+# In code we fold `sm_scale` into the `ds` tile before the dQ/dK matmuls:
+#   ds = P * (dP - Delta) * sm_scale
+# so `dq += ds @ K` and `dk += ds.T @ Q`.
+#
 # Sliding-window mask: per-tile lower-bound `j ≥ i - W + 1`. Combined
 # with causal `j ≤ i`, this lets us skip entire K/V tiles whose j range
 # is outside [i_min - W + 1, i_max].
@@ -54,25 +82,6 @@ if _HAS_TRITON:
         sm_scale,  # float — attention scale, usually D**-0.5
         LSE,  # (B, H, M) fp32 — out: row log-sum-exp for bwd
         O,  # (B, H, M, D) — out: attention output
-        stride_qb,  # int — Q stride along B
-        stride_qh,  # int — Q stride along H
-        stride_qm,  # int — Q stride along M
-        stride_qd,  # int — Q stride along D
-        stride_kb,  # int — K stride along B
-        stride_kh,  # int — K stride along H
-        stride_kn,  # int — K stride along N
-        stride_kd,  # int — K stride along D
-        stride_vb,  # int — V stride along B
-        stride_vh,  # int — V stride along H
-        stride_vn,  # int — V stride along N
-        stride_vd,  # int — V stride along D
-        stride_ob,  # int — O stride along B
-        stride_oh,  # int — O stride along H
-        stride_om,  # int — O stride along M
-        stride_od,  # int — O stride along D
-        stride_lb,  # int — LSE stride along B
-        stride_lh,  # int — LSE stride along H
-        stride_lm,  # int — LSE stride along M
         B,  # int — batch size
         H,  # int — number of attention heads
         M,  # int — query sequence length
@@ -88,17 +97,20 @@ if _HAS_TRITON:
         bid = pid_bh // H
         hid = pid_bh % H
 
-        # Offsets into B, H of Q, K, V, O for this program.
-        q_off = bid * stride_qb + hid * stride_qh
-        k_off = bid * stride_kb + hid * stride_kh
-        v_off = bid * stride_vb + hid * stride_vh
-        o_off = bid * stride_ob + hid * stride_oh
-        lse_off = bid * stride_lb + hid * stride_lh
+        # v1 requires contiguous Q/K/V/O and H_q == H_kv, so offsets are
+        # standard row-major. This keeps the kernel signature short; add
+        # explicit strides back if we later support packed/non-contiguous layouts.
+        bh_base = (bid * H + hid)
+        q_off = bh_base * M * BLOCK_DMODEL
+        k_off = bh_base * N * BLOCK_DMODEL
+        v_off = bh_base * N * BLOCK_DMODEL
+        o_off = bh_base * M * BLOCK_DMODEL
+        lse_off = bh_base * M
 
         # Q tile: load BLOCK_M rows of Q for this program. Stays resident.
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, BLOCK_DMODEL)
-        q_ptrs = Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        q_ptrs = Q + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
         m_mask = offs_m < M
         q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
 
@@ -123,10 +135,10 @@ if _HAS_TRITON:
 
             # Load K, V tiles
             k_ptrs = (
-                K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+                K + k_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
             )
             v_ptrs = (
-                V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                V + v_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
             )
             k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
             v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
@@ -166,10 +178,10 @@ if _HAS_TRITON:
         acc = acc / l_i[:, None]
         lse = m_i + tl.log(l_i)
 
-        o_ptrs = O + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        o_ptrs = O + o_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
         tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=m_mask[:, None])
 
-        lse_ptrs = LSE + lse_off + offs_m * stride_lm
+        lse_ptrs = LSE + lse_off + offs_m
         tl.store(lse_ptrs, lse, mask=m_mask)
 
     @triton.jit
@@ -177,13 +189,6 @@ if _HAS_TRITON:
         O,  # (B, H, M, D) — in: forward output
         dO,  # (B, H, M, D) — in: gradient of output
         D,  # (B, H, M) fp32 — out: row dot(O, dO)
-        stride_ob,  # int — O/dO stride along B
-        stride_oh,  # int — O/dO stride along H
-        stride_om,  # int — O/dO stride along M
-        stride_od,  # int — O/dO stride along D
-        stride_db,  # int — D stride along B
-        stride_dh,  # int — D stride along H
-        stride_dm,  # int — D stride along M
         B,  # int — batch size
         H,  # int — number of attention heads
         M,  # int — query sequence length
@@ -201,13 +206,14 @@ if _HAS_TRITON:
         offs_d = tl.arange(0, BLOCK_DMODEL)
         m_mask = offs_m < M
 
-        o_off = bid * stride_ob + hid * stride_oh
-        o_ptrs = O + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-        do_ptrs = dO + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        bh_base = bid * H + hid
+        o_off = bh_base * M * BLOCK_DMODEL
+        o_ptrs = O + o_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
+        do_ptrs = dO + o_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
         o = tl.load(o_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
         do = tl.load(do_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
         d_row = tl.sum(o * do, axis=1)
-        d_ptrs = D + bid * stride_db + hid * stride_dh + offs_m * stride_dm
+        d_ptrs = D + bh_base * M + offs_m
         tl.store(d_ptrs, d_row, mask=m_mask)
 
     @triton.jit
@@ -222,28 +228,6 @@ if _HAS_TRITON:
         dQ,  # (B, H, M, D) — out: grad wrt query
         dK,  # (B, H, N, D) — out: grad wrt key, atomic accumulated
         dV,  # (B, H, N, D) — out: grad wrt value, atomic accumulated
-        stride_qb,  # int — Q/dQ stride along B
-        stride_qh,  # int — Q/dQ stride along H
-        stride_qm,  # int — Q/dQ stride along M
-        stride_qd,  # int — Q/dQ stride along D
-        stride_kb,  # int — K/dK stride along B
-        stride_kh,  # int — K/dK stride along H
-        stride_kn,  # int — K/dK stride along N
-        stride_kd,  # int — K/dK stride along D
-        stride_vb,  # int — V/dV stride along B
-        stride_vh,  # int — V/dV stride along H
-        stride_vn,  # int — V/dV stride along N
-        stride_vd,  # int — V/dV stride along D
-        stride_ob,  # int — O/dO stride along B
-        stride_oh,  # int — O/dO stride along H
-        stride_om,  # int — O/dO stride along M
-        stride_od,  # int — O/dO stride along D
-        stride_lb,  # int — LSE stride along B
-        stride_lh,  # int — LSE stride along H
-        stride_lm,  # int — LSE stride along M
-        stride_db,  # int — D stride along B
-        stride_dh,  # int — D stride along H
-        stride_dm,  # int — D stride along M
         B,  # int — batch size
         H,  # int — number of attention heads
         M,  # int — query sequence length
@@ -265,21 +249,17 @@ if _HAS_TRITON:
         offs_d = tl.arange(0, BLOCK_DMODEL)
         m_mask = offs_m < M
 
-        q_off = bid * stride_qb + hid * stride_qh
-        k_off = bid * stride_kb + hid * stride_kh
-        v_off = bid * stride_vb + hid * stride_vh
+        bh_base = bid * H + hid
+        q_off = bh_base * M * BLOCK_DMODEL
+        k_off = bh_base * N * BLOCK_DMODEL
+        v_off = bh_base * N * BLOCK_DMODEL
+        lse_off = bh_base * M
 
         # Load Q tile, dO tile, LSE, D for this Q range
-        q_ptrs = Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        do_ptrs = (
-            dO
-            + bid * stride_ob
-            + hid * stride_oh
-            + offs_m[:, None] * stride_om
-            + offs_d[None, :] * stride_od
-        )
-        lse_ptrs = LSE + bid * stride_lb + hid * stride_lh + offs_m * stride_lm
-        d_ptrs = D + bid * stride_db + hid * stride_dh + offs_m * stride_dm
+        q_ptrs = Q + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
+        do_ptrs = dO + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
+        lse_ptrs = LSE + lse_off + offs_m
+        d_ptrs = D + lse_off + offs_m
         q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
         do = tl.load(do_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
         lse = tl.load(lse_ptrs, mask=m_mask, other=0.0)
@@ -296,10 +276,10 @@ if _HAS_TRITON:
             n_mask = offs_n < N
 
             k_ptrs = (
-                K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+                K + k_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
             )
             v_ptrs = (
-                V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                V + v_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
             )
             k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
             v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
@@ -327,16 +307,16 @@ if _HAS_TRITON:
 
             # Atomic-add dK, dV (overlapping Q tiles touch same K rows)
             dk_ptrs = (
-                dK + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+                dK + k_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
             )
             dv_ptrs = (
-                dV + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                dV + v_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
             )
             tl.atomic_add(dk_ptrs, dk.to(dK.dtype.element_ty), mask=n_mask[:, None])
             tl.atomic_add(dv_ptrs, dv.to(dV.dtype.element_ty), mask=n_mask[:, None])
 
         # Write dQ (single contributor per Q tile — no atomic needed)
-        dq_ptrs = dQ + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        dq_ptrs = dQ + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
         tl.store(dq_ptrs, dq_acc.to(dQ.dtype.element_ty), mask=m_mask[:, None])
 
 
@@ -391,25 +371,6 @@ class FlashSDPA(torch.autograd.Function):
             sm_scale,
             lse,
             o,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),
-            lse.stride(0),
-            lse.stride(1),
-            lse.stride(2),
             B,
             H,
             M,
@@ -455,13 +416,6 @@ class FlashSDPA(torch.autograd.Function):
             o,
             do,
             d,
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),
-            d.stride(0),
-            d.stride(1),
-            d.stride(2),
             B,
             H,
             M,
@@ -485,28 +439,6 @@ class FlashSDPA(torch.autograd.Function):
             dq,
             dk,
             dv,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),
-            lse.stride(0),
-            lse.stride(1),
-            lse.stride(2),
-            d.stride(0),
-            d.stride(1),
-            d.stride(2),
             B,
             H,
             M,
