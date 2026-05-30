@@ -59,12 +59,15 @@ from .triton_fused_attn_output import (
 from .triton_fused_attn_qkv import (
     _norm_qkv_projection_bwd_impl,
     _norm_qkv_projection_bwd_op,
-    _norm_qkv_projection_fwd_impl,
-    _norm_qkv_projection_fwd_op,
-    norm_qkv_projection,
+    _norm_qkv_projection_residual_mix_fwd_impl,
+    _norm_qkv_projection_residual_mix_fwd_op,
+    norm_qkv_projection_with_residual_mix,
 )
 from .triton_fused_attn_sdpa import (
-    FlashSDPA,
+    _flash_sdpa_bwd_impl,
+    _flash_sdpa_bwd_op,
+    _flash_sdpa_fwd_impl,
+    _flash_sdpa_fwd_op,
     flash_sdpa,
 )
 

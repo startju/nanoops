@@ -131,12 +131,12 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
     Patched: attn side unchanged; the second line collapses
     `norm + c_fc + relu² + c_proj + outer-residual-add` into one fused
     call (3 Triton kernels fwd + 4 Triton kernels bwd, see TRITON_zh.md
-    §3). Input reshape (B,T,C) → (B·T, C) is a no-op view (contiguous
-    along last dim), so no extra copy.
+    §3). The public fused call keeps `(B,T,C)`; its wrapper flattens to
+    `M=B*T` before launching Triton kernels.
 
-    norm_weight=None because nanchat's `norm()` is
-    `F.rms_norm(x, (x.size(-1),))` — plain RMSNorm without per-channel
-    affine (see gpt.py:42).
+    nanochat's `norm()` is `F.rms_norm(x, (x.size(-1),))` — plain
+    RMSNorm without per-channel affine (see gpt.py:42), so the fused op
+    has no norm-weight parameter.
 
     Inference paths (kv_cache present) bypass the fusion — the kv_cache
     interaction with the (B,T,C) → 2D reshape needs more thought and
@@ -149,20 +149,16 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
         # Inference (kv_cache present) or CPU (e.g. tiny test harness):
         # fall back to the original mlp+norm+residual chain.
         return x + self.mlp(_orig_norm(x))
-    B, T, C = x.shape
     # `.contiguous()` is cheap when already contiguous (returns same tensor);
     # if attn produced a non-contiguous view (e.g. via stride tricks) the
     # fused kernel needs contiguous input for its index arithmetic.
     # Weight dtype cast (fp32 master → bf16 activation) is handled inside
     # `fused_mlp_block` itself, so we pass the raw module weights here.
-    x_2d = x.reshape(B * T, C).contiguous()
-    y_2d = _fused_mlp_block(
-        x_2d,
-        None,
+    return _fused_mlp_block(
+        x.contiguous(),
         self.mlp.c_fc.weight,
         self.mlp.c_proj.weight,
     )
-    return y_2d.reshape(B, T, C)
 
 
 # Captured at _apply() time so `_patched_block_forward` can call the
@@ -177,23 +173,38 @@ def _rms_norm_no_weight(x: torch.Tensor) -> torch.Tensor:
     return nF.rms_norm(x, (x.size(-1),))
 
 
-def _attn_qkv_residual(self, x, ve_ids, ve_weight, cos_sin, window_size):
-    """Attention residual using fused outer RMSNorm + QKV/rotary/QK-norm.
+def _attn_qkv_residual(
+    self,
+    x,
+    x0,
+    resid_scale,
+    x0_scale,
+    ve_ids,
+    ve_weight,
+    cos_sin,
+    window_size,
+):
+    """Attention residual using fused residual/x0 mix + QKV/rotary/QK-norm.
 
-    This replaces `x + self.attn(norm(x), ve, ...)` in training. The fusion must
-    live above `CausalSelfAttention.forward` because nanchat normally applies
-    `norm(x)` in `Block.forward`, while `norm_qkv_projection` owns that outer
-    RMSNorm internally. `ve_ids`/`ve_weight` are passed separately so the Triton
-    op can fuse the value-embedding lookup instead of consuming a precomputed
+    This replaces the training pair:
+        x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+        x = x + self.attn(norm(x), ve, ...)
+
+    The fusion must live above `CausalSelfAttention.forward` because nanchat
+    applies both the residual/x0 blend and `norm(x)` one level up from the
+    Q/K/V linears. `ve_ids`/`ve_weight` are passed separately so the Triton op
+    can fuse the value-embedding lookup instead of consuming a precomputed
     `ve` tensor.
     """
     B, T, _C = x.shape
     attn = self.attn
     has_ve = ve_weight is not None
     ve_gate_weight = attn.ve_gate.weight if has_ve else None
-    q, k, v = _fused_attn_qkv(
+    q, k, v, x_mix = _fused_attn_qkv(
         x,
-        None,
+        x0,
+        resid_scale,
+        x0_scale,
         ve_ids if has_ve else None,
         ve_weight,
         attn.ve_gate_channels if has_ve else 1,
@@ -218,22 +229,23 @@ def _attn_qkv_residual(self, x, ve_ids, ve_weight, cos_sin, window_size):
     )
     y = y.contiguous().view(B, T, -1)
     y = attn.c_proj(y)
-    return x + y
+    return x_mix + y
+
+
+def _attn_native_residual(self, x, ve, cos_sin, window_size):
+    """Attention residual matching the non-QKV-fused Block.forward path."""
+    return x + self.attn(_rms_norm_no_weight(x), ve, cos_sin, window_size, None)
 
 
 def _mlp_residual(self, x):
     if _fused_mlp_block is None:
         return x + self.mlp(_rms_norm_no_weight(x))
 
-    B, T, C = x.shape
-    x_2d = x.reshape(B * T, C).contiguous()
-    y_2d = _fused_mlp_block(
-        x_2d,
-        None,
+    return _fused_mlp_block(
+        x.contiguous(),
         self.mlp.c_fc.weight,
         self.mlp.c_proj.weight,
     )
-    return y_2d.reshape(B, T, C)
 
 
 def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
@@ -272,36 +284,56 @@ def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction=
     n_layer = self.config.n_layer
     backout_layer = n_layer // 2
     x_backout = None
+    qkv_mode = os.environ.get("NANOOPS_FUSED_ATTN_QKV_MODE", "all")
     for i, block in enumerate(self.transformer.h):
-        x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        resid_scale = self.resid_lambdas[i]
+        x0_scale = self.x0_lambdas[i]
         ve_weight = (
             self.value_embeds[str(i)].weight
             if str(i) in self.value_embeds
             else None
         )
-        if (
-            os.environ.get("NANOOPS_L_ATTN_CHECKPOINT")
-            and (self.window_sizes[i][0] < 0 or self.window_sizes[i][0] >= T)
-        ):
-            x = _ckpt.checkpoint(
-                _attn_qkv_residual,
-                block,
-                x,
-                idx if ve_weight is not None else None,
-                ve_weight,
-                cos_sin,
-                self.window_sizes[i],
-                use_reentrant=False,
-            )
+        use_fused_qkv = (
+            qkv_mode == "all"
+            or (qkv_mode == "ve" and ve_weight is not None)
+            or (qkv_mode == "no_ve" and ve_weight is None)
+        )
+        is_full_attn = self.window_sizes[i][0] < 0 or self.window_sizes[i][0] >= T
+        if use_fused_qkv:
+            if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT") and is_full_attn:
+                x = _ckpt.checkpoint(
+                    _attn_qkv_residual,
+                    block,
+                    x,
+                    x0,
+                    resid_scale,
+                    x0_scale,
+                    idx if ve_weight is not None else None,
+                    ve_weight,
+                    cos_sin,
+                    self.window_sizes[i],
+                    use_reentrant=False,
+                )
+            else:
+                x = _attn_qkv_residual(
+                    block,
+                    x,
+                    x0,
+                    resid_scale,
+                    x0_scale,
+                    idx if ve_weight is not None else None,
+                    ve_weight,
+                    cos_sin,
+                    self.window_sizes[i],
+                )
         else:
-            x = _attn_qkv_residual(
-                block,
-                x,
-                idx if ve_weight is not None else None,
-                ve_weight,
-                cos_sin,
-                self.window_sizes[i],
+            ve = (
+                self.value_embeds[str(i)](idx).to(x.dtype)
+                if ve_weight is not None
+                else None
             )
+            x = resid_scale * x + x0_scale * x0
+            x = _attn_native_residual(block, x, ve, cos_sin, self.window_sizes[i])
         x = _mlp_residual(block, x)
         if i == backout_layer:
             x_backout = x
@@ -493,7 +525,7 @@ def _apply() -> dict[str, dict]:
     gpt_mod.MLP.forward = _patched_mlp_forward
     # Block.forward: opt-in via NANOOPS_FUSED_MLP_BLOCK=1. Replaces the
     # mlp half of Block.forward — `x + mlp(norm(x))` — with a single
-    # `fused_mlp_block(x, None, W_fc, W_proj)` call that collapses
+    # `fused_mlp_block(x, W_fc, W_proj)` call that collapses
     # norm + c_fc + relu² + c_proj + outer residual into 3 fwd Triton
     # kernels + 4 bwd Triton kernels.
     # See nanoops/TRITON_zh.md §3 for the fusion breakdown. Supersedes
@@ -513,7 +545,7 @@ def _apply() -> dict[str, dict]:
     # the fused op owns the outer RMSNorm that nanchat applies one level up in
     # Block.forward, and it needs token ids + VE table to fuse value embedding.
     if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
-        from .triton_kernels import norm_qkv_projection as _nqp
+        from .triton_kernels import norm_qkv_projection_with_residual_mix as _nqp
 
         assert _orig_gpt_forward is None, (
             "_orig_gpt_forward already captured — call _restore() before _apply()"

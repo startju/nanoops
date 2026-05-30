@@ -6,9 +6,11 @@ backward. Re-exported through `nanoops.triton_kernels`.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
+from torch.library import wrap_triton
 
 try:
     import triton
@@ -17,6 +19,24 @@ try:
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
+
+
+def _pick_head_group(n_head: int) -> int:
+    """Pick how many heads one Triton program handles in a static loop."""
+    value = os.environ.get("NANOOPS_FLASH_SDPA_HEAD_GROUP")
+    if value is None:
+        return 1
+    head_group = int(value)
+    if head_group <= 0:
+        raise ValueError(f"NANOOPS_FLASH_SDPA_HEAD_GROUP must be > 0, got {value}")
+    return min(head_group, n_head)
+
+
+def _pick_sdpa_tile_config(head_dim: int) -> tuple[int, int, int, int]:
+    """Return `(block_m, block_n, num_warps, num_stages)` for SDPA kernels."""
+    if head_dim >= 128:
+        return 32, 32, 4, 1
+    return 64, 64, 4, 1
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -76,12 +96,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _flash_attn_fwd_kernel(
-        Q,  # (B, H, M, D) — in: query
-        K,  # (B, H, N, D) — in: key
-        V,  # (B, H, N, D) — in: value
+        Q,  # (B, M, H, D) — in: query
+        K,  # (B, N, H, D) — in: key
+        V,  # (B, N, H, D) — in: value
         sm_scale,  # float — attention scale, usually D**-0.5
-        LSE,  # (B, H, M) fp32 — out: row log-sum-exp for bwd
-        O,  # (B, H, M, D) — out: attention output
+        LSE,  # (B, M, H) fp32 — out: row log-sum-exp for bwd
+        OUT,  # (B, M, H, D) — out: attention output
         B,  # int — batch size
         H,  # int — number of attention heads
         M,  # int — query sequence length
@@ -89,145 +109,160 @@ if _HAS_TRITON:
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_DMODEL: tl.constexpr,
+        M_TILES: tl.constexpr,
+        HEAD_GROUP: tl.constexpr,
+        D: tl.constexpr,
     ):
-        """Forward: one program per (batch × head × Q-tile-of-BLOCK_M-rows)."""
-        pid_bh = tl.program_id(0)
-        pid_m = tl.program_id(1)
-        bid = pid_bh // H
-        hid = pid_bh % H
+        """Forward: one program per (batch × Q-tile × head-group).
 
-        # v1 requires contiguous Q/K/V/O and H_q == H_kv, so offsets are
-        # standard row-major. This keeps the kernel signature short; add
-        # explicit strides back if we later support packed/non-contiguous layouts.
-        bh_base = (bid * H + hid)
-        q_off = bh_base * M * BLOCK_DMODEL
-        k_off = bh_base * N * BLOCK_DMODEL
-        v_off = bh_base * N * BLOCK_DMODEL
-        o_off = bh_base * M * BLOCK_DMODEL
-        lse_off = bh_base * M
+        Q/K/V/OUT stay in contiguous `(B, T, H, D)` layout at the kernel
+        boundary. The launch grid prioritizes `(batch, row-tile)` on axis 0
+        and groups heads on axis 1. If HEAD_GROUP covers all heads, the grid
+        does not split the head dimension; the program loops over heads inside.
+        """
+        pid_bm = tl.program_id(0)
+        pid_hg = tl.program_id(1)
+        bid = pid_bm // M_TILES
+        pid_m = pid_bm - bid * M_TILES
 
-        # Q tile: load BLOCK_M rows of Q for this program. Stays resident.
+        # v1 requires contiguous (B, T, H, D) Q/K/V/OUT and H_q == H_kv.
+        # This keeps the kernel signature short; add explicit strides back
+        # if we later support packed/non-contiguous layouts.
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, BLOCK_DMODEL)
-        q_ptrs = Q + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
+        offs_d = tl.arange(0, D)
         m_mask = offs_m < M
-        q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
-
-        # Online softmax state per Q row.
-        m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
-        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
-
-        # Sliding-causal: each query at position i (= offs_m[i_local]) can
-        # attend to keys in [max(0, i - W + 1), i]. So we only need to
-        # stream K/V tiles whose j range overlaps with that band.
-        # For this Q tile (rows pid_m*BLOCK_M .. pid_m*BLOCK_M+BLOCK_M-1):
-        #   j_min_required = max(0, pid_m*BLOCK_M - WINDOW + 1)
-        #   j_max_required = pid_m*BLOCK_M + BLOCK_M - 1
-        # Convert to tile indices on K (BLOCK_N-wide tiles):
         kv_tile_start = tl.maximum(0, pid_m * BLOCK_M - WINDOW + 1) // BLOCK_N
-        kv_tile_end = tl.minimum(N, pid_m * BLOCK_M + BLOCK_M) // BLOCK_N + 1
+        kv_high = tl.minimum(N, pid_m * BLOCK_M + BLOCK_M)
+        kv_tile_end = (kv_high + BLOCK_N - 1) // BLOCK_N
+        batch_q_base = bid * M * H * D
+        batch_k_base = bid * N * H * D
+        batch_lse_base = bid * M * H
 
-        for kv_idx in range(kv_tile_start, kv_tile_end):
-            offs_n = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
-            n_mask = offs_n < N
+        for head_off in tl.static_range(0, HEAD_GROUP):
+            hid = pid_hg * HEAD_GROUP + head_off
+            head_mask = hid < H
+            q_base = batch_q_base + hid * D
+            k_base = batch_k_base + hid * D
+            v_base = batch_k_base + hid * D
+            o_base = batch_q_base + hid * D
+            lse_base = batch_lse_base + hid
 
-            # Load K, V tiles
-            k_ptrs = (
-                K + k_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
+            # Q tile: load BLOCK_M rows of Q for this program/head.
+            q_ptrs = Q + q_base + offs_m[:, None] * H * D + offs_d[None, :]
+            q = tl.load(
+                q_ptrs,
+                mask=m_mask[:, None] & head_mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            # Online softmax state per Q row.
+            m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+            l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+            acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+            for kv_idx in range(kv_tile_start, kv_tile_end):
+                offs_n = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+                n_mask = offs_n < N
+
+                k_ptrs = K + k_base + offs_n[:, None] * H * D + offs_d[None, :]
+                v_ptrs = V + v_base + offs_n[:, None] * H * D + offs_d[None, :]
+                kv_mask = n_mask[:, None] & head_mask
+                k_tile = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+                v_tile = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+
+                s = tl.dot(q, tl.trans(k_tile), input_precision="ieee") * sm_scale
+
+                j = offs_n[None, :]
+                i = offs_m[:, None]
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & m_mask[:, None]
+                    & n_mask[None, :]
+                    & head_mask
+                )
+                s = tl.where(mask_keep, s, -float("inf"))
+
+                m_new = tl.maximum(m_i, tl.max(s, axis=1))
+                all_masked = m_new == -float("inf")
+                alpha = tl.where(all_masked, 1.0, tl.exp(m_i - m_new))
+                p_unscaled = tl.where(
+                    all_masked[:, None],
+                    0.0,
+                    tl.exp(s - m_new[:, None]),
+                )
+                l_i = l_i * alpha + tl.sum(p_unscaled, axis=1)
+                acc = acc * alpha[:, None] + tl.dot(
+                    p_unscaled.to(v_tile.dtype),
+                    v_tile,
+                    input_precision="ieee",
+                )
+                m_i = m_new
+
+            acc = acc / l_i[:, None]
+            lse = m_i + tl.log(l_i)
+
+            o_ptrs = OUT + o_base + offs_m[:, None] * H * D + offs_d[None, :]
+            tl.store(
+                o_ptrs,
+                acc.to(OUT.dtype.element_ty),
+                mask=m_mask[:, None] & head_mask,
             )
-            v_ptrs = (
-                V + v_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
-            )
-            k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
-            v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
 
-            # Scores = Q @ K^T * scale, shape (BLOCK_M, BLOCK_N)
-            s = tl.dot(q, tl.trans(k_tile), input_precision="ieee") * sm_scale
-
-            # Apply sliding+causal mask per cell:
-            #   keep if  j ≤ i  AND  j ≥ i - W + 1
-            j = offs_n[None, :]
-            i = offs_m[:, None]
-            mask_keep = (
-                (j <= i) & (j >= i - WINDOW + 1) & m_mask[:, None] & n_mask[None, :]
-            )
-            s = tl.where(mask_keep, s, -float("inf"))
-
-            # Online softmax update. CRITICAL: when an entire row's scores
-            # were masked to -inf (sliding-window edge where this Q row's
-            # window doesn't overlap this K tile at all), m_new stays at -inf
-            # for that row. Then `exp(m_i - m_new) = exp(-inf - -inf) = exp(NaN)
-            # = NaN`, which contaminates the accumulator forever. Guard with
-            # tl.where so a "no valid keys this tile" row leaves m_i / l_i / acc
-            # unchanged (alpha=1, contribution=0).
-            m_new = tl.maximum(m_i, tl.max(s, axis=1))
-            all_masked = m_new == -float("inf")
-            alpha = tl.where(all_masked, 1.0, tl.exp(m_i - m_new))
-            p_unscaled = tl.where(all_masked[:, None], 0.0, tl.exp(s - m_new[:, None]))
-            l_i = l_i * alpha + tl.sum(p_unscaled, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(
-                p_unscaled.to(v_tile.dtype),
-                v_tile,
-                input_precision="ieee",
-            )
-            m_i = m_new
-
-        # Finalize: output / l, save LSE = m + log(l)
-        acc = acc / l_i[:, None]
-        lse = m_i + tl.log(l_i)
-
-        o_ptrs = O + o_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
-        tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=m_mask[:, None])
-
-        lse_ptrs = LSE + lse_off + offs_m
-        tl.store(lse_ptrs, lse, mask=m_mask)
+            lse_ptrs = LSE + lse_base + offs_m * H
+            tl.store(lse_ptrs, lse, mask=m_mask & head_mask)
 
     @triton.jit
     def _flash_attn_bwd_preprocess_kernel(
-        O,  # (B, H, M, D) — in: forward output
-        dO,  # (B, H, M, D) — in: gradient of output
-        D,  # (B, H, M) fp32 — out: row dot(O, dO)
+        OUT,  # (B, M, H, D) — in: forward output
+        dO,  # (B, M, H, D) — in: gradient of output
+        DELTA,  # (B, M, H) fp32 — out: row dot(O, dO)
         B,  # int — batch size
         H,  # int — number of attention heads
         M,  # int — query sequence length
         BLOCK_M: tl.constexpr,
-        BLOCK_DMODEL: tl.constexpr,
+        M_TILES: tl.constexpr,
+        HEAD_GROUP: tl.constexpr,
+        D: tl.constexpr,
     ):
-        """Precompute D[i] = sum_j o[i, j] * dO[i, j] — used in bwd to skip
+        """Precompute Delta[i] = sum_j o[i, j] * dO[i, j] — used in bwd to skip
         the inner softmax-bwd reduction. This is the classic Flash trick."""
-        pid_bh = tl.program_id(0)
-        pid_m = tl.program_id(1)
-        bid = pid_bh // H
-        hid = pid_bh % H
+        pid_bm = tl.program_id(0)
+        pid_hg = tl.program_id(1)
+        bid = pid_bm // M_TILES
+        pid_m = pid_bm - bid * M_TILES
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, BLOCK_DMODEL)
+        offs_d = tl.arange(0, D)
         m_mask = offs_m < M
+        batch_q_base = bid * M * H * D
+        batch_lse_base = bid * M * H
 
-        bh_base = bid * H + hid
-        o_off = bh_base * M * BLOCK_DMODEL
-        o_ptrs = O + o_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
-        do_ptrs = dO + o_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
-        o = tl.load(o_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
-        do = tl.load(do_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
-        d_row = tl.sum(o * do, axis=1)
-        d_ptrs = D + bh_base * M + offs_m
-        tl.store(d_ptrs, d_row, mask=m_mask)
+        for head_off in tl.static_range(0, HEAD_GROUP):
+            hid = pid_hg * HEAD_GROUP + head_off
+            head_mask = hid < H
+            o_base = batch_q_base + hid * D
+            o_ptrs = OUT + o_base + offs_m[:, None] * H * D + offs_d[None, :]
+            do_ptrs = dO + o_base + offs_m[:, None] * H * D + offs_d[None, :]
+            mask = m_mask[:, None] & head_mask
+            o = tl.load(o_ptrs, mask=mask, other=0.0).to(tl.float32)
+            do = tl.load(do_ptrs, mask=mask, other=0.0).to(tl.float32)
+            d_row = tl.sum(o * do, axis=1)
+            d_ptrs = DELTA + batch_lse_base + offs_m * H + hid
+            tl.store(d_ptrs, d_row, mask=m_mask & head_mask)
 
     @triton.jit
     def _flash_attn_bwd_kernel(
-        Q,  # (B, H, M, D) — in: query
-        K,  # (B, H, N, D) — in: key
-        V,  # (B, H, N, D) — in: value
+        Q,  # (B, M, H, D) — in: query
+        K,  # (B, N, H, D) — in: key
+        V,  # (B, N, H, D) — in: value
         sm_scale,  # float — attention scale
-        LSE,  # (B, H, M) fp32 — in: saved row log-sum-exp
-        D,  # (B, H, M) fp32 — in: row dot(O, dO)
-        dO,  # (B, H, M, D) — in: grad wrt output
-        dQ,  # (B, H, M, D) — out: grad wrt query
-        dK,  # (B, H, N, D) — out: grad wrt key, atomic accumulated
-        dV,  # (B, H, N, D) — out: grad wrt value, atomic accumulated
+        LSE,  # (B, M, H) fp32 — in: saved row log-sum-exp
+        DELTA,  # (B, M, H) fp32 — in: row dot(O, dO)
+        dO,  # (B, M, H, D) — in: grad wrt output
+        dQ,  # (B, M, H, D) — out: grad wrt query
+        dK,  # (B, N, H, D) — out: grad wrt key, atomic accumulated
+        dV,  # (B, N, H, D) — out: grad wrt value, atomic accumulated
         B,  # int — batch size
         H,  # int — number of attention heads
         M,  # int — query sequence length
@@ -235,221 +270,303 @@ if _HAS_TRITON:
         WINDOW: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_DMODEL: tl.constexpr,
+        M_TILES: tl.constexpr,
+        HEAD_GROUP: tl.constexpr,
+        D: tl.constexpr,
     ):
         """Backward: iterate Q tiles, stream K/V tiles within the sliding band.
         Atomic-add dK/dV across overlapping Q tiles (each K position can be
         touched by multiple Q tiles within the window)."""
-        pid_bh = tl.program_id(0)
-        pid_m = tl.program_id(1)
-        bid = pid_bh // H
-        hid = pid_bh % H
+        pid_bm = tl.program_id(0)
+        pid_hg = tl.program_id(1)
+        bid = pid_bm // M_TILES
+        pid_m = pid_bm - bid * M_TILES
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, BLOCK_DMODEL)
+        offs_d = tl.arange(0, D)
         m_mask = offs_m < M
 
-        bh_base = bid * H + hid
-        q_off = bh_base * M * BLOCK_DMODEL
-        k_off = bh_base * N * BLOCK_DMODEL
-        v_off = bh_base * N * BLOCK_DMODEL
-        lse_off = bh_base * M
-
-        # Load Q tile, dO tile, LSE, D for this Q range
-        q_ptrs = Q + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
-        do_ptrs = dO + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
-        lse_ptrs = LSE + lse_off + offs_m
-        d_ptrs = D + lse_off + offs_m
-        q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
-        do = tl.load(do_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
-        lse = tl.load(lse_ptrs, mask=m_mask, other=0.0)
-        d_row = tl.load(d_ptrs, mask=m_mask, other=0.0)
-
-        # dQ accumulator
-        dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
-
         kv_tile_start = tl.maximum(0, pid_m * BLOCK_M - WINDOW + 1) // BLOCK_N
-        kv_tile_end = tl.minimum(N, pid_m * BLOCK_M + BLOCK_M) // BLOCK_N + 1
+        kv_high = tl.minimum(N, pid_m * BLOCK_M + BLOCK_M)
+        kv_tile_end = (kv_high + BLOCK_N - 1) // BLOCK_N
+        batch_q_base = bid * M * H * D
+        batch_k_base = bid * N * H * D
+        batch_lse_base = bid * M * H
 
-        for kv_idx in range(kv_tile_start, kv_tile_end):
-            offs_n = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
-            n_mask = offs_n < N
+        for head_off in tl.static_range(0, HEAD_GROUP):
+            hid = pid_hg * HEAD_GROUP + head_off
+            head_mask = hid < H
+            q_base = batch_q_base + hid * D
+            k_base = batch_k_base + hid * D
+            v_base = batch_k_base + hid * D
+            lse_base = batch_lse_base + hid
 
-            k_ptrs = (
-                K + k_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
+            # Load Q tile, dO tile, LSE, Delta for this Q range/head.
+            q_ptrs = Q + q_base + offs_m[:, None] * H * D + offs_d[None, :]
+            do_ptrs = dO + q_base + offs_m[:, None] * H * D + offs_d[None, :]
+            lse_ptrs = LSE + lse_base + offs_m * H
+            d_ptrs = DELTA + lse_base + offs_m * H
+            q_mask = m_mask[:, None] & head_mask
+            q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+            do = tl.load(do_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+            lse = tl.load(lse_ptrs, mask=m_mask & head_mask, other=0.0)
+            d_row = tl.load(d_ptrs, mask=m_mask & head_mask, other=0.0)
+
+            dq_acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+            for kv_idx in range(kv_tile_start, kv_tile_end):
+                offs_n = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+                n_mask = offs_n < N
+
+                k_ptrs = K + k_base + offs_n[:, None] * H * D + offs_d[None, :]
+                v_ptrs = V + v_base + offs_n[:, None] * H * D + offs_d[None, :]
+                kv_mask = n_mask[:, None] & head_mask
+                k_tile = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+                v_tile = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+
+                s = tl.dot(q, tl.trans(k_tile), input_precision="ieee") * sm_scale
+                j = offs_n[None, :]
+                i = offs_m[:, None]
+                mask_keep = (
+                    (j <= i)
+                    & (j >= i - WINDOW + 1)
+                    & m_mask[:, None]
+                    & n_mask[None, :]
+                    & head_mask
+                )
+                s = tl.where(mask_keep, s, -float("inf"))
+                p = tl.exp(s - lse[:, None])
+
+                dv = tl.dot(tl.trans(p).to(do.dtype), do, input_precision="ieee")
+                dp = tl.dot(do, tl.trans(v_tile), input_precision="ieee")
+                ds = p * (dp - d_row[:, None]) * sm_scale
+                dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile, input_precision="ieee")
+                dk = tl.dot(tl.trans(ds).to(q.dtype), q, input_precision="ieee")
+
+                dk_ptrs = dK + k_base + offs_n[:, None] * H * D + offs_d[None, :]
+                dv_ptrs = dV + v_base + offs_n[:, None] * H * D + offs_d[None, :]
+                tl.atomic_add(
+                    dk_ptrs,
+                    dk.to(dK.dtype.element_ty),
+                    mask=n_mask[:, None] & head_mask,
+                )
+                tl.atomic_add(
+                    dv_ptrs,
+                    dv.to(dV.dtype.element_ty),
+                    mask=n_mask[:, None] & head_mask,
+                )
+
+            dq_ptrs = dQ + q_base + offs_m[:, None] * H * D + offs_d[None, :]
+            tl.store(
+                dq_ptrs,
+                dq_acc.to(dQ.dtype.element_ty),
+                mask=m_mask[:, None] & head_mask,
             )
-            v_ptrs = (
-                V + v_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
-            )
-            k_tile = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
-            v_tile = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
-
-            # Recompute P[i, j] = exp(s[i, j] * sm_scale - LSE[i])
-            s = tl.dot(q, tl.trans(k_tile), input_precision="ieee") * sm_scale
-            j = offs_n[None, :]
-            i = offs_m[:, None]
-            mask_keep = (
-                (j <= i) & (j >= i - WINDOW + 1) & m_mask[:, None] & n_mask[None, :]
-            )
-            s = tl.where(mask_keep, s, -float("inf"))
-            p = tl.exp(s - lse[:, None])
-
-            # dV += P^T @ dO  (BLOCK_N, BLOCK_DMODEL)
-            dv = tl.dot(tl.trans(p).to(do.dtype), do, input_precision="ieee")
-            # dP = dO @ V^T  (BLOCK_M, BLOCK_N)
-            dp = tl.dot(do, tl.trans(v_tile), input_precision="ieee")
-            # dS = P * (dP - D)  (BLOCK_M, BLOCK_N)
-            ds = p * (dp - d_row[:, None]) * sm_scale
-            # dQ += dS @ K
-            dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile, input_precision="ieee")
-            # dK += dS^T @ Q
-            dk = tl.dot(tl.trans(ds).to(q.dtype), q, input_precision="ieee")
-
-            # Atomic-add dK, dV (overlapping Q tiles touch same K rows)
-            dk_ptrs = (
-                dK + k_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
-            )
-            dv_ptrs = (
-                dV + v_off + offs_n[:, None] * BLOCK_DMODEL + offs_d[None, :]
-            )
-            tl.atomic_add(dk_ptrs, dk.to(dK.dtype.element_ty), mask=n_mask[:, None])
-            tl.atomic_add(dv_ptrs, dv.to(dV.dtype.element_ty), mask=n_mask[:, None])
-
-        # Write dQ (single contributor per Q tile — no atomic needed)
-        dq_ptrs = dQ + q_off + offs_m[:, None] * BLOCK_DMODEL + offs_d[None, :]
-        tl.store(dq_ptrs, dq_acc.to(dQ.dtype.element_ty), mask=m_mask[:, None])
 
 
-class FlashSDPA(torch.autograd.Function):
-    """Flash-style sliding-causal SDPA in Triton (no GQA, no kv-cache).
+def _flash_sdpa_fwd_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run Flash-style sliding-causal SDPA and return `(out, lse)`.
 
-    Forward: O = softmax(QK^T * scale) V with sliding-causal masking
-    (each query attends to keys in [i - W + 1, i]). Memory-efficient:
-    no (L, L) P matrix materialized; only LSE (L,) saved per (B, H) row.
+    Args:
+      q: (B, M, H, D) contiguous CUDA query tensor.
+      k: (B, N, H, D) contiguous CUDA key tensor; v1 requires N == M.
+      v: (B, N, H, D) contiguous CUDA value tensor.
+      window_size: total visible keys per query.
 
-    Backward: standard Flash recompute strategy — re-derive P from
-    Q@K^T + LSE per-tile, accumulate dQ, dK, dV with atomics for the
-    overlapping dK/dV contributions.
+    Returns:
+      out: (B, M, H, D), dtype=q.dtype.
+      lse: (B, M, H), fp32 row log-sum-exp for backward.
     """
+    if not _HAS_TRITON:
+        raise RuntimeError("flash_sdpa requires triton")
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    assert q.shape == k.shape == v.shape, (
+        f"v1 requires H_q == H_kv and same L: q{q.shape} k{k.shape} v{v.shape}"
+    )
+    B, M, H, D = q.shape
+    N = k.shape[1]
+    sm_scale = D**-0.5
 
-    @staticmethod
-    def forward(
-        ctx: Any,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        window_size: int,
-    ) -> torch.Tensor:
-        """Run sliding-causal scaled dot-product attention.
+    out = torch.empty_like(q)
+    lse = torch.empty((B, M, H), dtype=torch.float32, device=q.device)
 
-        Args:
-          q: (B, H, M, D) contiguous CUDA query tensor.
-          k: (B, H, N, D) contiguous CUDA key tensor; v1 requires N == M.
-          v: (B, H, N, D) contiguous CUDA value tensor.
-          window_size: number of keys visible to each query.
+    block_m, block_n, num_warps, num_stages = _pick_sdpa_tile_config(D)
+    # Keep tensor layout as `(B, T, H, D)` into Triton. The launch grid
+    # prioritizes batch/row tiles on axis 0 and uses axis 1 for heads.
+    m_tiles = triton.cdiv(M, block_m)
+    head_group = _pick_head_group(H)
+    grid = (B * m_tiles, triton.cdiv(H, head_group))
+    wrap_triton(_flash_attn_fwd_kernel)[grid](
+        q,
+        k,
+        v,
+        sm_scale,
+        lse,
+        out,
+        B,
+        H,
+        M,
+        N,
+        WINDOW=window_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        M_TILES=m_tiles,
+        HEAD_GROUP=head_group,
+        D=D,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out, lse
 
-        Returns:
-          (B, H, M, D) attention output."""
-        assert q.is_cuda and k.is_cuda and v.is_cuda
-        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-        assert q.shape == k.shape == v.shape, (
-            f"v1 requires H_q == H_kv and same L: q{q.shape} k{k.shape} v{v.shape}"
-        )
-        B, H, M, D = q.shape
-        N = k.shape[2]
-        sm_scale = D**-0.5
 
-        o = torch.empty_like(q)
-        lse = torch.empty((B, H, M), dtype=torch.float32, device=q.device)
+def _flash_sdpa_bwd_impl(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backprop for Flash-style sliding-causal SDPA.
 
-        BLOCK_M, BLOCK_N = 64, 64
-        grid = (B * H, triton.cdiv(M, BLOCK_M))
-        _flash_attn_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            sm_scale,
-            lse,
-            o,
-            B,
-            H,
-            M,
-            N,
-            WINDOW=window_size,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=D,
-        )
+    Args:
+      do: (B, M, H, D), grad wrt forward output.
+      q/k/v: (B, M, H, D), saved forward inputs.
+      out: (B, M, H, D), saved forward output.
+      lse: (B, M, H), fp32 saved forward row log-sum-exp.
+      window_size: total visible keys per query.
 
-        ctx.save_for_backward(q, k, v, o, lse)
-        ctx.sm_scale = sm_scale
-        ctx.window_size = window_size
-        ctx.BLOCK_M = BLOCK_M
-        ctx.BLOCK_N = BLOCK_N
-        return o
+    Returns:
+      dq, dk, dv with the same shapes/dtypes as q, k, v.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("flash_sdpa backward requires triton")
+    do = do.contiguous()
+    B, M, H, D = q.shape
+    N = k.shape[1]
+    sm_scale = D**-0.5
+    block_m, block_n, num_warps, num_stages = _pick_sdpa_tile_config(D)
+    head_group = _pick_head_group(H)
 
-    @staticmethod
-    def backward(
-        ctx: Any,
-        do: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-        """Backprop for sliding-causal attention.
+    # Delta[i] = sum_j out[i, j] * dO[i, j].
+    delta = torch.empty((B, M, H), dtype=torch.float32, device=q.device)
+    block_m_pre = block_m
+    m_tiles_pre = triton.cdiv(M, block_m_pre)
+    grid_pre = (B * m_tiles_pre, triton.cdiv(H, head_group))
+    wrap_triton(_flash_attn_bwd_preprocess_kernel)[grid_pre](
+        out,
+        do,
+        delta,
+        B,
+        H,
+        M,
+        BLOCK_M=block_m_pre,
+        M_TILES=m_tiles_pre,
+        HEAD_GROUP=head_group,
+        D=D,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
 
-        Args:
-          do: (B, H, M, D) gradient of attention output.
+    # dQ is one-writer per Q tile; dK/dV need atomic accumulation across
+    # overlapping sliding-window Q tiles.
+    dq = torch.empty_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    m_tiles = triton.cdiv(M, block_m)
+    grid_bwd = (B * m_tiles, triton.cdiv(H, head_group))
+    wrap_triton(_flash_attn_bwd_kernel)[grid_bwd](
+        q,
+        k,
+        v,
+        sm_scale,
+        lse,
+        delta,
+        do,
+        dq,
+        dk,
+        dv,
+        B,
+        H,
+        M,
+        N,
+        WINDOW=window_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        M_TILES=m_tiles,
+        HEAD_GROUP=head_group,
+        D=D,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return dq, dk, dv
 
-        Returns:
-          Gradients for (q, k, v, window_size)."""
-        q, k, v, o, lse = ctx.saved_tensors
-        do = do.contiguous()
-        sm_scale = ctx.sm_scale
-        window_size = ctx.window_size
-        BLOCK_M, BLOCK_N = ctx.BLOCK_M, ctx.BLOCK_N
-        B, H, M, D = q.shape
-        N = k.shape[2]
 
-        # D[i] = sum_j o[i, j] * dO[i, j]
-        d = torch.empty((B, H, M), dtype=torch.float32, device=q.device)
-        BLOCK_M_PRE = 64
-        grid_pre = (B * H, triton.cdiv(M, BLOCK_M_PRE))
-        _flash_attn_bwd_preprocess_kernel[grid_pre](
-            o,
-            do,
-            d,
-            B,
-            H,
-            M,
-            BLOCK_M=BLOCK_M_PRE,
-            BLOCK_DMODEL=D,
-        )
+@torch.library.triton_op(
+    "nanoops::flash_sdpa_fwd",
+    mutates_args=(),
+)
+def _flash_sdpa_fwd_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton-op forward wrapper returning `(out, lse)`."""
+    return _flash_sdpa_fwd_impl(q, k, v, window_size)
 
-        # dQ, dK, dV allocated as zero (dK, dV need accumulation via atomic).
-        dq = torch.empty_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        grid_bwd = (B * H, triton.cdiv(M, BLOCK_M))
-        _flash_attn_bwd_kernel[grid_bwd](
-            q,
-            k,
-            v,
-            sm_scale,
-            lse,
-            d,
-            do,
-            dq,
-            dk,
-            dv,
-            B,
-            H,
-            M,
-            N,
-            WINDOW=window_size,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=D,
-        )
 
-        return dq, dk, dv, None
+@torch.library.triton_op(
+    "nanoops::flash_sdpa_bwd",
+    mutates_args=(),
+)
+def _flash_sdpa_bwd_op(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton-op backward wrapper returning `(dq, dk, dv)`."""
+    return _flash_sdpa_bwd_impl(do, q, k, v, out, lse, window_size)
+
+
+def _flash_sdpa_setup_context(
+    ctx: Any,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int],
+    output: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Save tensors for `nanoops::flash_sdpa_fwd` backward."""
+    q, k, v, window_size = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.window_size = window_size
+
+
+def _flash_sdpa_autograd_backward(
+    ctx: Any,
+    do: torch.Tensor,
+    _d_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    """Autograd callback for Flash-style SDPA."""
+    q, k, v, out, lse = ctx.saved_tensors
+    dq, dk, dv = _flash_sdpa_bwd_op(do, q, k, v, out, lse, ctx.window_size)
+    return dq, dk, dv, None
+
+
+_flash_sdpa_fwd_op.register_autograd(
+    _flash_sdpa_autograd_backward,
+    setup_context=_flash_sdpa_setup_context,
+)
 
 
 def flash_sdpa(
@@ -458,17 +575,18 @@ def flash_sdpa(
     v: torch.Tensor,
     window_size: int,
 ) -> torch.Tensor:
-    """Flash-style sliding-causal SDPA. q, k, v: (B, H, L, D), H_q == H_kv.
+    """Flash-style sliding-causal SDPA. q, k, v: (B, L, H, D), H_q == H_kv.
 
     window_size: total keys each query attends to (= nanchat's window+1).
 
     Args:
-      q: (B, H, L, D) contiguous CUDA query tensor.
-      k: (B, H, L, D) contiguous CUDA key tensor.
-      v: (B, H, L, D) contiguous CUDA value tensor.
+      q: (B, L, H, D) contiguous CUDA query tensor.
+      k: (B, L, H, D) contiguous CUDA key tensor.
+      v: (B, L, H, D) contiguous CUDA value tensor.
       window_size: total visible keys per query.
 
     Returns:
-      (B, H, L, D) attention output.
+      (B, L, H, D) attention output.
     """
-    return FlashSDPA.apply(q, k, v, window_size)
+    out, _lse = _flash_sdpa_fwd_op(q, k, v, window_size)
+    return out

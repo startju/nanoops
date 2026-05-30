@@ -863,16 +863,15 @@ dtype（bf16），不在 HBM 里物化 bf16 权重副本。
 
 数学：
 ```
-y = x + relu²(RMSNorm(x) · norm_weight @ W_fc.T) @ W_proj.T
+y = x + relu²(RMSNorm(x) @ W_fc.T) @ W_proj.T
 ```
 
 API 签名：
 
 ```python
-def fused_mlp_block(x, norm_weight, fc_weight, proj_weight, eps=1e-6) -> y
-#   norm_weight=None 时退化为无 affine 的 plain RMSNorm
-#   x、fc_weight、proj_weight，以及存在时的 norm_weight 都必须是
-#   contiguous CUDA tensors
+def fused_mlp_block(x, fc_weight, proj_weight, eps=1e-6) -> y
+#   x、fc_weight、proj_weight 都必须是 contiguous CUDA tensors
+#   RMSNorm 固定是无 affine 版本；Python 入口不再接收 norm_weight。
 ```
 
 caller 在外面做 outer residual 的预求和（如果有），这个 block 只做
@@ -887,13 +886,13 @@ matmul 本身是 compute-bound，但 bwd 的 dz/dW_proj/dW_fc/dx 每一步都
 
 | 阶段 | Kernel | Grid | 干什么 |
 |---|---|---|---|
-| Fwd 0 | `_fused_add_norm_fwd_kernel`（重用 ch2 的）| 1D over M | RMSNorm 算 `x_hat` + 副产物 `rms_inv` |
+| Fwd 0 | `_rms_norm_fwd_kernel` | 1D over M | 无 affine RMSNorm 算 `x_hat` + 副产物 `rms_inv` |
 | Fwd 1 | `_cast_matmul_kernel` | 2D over (M, N_fc) | `z = x_hat @ W_fc.T`，W_fc 在 load 里 inline cast |
 | Fwd 2 | `_relu_sq_linear_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
 | Bwd A | `_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + 副产物 `inner_buf`（D 要用）|
 | Bwd B | `_mlp_dW_proj_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj`（fp32 master 输出）|
 | Bwd C | `_mlp_dW_fc_bwd_kernel` | 2D over (N_fc, K) | `dW_fc`（fp32 master 输出）|
-| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + RMSNorm bwd + outer residual fold → `dx` (+ `dnw`) |
+| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + 无 affine RMSNorm bwd + outer residual fold → `dx` |
 
 **fwd/bwd 全 Triton 是故意的**——nanchat 训练时 d24 shape (M=2048, N_fc=6144,
 K=1536) 上，每个 matmul 都能跟相邻的 elementwise / weight cast / reduction
@@ -905,36 +904,33 @@ matmul 相对 cuBLAS 的 10-15% 效率劣势。Step 1 看起来是孤立的大 m
 
 ### 3.2 Forward
 
-#### 3.2.1 Step 0 —— RMSNorm 复用 ch2 的 add+norm kernel
+#### 3.2.1 Step 0 —— 无 affine RMSNorm
 
-复用 `_fused_add_norm_fwd_kernel`，新加 `HAS_RESIDUAL: tl.constexpr` 开关
-跳过 add 路径：
+fwd 使用本文件内的小 `_rms_norm_fwd_kernel`：
 
 ```python
 # Step 0 caller (_fused_mlp_block_fwd_impl)
-_fused_add_norm_fwd_kernel[...](
-    x, x, nw_arg,                  # res_ptr 不会被读；传 x 当占位
-    x_hat, x, rms_inv,             # summed_ptr 不会被写；传 x 当占位
+_rms_norm_fwd_kernel[...](
+    x,
+    x_hat,
+    rms_inv,
     M, K, eps,
     BLOCK_M=norm_cfg.block_m, BLOCK_D=BLOCK_D_NORM,
-    HAS_NW=has_nw, HAS_RESIDUAL=False,
     num_warps=norm_cfg.num_warps,
 )
 ```
 
 kernel 体里：
 ```python
-if HAS_RESIDUAL:
-    r = tl.load(res_ptr + offs, ...)
-    summed = x + r
-    tl.store(summed_ptr + offs, summed, ...)
-else:
-    summed = x   # caller 把 x 直接当 residual stream 用
+x = tl.load(x_ptr + rows[:, None] * K + cols[None, :], ...)
+rms_inv = rsqrt(sum(x * x) / K + eps)
+x_hat = x * rms_inv[:, None]
+tl.store(x_hat_ptr + ..., x_hat.to(x_hat_ptr.dtype.element_ty), ...)
+tl.store(rms_inv_ptr + rows, rms_inv, ...)
 ```
 
-为什么不写一个独立的 plain-norm kernel？因为这个 kernel **副产物 `rms_inv`
-正是 bwd 要的**——独立写一个就要重复维护 rsqrt+精度对齐这套逻辑。
-HAS_RESIDUAL=False 时占位指针不会被 dereference，安全。
+这里固定是无 affine：nanchat 热路径的 RMSNorm 没有 learnable per-channel
+scale，Python API 也不再接收 `norm_weight`。
 
 #### 3.2.2 Step 1 —— `_cast_matmul_kernel`：c_fc + inline weight cast
 
@@ -1011,7 +1007,7 @@ tl.store(y_ptr + offs, y, ...)
 
 ### 3.3 Backward —— 4 个 Triton kernel 全包
 
-bwd 出 4 个梯度：`dz, dW_proj, dW_fc, dx + dnw`。这 4 个 reduction 轴
+bwd 出 4 个梯度 tensor：`dz, dW_proj, dW_fc, dx`。这 4 个 reduction 轴
 互相正交（A reduce K_out、B reduce M、C reduce M、D reduce N_fc），所以
 **不可能塞进单 kernel**。但每一步都跟相邻 elementwise fuse 掉了一次 HBM
 round-trip。
@@ -1140,17 +1136,11 @@ B 是这一组里唯一不需要 inline weight cast 的 matmul——dy 和 z 都
 #### 3.3.3 Step C —— `_mlp_dW_fc_bwd_kernel`：dz.T @ x_hat，x_hat 重算
 
 ```python
-if HAS_NW:
-    nw = tl.load(nw_ptr + ks, ...)              # bf16
-
 acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
 for m_start in range(0, M, BLOCK_M):
     x = tl.load(x_ptr + ..., ...)               # bf16
     rms_inv = tl.load(rms_inv_ptr + ms, ...)    # fp32
-    if HAS_NW:
-        x_hat = x * rms_inv[:, None] * nw[None, :]   # fp32（auto-promote）
-    else:
-        x_hat = x * rms_inv[:, None]
+    x_hat = x * rms_inv[:, None]                # fp32（auto-promote）
 
     dz_tile = tl.load(...)                                       # bf16
     acc += tl.dot(tl.trans(dz_tile), x_hat.to(dz_tile.dtype))    # bf16 @ bf16
@@ -1159,13 +1149,12 @@ tl.store(dW_fc_ptr + ..., acc.to(dW_fc_ptr.dtype.element_ty), ...)
 ```
 
 **x_hat 在 GEMM inner loop 里现场重算**——不需要在 fwd 时把 x_hat 写到
-HBM 给 bwd 用（forward 里 ctx 只存 `x`、`rms_inv`、`norm_weight`，x_hat
-丢弃）。
+HBM 给 bwd 用（forward 里 ctx 只存 `x` 和 `rms_inv`，x_hat 丢弃）。
 
 这相当于跟「cuBLAS 版」对比：
 ```
 [cuBLAS path]
-x_hat = (x * rms_inv * nw).contiguous()        # M·K HBM 写
+x_hat = (x * rms_inv).contiguous()             # M·K HBM 写
 dW_fc = dz.T @ x_hat                            # M·K HBM 读 + cuBLAS matmul
 ```
 
@@ -1207,11 +1196,7 @@ x = tl.load(x_ptr + offs, ...)                   # bf16
 dy = tl.load(dy_ptr + offs, ...)                 # bf16 native（passthrough）
 
 y_norm = x * rms_inv[:, None]                    # fp32（auto-promote）
-if HAS_NW:
-    nw = tl.load(nw_ptr + ks, ...)               # bf16
-    g_eff = dx_hat * nw[None, :]                 # fp32
-else:
-    g_eff = dx_hat
+g_eff = dx_hat
 
 # 一行汇总：RMSNorm bwd norm path → cast bf16 → + dy
 dx = (rms_inv[:, None] * (g_eff - y_norm * inner[:, None])).to(bf16) + dy
@@ -1234,30 +1219,22 @@ unlock 了用 BLOCK_M=64、BLOCK_K=64 这种 tensor core 友好的 tile（如果
 **3. outer-residual 折进 store**——`+ dy` 在 kernel 内完成，不需要外面的
 Python `dx_total = dx_norm + dy` 那一步 + 一次额外 HBM round-trip。
 
-D 还顺路写 `dnw_partial`（per-tile sum，caller 再 `.sum(dim=0)` 收成 dnw）
-when HAS_NW=True。dx_hat 反正在 register 里，多一个 `tl.sum(dx_hat * y_norm)`
-基本免费。
-
 **D 的配置分叉 + shared-mem 预算**：bf16 路径 sweep winner 是
-`(BLOCK_K=64, BLOCK_N=128, nw=8, st=2)`，~1043 μs，比 (64,64,nw=4,st=3) 的
-~1456 μs 快 28%。但同样的配置在 fp32 IEEE 路径（parity test 走的路径）下
-per-stage shared mem `(64·128 + 128·64)·4 = 64 KB`，×2 stages = 128 KB —— 
-超过 3090 SM 的 100 KB 预算。Triton 不会 launch 失败，而是**静默 miscompile**，
-backward parity test 直接挂 dx off by 8000+。所以 caller 里按 `ieee` 分叉：
+`(BLOCK_K=64, BLOCK_N=64, nw=4, st=2)`。fp32 IEEE 路径（parity test 走的路径）
+用更保守的 staging，所以 caller 里按 `ieee` 分叉：
 
 ```python
 if ieee:
     BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3   # fp32-safe (80 KB/2 stages)
 else:
-    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 128, 8, 2  # bf16 winner
+    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 4, 2   # bf16 winner
 ```
 
 这是 d24 sweep 时第一波 autotune 全 kernel 撞出来的坑——autotune 会试图
 跑所有候选，shared-mem 超的那些不报错、出错误结果、autotune 选了一个看
 起来"最快"但是答案错的配置。后续放弃 autotune dispatch，改成 manual sweep
 + 按预算筛配置 + caller 锁死的方案，顺带也跟 CUDA Graph capture 兼容（autotune
-dispatch 不能在 graph capture mode 下用）。BLOCK_M=64 固定（dnw_partials
-shape `(num_m_tiles, K)` 依赖它）。
+dispatch 不能在 graph capture mode 下用）。dx kernel 的 BLOCK_M 固定为 64。
 
 ##### dx 公式表达式里的精度路径
 
@@ -1275,7 +1252,7 @@ defer 招——dy 不需要升 fp32，最后那次加法在 bf16 里完成。
 |---|---|---|
 | Fwd c_fc matmul (z = x_hat @ W_fc) | Triton (`_cast_matmul_kernel`) | fp32→bf16 weight cast 折进 load，省 36 MB HBM 往返 + 1 launch，盖过 cuBLAS ~10-15% 效率优势 |
 | Fwd relu² + c_proj + residual | Triton | 三 op fused，r 不出 HBM；proj_w 同样 inline cast |
-| Fwd RMSNorm | Triton | 复用 ch2 的 add+norm kernel（HAS_RESIDUAL=False） |
+| Fwd RMSNorm | Triton | 本地无 affine RMSNorm kernel 写 x_hat + rms_inv |
 | Bwd dz (A) | Triton | matmul + relu² bwd + atomic_add 副产物，三 in one；proj_w inline cast |
 | Bwd dW_proj (B) | Triton | r 重算 fused 进 matmul；输出直接落 fp32 master |
 | Bwd dW_fc (C) | Triton | x_hat 重算 fused 进 matmul；输出直接落 fp32 master |
@@ -1297,7 +1274,7 @@ master 上。
 
 | 操作 | dtype | 原因 |
 |---|---|---|
-| HBM load: x, z, dy, dz, nw | bf16 native | caller dtype |
+| HBM load: x, z, dy, dz | bf16 native | caller dtype |
 | HBM load: W_fc, W_proj | fp32 native (master) | nanchat 用 fp32 master weight |
 | HBM load: rms_inv, inner_buf | fp32 native | 精度敏感的副产物 |
 | Weight cast `W_*.to(activation.dtype)` | bf16 (in register) | inline cast 在 dot 前，bf16 weight tile 不出 register |
@@ -1384,9 +1361,9 @@ Fused（4 个 Triton kernel）：
 ```
 A:  rd dy + z + W_proj, wr dz, atomic inner_buf  (no dr to HBM)
 B:  rd dy + z, wr dW_proj                        (no r to HBM)
-C:  rd dz + x + rms_inv + nw, wr dW_fc           (no x_hat to HBM)
-D:  rd dz + W_fc + x + rms_inv + nw + dy + inner_buf, wr dx + dnw_partial
-                                                  (no dx_hat / dnw to HBM directly)
+C:  rd dz + x + rms_inv, wr dW_fc               (no x_hat to HBM)
+D:  rd dz + W_fc + x + rms_inv + dy + inner_buf, wr dx
+                                                  (no dx_hat to HBM directly)
 合计:
   - 省了 dr (M·N)、r (M·N)、x_hat (M·K)、dx_hat (M·K)、dx_norm (M·K) 这些
     中间 buffer 的 HBM round-trip
@@ -1449,12 +1426,12 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
         return x + self.mlp(_orig_norm(x))          # CPU / kv-cache fallback
     B, T, C = x.shape
     x_2d = x.reshape(B * T, C).contiguous()
-    y_2d = _fused_mlp_block(x_2d, None, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
+    y_2d = _fused_mlp_block(x_2d, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
     return y_2d.reshape(B, T, C)
 ```
 
-`norm_weight=None` 是因为 nanchat 的 RMSNorm 不带 affine（无 γ）；
-`_orig_norm` 是原 `Block.norm`，被捕获在 module global 里。
+fused block 固定使用 nanchat 的无 affine RMSNorm；`_orig_norm` 是原
+`Block.norm`，被捕获在 module global 里。
 
 **单 op 增益不完全等于 end-to-end 增益**，但 `fused_mlp_block` 现在
 封装成 `torch.library.custom_op`（fwd / bwd 各一个，配 `register_fake`

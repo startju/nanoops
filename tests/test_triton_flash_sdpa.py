@@ -21,11 +21,16 @@ from nanoops.functional import sliding_window_sdpa
 ])
 def test_forward_parity_fp32(B, H, L, D, W):
     torch.manual_seed(0)
-    q = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
-    k = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
-    v = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
+    q = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
 
-    o_ref = sliding_window_sdpa(q, k, v, W)
+    o_ref = sliding_window_sdpa(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        W,
+    ).transpose(1, 2)
     o_triton = flash_sdpa(q, k, v, W)
     max_diff = (o_ref - o_triton).abs().max().item()
     assert torch.allclose(o_ref, o_triton, atol=1e-3), \
@@ -38,14 +43,19 @@ def test_forward_parity_fp32(B, H, L, D, W):
 ])
 def test_backward_parity_fp32(B, H, L, D, W):
     torch.manual_seed(0)
-    q0 = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
-    k0 = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
-    v0 = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
-    g = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda")
+    q0 = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
+    k0 = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
+    v0 = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
+    g = torch.randn(B, L, H, D, dtype=torch.float32, device="cuda")
 
     # Reference
     q1, k1, v1 = q0.clone().requires_grad_(True), k0.clone().requires_grad_(True), v0.clone().requires_grad_(True)
-    sliding_window_sdpa(q1, k1, v1, W).backward(g)
+    sliding_window_sdpa(
+        q1.transpose(1, 2),
+        k1.transpose(1, 2),
+        v1.transpose(1, 2),
+        W,
+    ).transpose(1, 2).backward(g)
 
     # Triton
     q2, k2, v2 = q0.clone().requires_grad_(True), k0.clone().requires_grad_(True), v0.clone().requires_grad_(True)

@@ -930,15 +930,14 @@ bf16 weight tile never gets materialized in HBM.
 
 Math:
 ```
-y = x + relu²(RMSNorm(x) · norm_weight @ W_fc.T) @ W_proj.T
+y = x + relu²(RMSNorm(x) @ W_fc.T) @ W_proj.T
 ```
 
 API:
 ```python
-def fused_mlp_block(x, norm_weight, fc_weight, proj_weight, eps=1e-6) -> y
-#   norm_weight=None ⇒ plain RMSNorm without per-channel affine
-#   x, fc_weight, proj_weight, and norm_weight when present must be
-#   contiguous CUDA tensors
+def fused_mlp_block(x, fc_weight, proj_weight, eps=1e-6) -> y
+#   x, fc_weight, and proj_weight must be contiguous CUDA tensors
+#   RMSNorm is plain no-affine; there is no Python norm_weight argument.
 ```
 
 The caller pre-sums any outer residual if needed; this block does the
@@ -954,13 +953,13 @@ The matmul itself is compute-bound, but each bwd step
 
 | Stage | Kernel | Grid | Role |
 |---|---|---|---|
-| Fwd 0 | `_fused_add_norm_fwd_kernel` (reused from ch2) | 1D over M | RMSNorm computes `x_hat` + side-output `rms_inv` |
+| Fwd 0 | `_rms_norm_fwd_kernel` | 1D over M | Plain RMSNorm computes `x_hat` + side-output `rms_inv` |
 | Fwd 1 | `_cast_matmul_kernel` | 2D over (M, N_fc) | `z = x_hat @ W_fc.T`, W_fc cast inline at load |
 | Fwd 2 | `_relu_sq_linear_residual_fwd_kernel` | 2D over (M, K_out) | relu² + c_proj + outer residual add → `y` |
 | Bwd A | `_mlp_dz_bwd_kernel` | 2D over (M, N_fc) | `dz` + side-output `inner_buf` (D needs it) |
 | Bwd B | `_mlp_dW_proj_bwd_kernel` | 2D over (K_out, N_fc) | `dW_proj` (fp32 master output) |
 | Bwd C | `_mlp_dW_fc_bwd_kernel` | 2D over (N_fc, K) | `dW_fc` (fp32 master output) |
-| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + RMSNorm bwd + outer residual fold → `dx` (+ `dnw`) |
+| Bwd D | `_mlp_dx_bwd_kernel` | 2D over (M, K) | `dx_hat` matmul + no-affine RMSNorm bwd + outer residual fold → `dx` |
 
 **All-Triton fwd/bwd is intentional**. At d24 shape (M=2048,
 N_fc=6144, K=1536), every matmul can fuse one HBM round-trip or one
@@ -973,38 +972,34 @@ cast folded into the load. See §3.4.
 
 ### 3.2 Forward
 
-#### 3.2.1 Step 0 — RMSNorm reuses ch2's add+norm kernel
+#### 3.2.1 Step 0 — no-affine RMSNorm
 
-The fwd reuses `_fused_add_norm_fwd_kernel` with the
-`HAS_RESIDUAL: tl.constexpr` switch flipped off:
+The fwd runs a small local `_rms_norm_fwd_kernel`:
 
 ```python
 # Step 0 caller (_fused_mlp_block_fwd_impl)
-_fused_add_norm_fwd_kernel[...](
-    x, x, nw_arg,                  # res_ptr is unread; pass x as placeholder
-    x_hat, x, rms_inv,             # summed_ptr is unwritten; pass x as placeholder
+_rms_norm_fwd_kernel[...](
+    x,
+    x_hat,
+    rms_inv,
     M, K, eps,
     BLOCK_M=norm_cfg.block_m, BLOCK_D=BLOCK_D_NORM,
-    HAS_NW=has_nw, HAS_RESIDUAL=False,
     num_warps=norm_cfg.num_warps,
 )
 ```
 
 Inside the kernel:
 ```python
-if HAS_RESIDUAL:
-    r = tl.load(res_ptr + offs, ...)
-    summed = x + r
-    tl.store(summed_ptr + offs, summed, ...)
-else:
-    summed = x   # caller uses x directly as the residual stream
+x = tl.load(x_ptr + rows[:, None] * K + cols[None, :], ...)
+rms_inv = rsqrt(sum(x * x) / K + eps)
+x_hat = x * rms_inv[:, None]
+tl.store(x_hat_ptr + ..., x_hat.to(x_hat_ptr.dtype.element_ty), ...)
+tl.store(rms_inv_ptr + rows, rms_inv, ...)
 ```
 
-Why not write a standalone plain-norm kernel? Because **this kernel's
-`rms_inv` side-output is exactly what bwd needs** — writing a fresh
-one would mean re-implementing the rsqrt + precision-alignment logic.
-When HAS_RESIDUAL=False the placeholder pointers are never
-dereferenced, so it's safe.
+This is deliberately no-affine: nanchat's RMSNorm has no learnable
+per-channel scale on the hot path, and the Python API no longer accepts
+one.
 
 #### 3.2.2 Step 1 — `_cast_matmul_kernel`: c_fc + inline weight cast
 
@@ -1088,7 +1083,7 @@ Patterns to notice:
 
 ### 3.3 Backward — 4 Triton kernels do it all
 
-bwd produces 4 gradients: `dz, dW_proj, dW_fc, dx + dnw`. The four
+bwd produces 4 gradient tensors: `dz, dW_proj, dW_fc, dx`. The four
 reduction axes are mutually orthogonal (A reduces K_out, B reduces M,
 C reduces M, D reduces N_fc), so **packing them into a single kernel
 isn't possible**. But each step fuses one HBM round-trip with an
@@ -1232,17 +1227,11 @@ not fp32 master), there's nothing to cast.
 #### 3.3.3 Step C — `_mlp_dW_fc_bwd_kernel`: dz.T @ x_hat, x_hat recomputed
 
 ```python
-if HAS_NW:
-    nw = tl.load(nw_ptr + ks, ...)              # bf16
-
 acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
 for m_start in range(0, M, BLOCK_M):
     x = tl.load(x_ptr + ..., ...)               # bf16
     rms_inv = tl.load(rms_inv_ptr + ms, ...)    # fp32
-    if HAS_NW:
-        x_hat = x * rms_inv[:, None] * nw[None, :]   # fp32 (auto-promote)
-    else:
-        x_hat = x * rms_inv[:, None]
+    x_hat = x * rms_inv[:, None]                # fp32 (auto-promote)
 
     dz_tile = tl.load(...)                                       # bf16
     acc += tl.dot(tl.trans(dz_tile), x_hat.to(dz_tile.dtype))    # bf16 @ bf16
@@ -1251,13 +1240,13 @@ tl.store(dW_fc_ptr + ..., acc.to(dW_fc_ptr.dtype.element_ty), ...)
 ```
 
 **x_hat is reconstructed in the GEMM inner loop** — fwd doesn't have
-to write x_hat to HBM for bwd's sake (forward's ctx saves only `x`,
-`rms_inv`, `norm_weight`; x_hat is discarded).
+to write x_hat to HBM for bwd's sake (forward's ctx saves only `x`
+and `rms_inv`; x_hat is discarded).
 
 Compared to the cuBLAS path:
 ```
 [cuBLAS path]
-x_hat = (x * rms_inv * nw).contiguous()        # M·K HBM write
+x_hat = (x * rms_inv).contiguous()             # M·K HBM write
 dW_fc = dz.T @ x_hat                            # M·K HBM read + cuBLAS matmul
 ```
 
@@ -1300,11 +1289,7 @@ x = tl.load(x_ptr + offs, ...)                   # bf16
 dy = tl.load(dy_ptr + offs, ...)                 # bf16 native (passthrough)
 
 y_norm = x * rms_inv[:, None]                    # fp32 (auto-promote)
-if HAS_NW:
-    nw = tl.load(nw_ptr + ks, ...)               # bf16
-    g_eff = dx_hat * nw[None, :]                 # fp32
-else:
-    g_eff = dx_hat
+g_eff = dx_hat
 
 # One-line merge: RMSNorm bwd norm path → cast bf16 → + dy
 dx = (rms_inv[:, None] * (g_eff - y_norm * inner[:, None])).to(bf16) + dy
@@ -1332,25 +1317,16 @@ fire).
 no external Python `dx_total = dx_norm + dy` step and no extra HBM
 round-trip.
 
-D also writes `dnw_partial` along the way (a per-tile sum that the
-caller reduces via `.sum(dim=0)` into dnw) when HAS_NW=True. Since
-dx_hat is already in registers, an extra `tl.sum(dx_hat * y_norm)`
-is essentially free.
-
 **D's config bifurcation + shared-mem budget**: the d24 bf16 sweep
-winner is `(BLOCK_K=64, BLOCK_N=128, nw=8, st=2)` at ~1043 μs, 28%
-faster than `(64,64,nw=4,st=3)` at ~1456 μs. But in the fp32 IEEE
-path (which parity tests take), per-stage shared mem is
-`(64·128 + 128·64)·4 = 64 KB`, ×2 stages = 128 KB — over the 3090
-SM's 100 KB budget. Triton doesn't fail the launch; it **silently
-miscompiles**, and the backward parity test shows dx off by 8000+.
-So the caller bifurcates on `ieee`:
+winner is `(BLOCK_K=64, BLOCK_N=64, nw=4, st=2)`. The fp32 IEEE path
+(which parity tests take) uses a more conservative staging choice, so
+the caller bifurcates on `ieee`:
 
 ```python
 if ieee:
     BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 8, 3   # fp32-safe (80 KB / 2 stages)
 else:
-    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 128, 8, 2  # bf16 winner
+    BLOCK_K_D, BLOCK_N_D, NW_D, ST_D = 64, 64, 4, 2   # bf16 winner
 ```
 
 This was a trap discovered when we first tried `@triton.autotune`
@@ -1359,9 +1335,8 @@ over-budget ones produced wrong results silently, and autotune
 picked one that "looked fastest" but had wrong output. The fix was
 to drop autotune dispatch entirely, switch to a manual sweep with
 shared-mem filtering, and lock configs in the caller. Side benefit:
-works with CUDA Graph capture (autotune dispatch doesn't).
-BLOCK_M=64 is fixed (`dnw_partials` shape `(num_m_tiles, K)` depends
-on it).
+works with CUDA Graph capture (autotune dispatch doesn't). BLOCK_M=64
+is fixed for the dx kernel.
 
 ##### Precision path in the dx formula
 
@@ -1380,7 +1355,7 @@ to be promoted, the final add happens in bf16.
 |---|---|---|
 | Fwd c_fc matmul (z = x_hat @ W_fc) | Triton (`_cast_matmul_kernel`) | fp32→bf16 weight cast folded into load, saves 36 MB HBM round-trip + 1 launch, beats cuBLAS's ~10-15% efficiency edge |
 | Fwd relu² + c_proj + residual | Triton | three ops fused, r never to HBM; proj_w also cast inline |
-| Fwd RMSNorm | Triton | reuses ch2's add+norm kernel (HAS_RESIDUAL=False) |
+| Fwd RMSNorm | Triton | local no-affine RMSNorm kernel writes x_hat + rms_inv |
 | Bwd dz (A) | Triton | matmul + relu² bwd + atomic_add side-output, three in one; proj_w cast inline |
 | Bwd dW_proj (B) | Triton | r recomputed and fused into matmul; output goes straight to fp32 master |
 | Bwd dW_fc (C) | Triton | x_hat recomputed and fused into matmul; output goes straight to fp32 master |
@@ -1405,7 +1380,7 @@ in HBM**:
 
 | Operation | dtype | Why |
 |---|---|---|
-| HBM load: x, z, dy, dz, nw | bf16 native | caller dtype |
+| HBM load: x, z, dy, dz | bf16 native | caller dtype |
 | HBM load: W_fc, W_proj | fp32 native (master) | nanchat uses fp32 master weights |
 | HBM load: rms_inv, inner_buf | fp32 native | precision-sensitive side-outputs |
 | Weight cast `W_*.to(activation.dtype)` | bf16 (in register) | inline cast before dot, bf16 weight tile never leaves registers |
@@ -1494,9 +1469,9 @@ Fused (4 Triton kernels):
 ```
 A:  rd dy + z + W_proj, wr dz, atomic inner_buf  (no dr to HBM)
 B:  rd dy + z, wr dW_proj                        (no r to HBM)
-C:  rd dz + x + rms_inv + nw, wr dW_fc           (no x_hat to HBM)
-D:  rd dz + W_fc + x + rms_inv + nw + dy + inner_buf, wr dx + dnw_partial
-                                                  (no dx_hat / dnw to HBM directly)
+C:  rd dz + x + rms_inv, wr dW_fc               (no x_hat to HBM)
+D:  rd dz + W_fc + x + rms_inv + dy + inner_buf, wr dx
+                                                  (no dx_hat to HBM directly)
 Total:
   - dr (M·N), r (M·N), x_hat (M·K), dx_hat (M·K), dx_norm (M·K) — none of
     these intermediates go to HBM
@@ -1564,13 +1539,12 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
         return x + self.mlp(_orig_norm(x))          # CPU / kv-cache fallback
     B, T, C = x.shape
     x_2d = x.reshape(B * T, C).contiguous()
-    y_2d = _fused_mlp_block(x_2d, None, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
+    y_2d = _fused_mlp_block(x_2d, self.mlp.c_fc.weight, self.mlp.c_proj.weight)
     return y_2d.reshape(B, T, C)
 ```
 
-`norm_weight=None` because nanchat's RMSNorm has no affine (no γ);
-`_orig_norm` is the original `Block.norm`, captured in a module
-global at patch time.
+The fused block always uses nanchat's no-affine RMSNorm; `_orig_norm`
+is the original `Block.norm`, captured in a module global at patch time.
 
 **Single-op gain doesn't translate 1:1 to end-to-end gain**, but
 `fused_mlp_block` is now wrapped as `torch.library.custom_op` (paired
