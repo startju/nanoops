@@ -57,6 +57,10 @@ export NANOOPS_L_ATTN_CHECKPOINT="${NANOOPS_L_ATTN_CHECKPOINT:-1}"
 # torch.compile black-box dilutes that. Opt out with empty value.
 # CPU / kv-cache fallback already wired in _patched_block_forward.
 export NANOOPS_FUSED_MLP_BLOCK="${NANOOPS_FUSED_MLP_BLOCK:-1}"
+# Fused attention QKV ON by default — swaps the training trunk through
+# GPT.forward so outer RMSNorm + Q/K/V projection + rotary + QK norm + VE
+# lookup run in the custom Triton op. Empty value disables it for A/B runs.
+export NANOOPS_FUSED_ATTN_QKV="${NANOOPS_FUSED_ATTN_QKV-1}"
 
 NPROC=${NPROC:-2}
 WANDB_RUN=${WANDB_RUN:-dummy}

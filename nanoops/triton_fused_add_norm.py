@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, NamedTuple
 
 import torch
+from torch.library import wrap_triton
 
 try:
     import triton
@@ -51,7 +52,7 @@ except ImportError:
 #   Fallback — _fused_add_norm_inner_kernel + _fused_add_norm_bwd_kernel:
 #     Flash-Attention style 2-pass (pre-compute inner[m], then 2D-tile
 #     grid over (M, D) for d_summed + dnw_partial). Engages when inline
-#     would spill (HAS_NW=True at D ≥ 16K).
+#     would spill (HAS_NW=True at D ≥ 32K).
 #   Both paths fold d_summed_external (caller's direct gradient w.r.t.
 #   summed) into the kernel's d_summed store, saving an extra Python
 #   `+` op + its HBM round-trip.
@@ -115,7 +116,7 @@ def _pick_tile_config(M: int, BLOCK_D: int, n_live_tiles: int) -> TileConfig:
 
     Returns a `TileConfig`. The caller should inspect `fits_reg_budget`
     when the kernel is known to spill catastrophically at large tiles
-    (e.g. the bwd inline kernel at D > 16K with HAS_NW=True) — and
+    (e.g. the bwd inline kernel at D ≥ 32K with HAS_NW=True) — and
     pick a different code path if it returns False. nw is capped at 16
     regardless of tile size, so for very large BLOCK_D the budget can
     be exceeded even with maxed-out nw.
@@ -544,7 +545,7 @@ def _fused_add_norm_fwd_impl(
     # valid placeholder pointer (Triton still requires the arg).
     grid = (triton.cdiv(M, BLOCK_M),)
     nw_arg = norm_weight if has_nw else x
-    _fused_add_norm_fwd_kernel[grid](
+    wrap_triton(_fused_add_norm_fwd_kernel)[grid](
         x,
         residual,
         nw_arg,
@@ -580,7 +581,7 @@ def _fused_add_norm_bwd_impl(
           Wins 1.5–2.4× on most shapes (kernel-only).
       (B) 2-kernel D-split fallback `_fused_add_norm_inner_kernel` +
           `_fused_add_norm_bwd_kernel` — used when inline tile would
-          exceed Ampere's 255 fp32 reg/thread cap (HAS_NW=True at D ≥ 16K).
+          exceed Ampere's 255 fp32 reg/thread cap (HAS_NW=True at D ≥ 32K).
 
     Both paths reconstruct y_norm = ynorm_src · rms_inv (when HAS_NW=True;
     when HAS_NW=False ynorm_src IS y_norm). The fwd→bwd save strategy is
@@ -630,7 +631,7 @@ def _fused_add_norm_bwd_impl(
         else:
             nw_arg = dnw_arg = ynorm_src  # dummy ptrs; kernel skips deref
 
-        _fused_add_norm_bwd_inline_kernel[(num_m_tiles,)](
+        wrap_triton(_fused_add_norm_bwd_inline_kernel)[(num_m_tiles,)](
             ynorm_src,
             rms_inv,
             nw_arg,
@@ -663,7 +664,9 @@ def _fused_add_norm_bwd_impl(
         # (n_live_tiles=2: y_norm and g_eff alive together briefly).
         INNER_BLOCK_D = triton.next_power_of_2(D)
         inner_cfg = _pick_tile_config(M, INNER_BLOCK_D, n_live_tiles=2)
-        _fused_add_norm_inner_kernel[(triton.cdiv(M, inner_cfg.block_m),)](
+        wrap_triton(_fused_add_norm_inner_kernel)[
+            (triton.cdiv(M, inner_cfg.block_m),)
+        ](
             ynorm_src,
             rms_inv,
             nw_arg,
@@ -678,7 +681,9 @@ def _fused_add_norm_bwd_impl(
         )
 
         # Stage 2: bwd reads pre-computed inner; 2D grid splits D.
-        _fused_add_norm_bwd_kernel[(num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))](
+        wrap_triton(_fused_add_norm_bwd_kernel)[
+            (num_m_tiles, triton.cdiv(D, BLOCK_D_BWD))
+        ](
             ynorm_src,
             rms_inv,
             nw_arg,
@@ -694,23 +699,19 @@ def _fused_add_norm_bwd_impl(
             HAS_NW=has_nw,
             num_warps=NUM_WARPS_BWD,
         )
-
     dnw = dnw_partials.sum(dim=0) if has_nw else None
     return d_summed, dnw
 
 
-# ── torch.library.custom_op wrapping — opaque to dynamo. Without this,
-# calling fused_add_norm under torch.compile would either graph-break
-# (autograd.Function) or attempt to trace into the Triton kernels with
-# FakeTensors and crash on .data_ptr() (allow_in_graph). custom_op tells
-# dynamo "opaque op, here's its shape via register_fake, here's its
-# autograd". Same pattern used in `triton_fused_mlp_block.py`. ──
+# ── torch.library.triton_op wrapping — visible to torch.compile ──
+# triton_op + wrap_triton lets Dynamo/AOTAutograd decompose the op into
+# its inner Triton launches during compile, matching the MLP/QKV fused
+# ops while preserving a single public autograd-registered API.
 
 
-@torch.library.custom_op(
+@torch.library.triton_op(
     "nanoops::fused_add_norm_fwd",
     mutates_args=(),
-    device_types="cuda",
 )
 def _fused_add_norm_fwd_op(
     x: torch.Tensor,
@@ -718,7 +719,7 @@ def _fused_add_norm_fwd_op(
     norm_weight: torch.Tensor | None,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Custom op wrapper for `_fused_add_norm_fwd_impl`.
+    """Triton-op forward wrapper for `_fused_add_norm_fwd_impl`.
 
     Args:
       x: (M, D) contiguous CUDA tensor.
@@ -731,35 +732,16 @@ def _fused_add_norm_fwd_op(
     return _fused_add_norm_fwd_impl(x, residual, norm_weight, eps)
 
 
-@_fused_add_norm_fwd_op.register_fake
-def _fused_add_norm_fwd_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fake tensor shape function for fused_add_norm_fwd.
-
-    Returns tensors shaped like `_fused_add_norm_fwd_op` without touching CUDA."""
-    M, _D = x.shape
-    return (
-        torch.empty_like(x),  # y
-        torch.empty_like(x),  # summed
-        torch.empty((M,), dtype=torch.float32, device=x.device),  # rms_inv
-    )
-
-
-# custom_op return types can't be Optional[Tensor], so we always return
+# triton_op return types can't be Optional[Tensor], so we always return
 # two tensors and use a 1-elem placeholder for dnw when norm_weight is
 # None. The autograd wrapper below substitutes that placeholder back to
 # None before returning to autograd (autograd requires None grad for a
 # None input).
 
 
-@torch.library.custom_op(
+@torch.library.triton_op(
     "nanoops::fused_add_norm_bwd",
     mutates_args=(),
-    device_types="cuda",
 )
 def _fused_add_norm_bwd_op(
     dy: torch.Tensor,
@@ -768,7 +750,7 @@ def _fused_add_norm_bwd_op(
     norm_weight: torch.Tensor | None,
     rms_inv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Custom op wrapper for `_fused_add_norm_bwd_impl`.
+    """Triton-op backward wrapper for `_fused_add_norm_bwd_impl`.
 
     Args:
       dy: (M, D) gradient of y.
@@ -778,7 +760,7 @@ def _fused_add_norm_bwd_op(
       rms_inv: (M,) fp32 inverse RMS.
 
     Returns:
-      (d_summed, dnw_or_placeholder), both tensors for custom_op schema
+      (d_summed, dnw_or_placeholder), both tensors for triton_op schema
       compatibility."""
     d_summed, dnw = _fused_add_norm_bwd_impl(
         dy, d_summed_external, ynorm_src, norm_weight, rms_inv
@@ -788,31 +770,12 @@ def _fused_add_norm_bwd_op(
     return d_summed, dnw
 
 
-@_fused_add_norm_bwd_op.register_fake
-def _fused_add_norm_bwd_fake(
-    dy: torch.Tensor,
-    d_summed_external: torch.Tensor,
-    ynorm_src: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    rms_inv: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fake tensor shape function for fused_add_norm_bwd.
-
-    Returns d_summed shaped like ynorm_src and dnw shaped like norm_weight
-    when present, otherwise the custom op's 1-element placeholder."""
-    if norm_weight is not None:
-        dnw = torch.empty_like(norm_weight)
-    else:
-        dnw = torch.empty(1, dtype=ynorm_src.dtype, device=ynorm_src.device)
-    return torch.empty_like(ynorm_src), dnw
-
-
 def _fused_add_norm_setup_context(
     ctx: Any,
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float],
     output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
-    """Save the minimum tensors needed by the custom op autograd formula."""
+    """Save the minimum tensors needed by the Triton-op autograd formula."""
     _x, _residual, norm_weight, _eps = inputs
     y, summed, rms_inv = output
     # ynorm_src is `summed` when norm_weight exists (bwd needs to multiply
@@ -874,11 +837,8 @@ def fused_add_norm(
     and the mlp block's norm-input (or symmetrically between mlp output
     and the next layer's attn norm-input).
 
-    Implemented as a `torch.library.custom_op` (with register_fake +
-    register_autograd) so torch.compile keeps the op as an opaque FX node
-    instead of breaking the graph at the call — see
-    `_fused_add_norm_fwd_impl` / `_fused_add_norm_bwd_impl` for the actual
-    kernel call sequences.
+    Implemented as a `torch.library.triton_op` with `wrap_triton` kernel
+    launches so torch.compile can see and schedule the inner Triton work.
 
     Args:
       x: (M, D) contiguous CUDA tensor.
@@ -888,7 +848,7 @@ def fused_add_norm(
 
     Returns:
       (y, summed), both (M, D) tensors with x.dtype."""
-    # custom_op returns (y, summed, rms_inv); rms_inv is saved-for-backward
+    # triton_op returns (y, summed, rms_inv); rms_inv is saved-for-backward
     # only, so we drop it here and return the original (y, summed) shape.
     y, summed, _rms_inv = _fused_add_norm_fwd_op(x, residual, norm_weight, eps)
     return y, summed

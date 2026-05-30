@@ -83,7 +83,7 @@ def test_backward_parity(has_nw):
 def test_fused_mlp_block_rejects_noncontiguous_inputs():
     M, K, N_fc = 8, 16, 32
     x = torch.randn(M, K, dtype=torch.float32, device="cuda")
-    norm_w = torch.randn(2, K, dtype=torch.float32, device="cuda")[0]
+    norm_w = torch.randn(K, 2, dtype=torch.float32, device="cuda")[:, 0]
     W_fc = torch.randn(K, N_fc, dtype=torch.float32, device="cuda").t()
     W_proj = torch.randn(N_fc, K, dtype=torch.float32, device="cuda").t()
 

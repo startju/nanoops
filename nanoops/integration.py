@@ -29,6 +29,7 @@ Patched ops:
   Class methods (targeted swaps, can't be reached via F-namespace):
     nanochat.gpt.MLP.forward             — relu_square fused
                                              + optional MLP activation ckpt
+    nanochat.gpt.GPT.forward             — optional fused attention QKV path
     nanochat.gpt.CausalSelfAttention.forward
                                           — optional L-layer activation ckpt
     nanochat.flash_attention._sdpa_attention
@@ -61,6 +62,7 @@ import nanoops.functional as nF
 # Captured at _apply() time so the L-attn checkpoint wrapper can call the
 # un-patched original CausalSelfAttention.forward. _restore() resets to None.
 _orig_attn_forward = None
+_orig_gpt_forward = None
 
 
 _F_OVERRIDES = {
@@ -166,6 +168,161 @@ def _patched_block_forward(self, x, ve, cos_sin, window_size, kv_cache):
 # `nanchat.gpt.F` through nanoops).
 _orig_norm = None
 _fused_mlp_block = None
+_fused_attn_qkv = None
+
+
+def _attn_qkv_residual(self, x, ve_ids, ve_weight, cos_sin, window_size):
+    """Attention residual using fused outer RMSNorm + QKV/rotary/QK-norm.
+
+    This replaces `x + self.attn(norm(x), ve, ...)` in training. The fusion must
+    live above `CausalSelfAttention.forward` because nanchat normally applies
+    `norm(x)` in `Block.forward`, while `norm_qkv_projection` owns that outer
+    RMSNorm internally. `ve_ids`/`ve_weight` are passed separately so the Triton
+    op can fuse the value-embedding lookup instead of consuming a precomputed
+    `ve` tensor.
+    """
+    B, T, _C = x.shape
+    attn = self.attn
+    has_ve = ve_weight is not None
+    ve_gate_weight = attn.ve_gate.weight if has_ve else None
+    q, k, v = _fused_attn_qkv(
+        x,
+        None,
+        ve_ids if has_ve else None,
+        ve_weight,
+        attn.ve_gate_channels if has_ve else 1,
+        ve_gate_weight,
+        attn.c_q.weight,
+        attn.c_k.weight,
+        attn.c_v.weight,
+        cos_sin[0],
+        cos_sin[1],
+        attn.n_head,
+        attn.n_kv_head,
+        attn.head_dim,
+        1.2,
+        1e-6,
+    )
+    y = _gpt_mod().flash_attn.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        window_size=window_size,
+    )
+    y = y.contiguous().view(B, T, -1)
+    y = attn.c_proj(y)
+    return x + y
+
+
+def _gpt_mod():
+    return importlib.import_module("nanochat.gpt")
+
+
+def _mlp_residual(self, x):
+    if _fused_mlp_block is None:
+        return x + self.mlp(_gpt_mod().norm(x))
+
+    B, T, C = x.shape
+    x_2d = x.reshape(B * T, C).contiguous()
+    y_2d = _fused_mlp_block(
+        x_2d,
+        None,
+        self.mlp.c_fc.weight,
+        self.mlp.c_proj.weight,
+    )
+    return y_2d.reshape(B, T, C)
+
+
+def _patched_gpt_forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+    """GPT.forward with fused training attention QKV.
+
+    Falls back to the original forward for inference/KV-cache and non-CUDA
+    paths. Training base_train uses fixed-shape CUDA batches, which is the path
+    this fusion is tuned for.
+    """
+    if kv_cache is not None or not idx.is_cuda:
+        return _orig_gpt_forward(self, idx, targets, kv_cache, loss_reduction)
+
+    gpt_mod = _gpt_mod()
+    B, T = idx.size()
+
+    assert T <= self.cos.size(1), (
+        f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+    )
+    assert idx.device == self.cos.device, (
+        f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+    )
+    assert self.cos.dtype == gpt_mod.COMPUTE_DTYPE, (
+        f"Rotary embeddings must be in {gpt_mod.COMPUTE_DTYPE}, got {self.cos.dtype}"
+    )
+    cos_sin = self.cos[:, :T], self.sin[:, :T]
+
+    x = self.transformer.wte(idx)
+    x = x.to(gpt_mod.COMPUTE_DTYPE)
+    x = gpt_mod.norm(x)
+
+    # Smear: same training path as nanochat.gpt.GPT.forward.
+    assert T > 1, "Training forward pass should have T > 1"
+    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+    x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+
+    x0 = x
+    n_layer = self.config.n_layer
+    backout_layer = n_layer // 2
+    x_backout = None
+    for i, block in enumerate(self.transformer.h):
+        x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        ve_weight = (
+            self.value_embeds[str(i)].weight
+            if str(i) in self.value_embeds
+            else None
+        )
+        if (
+            os.environ.get("NANOOPS_L_ATTN_CHECKPOINT")
+            and (self.window_sizes[i][0] < 0 or self.window_sizes[i][0] >= T)
+        ):
+            x = _ckpt.checkpoint(
+                _attn_qkv_residual,
+                block,
+                x,
+                idx if ve_weight is not None else None,
+                ve_weight,
+                cos_sin,
+                self.window_sizes[i],
+                use_reentrant=False,
+            )
+        else:
+            x = _attn_qkv_residual(
+                block,
+                x,
+                idx if ve_weight is not None else None,
+                ve_weight,
+                cos_sin,
+                self.window_sizes[i],
+            )
+        x = _mlp_residual(block, x)
+        if i == backout_layer:
+            x_backout = x
+
+    if x_backout is not None:
+        x = x - self.backout_lambda.to(x.dtype) * x_backout
+    x = gpt_mod.norm(x)
+
+    softcap = 15
+    logits = self.lm_head(x)
+    logits = logits[..., : self.config.vocab_size]
+    logits = logits.float()
+    logits = softcap * torch.tanh(logits / softcap)
+
+    if targets is not None:
+        return gpt_mod.F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction=loss_reduction,
+        )
+    return logits
 
 
 def _patched_l_attn_forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -305,7 +462,8 @@ def _apply() -> dict[str, dict]:
     "originals", and the restore path would put back patched versions
     instead of the true originals.
     """
-    global _PATCHED
+    global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
+    global _fused_mlp_block, _fused_attn_qkv
     if _PATCHED:
         raise RuntimeError(
             "nanoops.integration already patched; call _restore() before _apply() again"
@@ -336,13 +494,12 @@ def _apply() -> dict[str, dict]:
     # mlp half of Block.forward — `x + mlp(norm(x))` — with a single
     # `fused_mlp_block(x, None, W_fc, W_proj)` call that collapses
     # norm + c_fc + relu² + c_proj + outer residual into 3 fwd Triton
-    # kernels (one cuBLAS matmul kept for c_fc) + 4 bwd Triton kernels.
+    # kernels + 4 bwd Triton kernels.
     # See nanoops/TRITON_zh.md §3 for the fusion breakdown. Supersedes
     # the relu_square fusion (which is a subset of what's fused here).
     if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
         from .triton_kernels import fused_mlp_block as _fmb
 
-        global _orig_norm, _fused_mlp_block
         assert _orig_norm is None, "_orig_norm already captured — call _restore() first"
         _orig_norm = gpt_mod.norm
         _fused_mlp_block = _fmb
@@ -350,12 +507,25 @@ def _apply() -> dict[str, dict]:
             gpt_mod.Block.forward
         )
         gpt_mod.Block.forward = _patched_block_forward
+    # Fused attention QKV: opt-in via NANOOPS_FUSED_ATTN_QKV=1. This is
+    # installed at GPT.forward instead of CausalSelfAttention.forward because
+    # the fused op owns the outer RMSNorm that nanchat applies one level up in
+    # Block.forward, and it needs token ids + VE table to fuse value embedding.
+    if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
+        from .triton_kernels import norm_qkv_projection as _nqp
+
+        assert _orig_gpt_forward is None, (
+            "_orig_gpt_forward already captured — call _restore() before _apply()"
+        )
+        _orig_gpt_forward = gpt_mod.GPT.forward
+        _fused_attn_qkv = _nqp
+        originals["method"][("nanochat.gpt", "GPT", "forward")] = _orig_gpt_forward
+        gpt_mod.GPT.forward = _patched_gpt_forward
     # L-layer activation checkpoint: opt-in via NANOOPS_L_ATTN_CHECKPOINT=1.
     # Installed conditionally so when the env var is OFF, attention forward
     # stays the original (no per-call wrapper cost). Env var read once here
     # at patch time, same pattern as NANOOPS_OFFLOAD_OPTIM below.
     if os.environ.get("NANOOPS_L_ATTN_CHECKPOINT"):
-        global _orig_attn_forward
         assert _orig_attn_forward is None, (
             "_orig_attn_forward already captured — call _restore() before _apply()"
         )
@@ -418,11 +588,14 @@ def _restore(originals: dict[str, dict]) -> None:
     for (modname, cls_name, method_name), original in originals["method"].items():
         cls = getattr(importlib.import_module(modname), cls_name)
         setattr(cls, method_name, original)
-    global _PATCHED, _orig_attn_forward, _orig_norm, _fused_mlp_block
+    global _PATCHED, _orig_attn_forward, _orig_gpt_forward, _orig_norm
+    global _fused_mlp_block, _fused_attn_qkv
     _PATCHED = False
     _orig_attn_forward = None
+    _orig_gpt_forward = None
     _orig_norm = None
     _fused_mlp_block = None
+    _fused_attn_qkv = None
 
 
 def patch_nanchat() -> list[str]:
@@ -444,6 +617,8 @@ def patch_nanchat() -> list[str]:
         names.append("CausalSelfAttention.forward(L-only activation checkpoint)")
     if os.environ.get("NANOOPS_FUSED_MLP_BLOCK"):
         names.append("Block.forward(fused_mlp_block — supersedes relu_square fusion)")
+    if os.environ.get("NANOOPS_FUSED_ATTN_QKV"):
+        names.append("GPT.forward(norm_qkv_projection fused)")
     return names
 
 

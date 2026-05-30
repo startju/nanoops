@@ -77,9 +77,9 @@ def test_fused_add_norm_backward(M, has_nw):
 
 
 def test_fused_add_norm_backward_large_d_fallback():
-    """D=16384 with affine weight exceeds the inline reg budget and uses fallback."""
+    """D=32768 with affine weight exceeds the inline reg budget and uses fallback."""
     torch.manual_seed(0)
-    M, D = 128, 16384
+    M, D = 8, 32768
     BLOCK_D = triton.next_power_of_2(D)
     assert not _pick_tile_config(M, BLOCK_D, n_live_tiles=5).fits_reg_budget
     x0 = torch.randn(M, D, dtype=torch.float32, device="cuda")
